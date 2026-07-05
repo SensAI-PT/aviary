@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# colibrì — installazione su una macchina nuova (Linux x86-64).
+# Compila il motore e fa un self-test. Il MODELLO (~372 GB int4) va copiato a parte
+# o rigenerato con: coli convert --model <dir-su-ext4/NVMe>
+set -e
+cd "$(dirname "$0")"
+echo "🐦 colibrì — setup"
+
+# 1) dipendenze
+command -v gcc  >/dev/null || { echo "manca gcc (es: sudo apt install build-essential)"; exit 1; }
+command -v make >/dev/null || { echo "manca make"; exit 1; }
+echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
+echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "manca (libgomp)"; exit 1; }
+
+# 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
+echo "  compilo (ARCH=${ARCH:-native})…"
+make -s glm ARCH="${ARCH:-native}"
+
+# 3) self-test sull'oracolo tiny, se presente
+if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
+    r=$(SNAP=./glm_tiny TF=1 ./glm 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ posizioni" || true)
+    echo "  self-test motore: ${r:-?}  (atteso 32/32)"
+fi
+
+# 4) info macchina (la velocità dipende da QUESTI due numeri, non dalla GPU)
+ram=$(awk '/MemTotal/{printf "%.0f", $2/1e6}' /proc/meminfo 2>/dev/null || echo "?")
+echo "  RAM: ${ram} GB   (più RAM = più expert in cache = più veloce)"
+echo
+echo "pronto. Prossimi passi:"
+echo "  ./coli build           # (gia' fatto)"
+echo "  ./coli convert --model /percorso/NVMe/glm52_i4     # genera il modello int4 (ore)"
+echo "  ./coli info  --model /percorso/NVMe/glm52_i4"
+echo "  ./coli chat  --model /percorso/NVMe/glm52_i4 --ram <GB>"
+echo
+echo "IMPORTANTE: tieni il modello su disco VELOCE (NVMe/ext4), MAI su /mnt/c o rete."

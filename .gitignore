@@ -1,0 +1,23 @@
+# ambienti python / cache
+c/mio_env/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# binari compilati (si rigenerano con make / coli build)
+c/glm
+c/olmoe
+c/iobench
+c/tok_test
+
+# oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
+c/glm_tiny/
+c/glm_tiny_i2/
+c/glm_tiny_i4/
+c/glm_tiny_mix/
+c/bench/
+
+# pesi modello / artefatti di run
+*.safetensors
+stats*.txt
+*.log
