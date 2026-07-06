@@ -16,7 +16,7 @@ Config via env o flag (validi anche dopo il sottocomando):
   --topp P           top-p adattivo sugli expert     --topk N   top-k fisso
   --ngen N           token massimi per risposta      --cap N    slot cache/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GLM  = os.path.join(HERE, "glm")
@@ -197,20 +197,36 @@ def cmd_chat(a):
     try:
         elog=open(errlog.name).read()
         mload=re.search(r"caricato in ([0-9.]+)s \| densa residente: ([0-9.]+) MB", elog)
-        extra=" · ".join(l.strip() for l in elog.splitlines()
-                         if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]")))
         if mload: print(f"  {C.grn}✓{C.r} pronto in {mload.group(1)}s {C.dim}· residente {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
-        if extra:  print(f"  {C.dgray}{extra}{C.r}")
+        for l in elog.splitlines():                     # una riga di stato per riga, senza path
+            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]")):
+                l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
+                l=re.sub(r" da$| in$","",l)
+                for chunk in textwrap.wrap(l, term_w()-4) or [l]:
+                    print(f"  {C.dgray}{chunk}{C.r}")
     except Exception: pass
     print(f"  {C.dim}scrivi e premi invio · :piu continua risposta · :reset memoria · :q esci{C.r}\n")
     w=term_w()-4
+    def user_box(msg):
+        """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
+        l'input grezzo (che sborda) viene cancellato e sostituito dal testo avvolto."""
+        cols=shutil.get_terminal_size((80,20)).columns
+        used=max(1, (6+len(msg)+cols-1)//cols)          # righe occupate dall'input ("  │ › "+msg)
+        sys.stdout.write(f"\x1b[{used}A\x1b[0J")        # su di N righe e pulisci fino in fondo
+        inner=w-3                                        # spazio utile: "  │ › "+testo+"│" = w+4 colonne
+        lines=textwrap.wrap(msg, inner) or [""]
+        for i,ln in enumerate(lines):
+            pre = f"{C.teal}{C.b}›{C.r}" if i==0 else " "
+            print(f"  {C.dgray}│{C.r} {pre} {ln}{' '*(inner-len(ln))}{C.dgray}│{C.r}")
+        print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
     try:
         while True:
             if TTY:
                 print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
                 try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
                 except EOFError: print(); break
-                print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+                try: user_box(msg.strip())
+                except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
             else:
                 try: msg=input()
                 except EOFError: break
