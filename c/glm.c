@@ -1061,7 +1061,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=1.0f;            /* auto: sampling ufficiale (temp 1.0, top-p 0.95) */
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+                                          * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
@@ -1101,7 +1102,8 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=1.0f;            /* auto: sampling ufficiale (temp 1.0, top-p 0.95) */
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+                                          * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
@@ -1328,7 +1330,7 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
-    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;
+    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
