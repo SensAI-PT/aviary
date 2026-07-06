@@ -814,6 +814,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             #pragma omp parallel for schedule(dynamic,1)
             for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
             m->t_edisk += now_s()-t0; }
+        /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
+         * questo — il kernel legge in background, le pread dopo trovano cache calda */
+        if(base+64<nu){
+            int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
+            for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
+                ESlot *P=m->pin[layer];
+                for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
+                ESlot *Sl=m->ecache[layer];
+                for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
+                if(!found) expert_prefetch(m,layer,eid);
+            }
+        }
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
