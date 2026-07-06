@@ -636,6 +636,36 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
+/* ---- helper per l'ABSORPTION: accesso per-riga ai QT quantizzati ---- */
+/* acc[0..I) += coef * W[row,:] (dequant al volo) */
+static void qt_addrow(const QT *t, int row, float coef, float *acc){
+    int I=t->I;
+    if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
+    float c=coef*t->s[row];
+    if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
+    if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
+        if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
+    const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
+    for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
+}
+/* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
+static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
+    int I=t->I;
+    for(int j=0;j<n;j++){ int row=r0+j; double a=0;
+        if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
+        else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
+            float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
+        else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
+            for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+            if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
+        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
+            for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+        y[j]=(float)a;
+    }
+}
+static int g_absorb=-1;   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
+
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -657,6 +687,41 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, comp+c->kv_lora, c->qk_rope*sizeof(float));
         rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+    }
+    /* WEIGHT ABSORPTION (DeepSeek): per S piccoli (decode/verifica MTP) NON si ricostruisce
+     * k/v per ogni token del contesto. Per linearita':
+     *   q·k_nope_t = (W_K^hT q_nope)·L_t      ctx^h = W_V^h (Σ_t a_t L_t)
+     * costo per step ~O(T·kv_lora) invece di O(T·H·(nope+vh)) del matmul kvb_all. */
+    int absorb = g_absorb==1 || (g_absorb<0 && S<=4);
+    if(absorb && c->kv_lora<=512){
+        int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+            int pos=pos_base+s;
+            const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;
+            const float *qr=qp+c->qk_nope;
+            int rbase=h*(c->qk_nope+vh);
+            float qabs[512]; memset(qabs,0,kvl*sizeof(float));
+            for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+            float sc[8192];
+            int st0=m->kv_start[layer];
+            for(int t=st0;t<=pos;t++){
+                const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
+                const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
+                float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                sc[t-st0]=a*c->attn_scale;
+            }
+            softmax(sc,pos+1-st0);
+            float clat[512]; memset(clat,0,kvl*sizeof(float));
+            for(int t=st0;t<=pos;t++){ const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
+                float a=sc[t-st0]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
+            qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
+        }
+        matmul_qt(out, ctx, &l->o, S);
+        free(ctx); free(Q); free(qresid); free(comp);
+        m->t_attn += now_s()-ta0;
+        return;
     }
     /* 2) ricostruzione di k_nope+value per TUTTI i token 0..Tk-1 (un solo matmul su kv_b) */
     double tk0=now_s();
@@ -1412,6 +1477,7 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
