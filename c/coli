@@ -200,7 +200,7 @@ def cmd_chat(a):
         if mload: print(f"  {C.grn}✓{C.r} pronto in {mload.group(1)}s {C.dim}· residente {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         if extra:  print(f"  {C.dgray}{extra}{C.r}")
     except Exception: pass
-    print(f"  {C.dim}scrivi e premi invio · :reset memoria · :q esci{C.r}\n")
+    print(f"  {C.dim}scrivi e premi invio · :piu continua risposta · :reset memoria · :q esci{C.r}\n")
     w=term_w()-4
     try:
         while True:
@@ -219,7 +219,10 @@ def cmd_chat(a):
                 p.stdin.write(b"\x02RESET\n"); p.stdin.flush()
                 stream_turn(p, END, lambda b: None)
                 print(f"  {C.dim}✦ memoria azzerata{C.r}\n"); continue
-            p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
+            if msg in (":piu",":più",":more",":continua"):
+                p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
+            else:
+                p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
             print(f"\n  {C.teal}◆ colibrì{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
@@ -236,7 +239,10 @@ def cmd_chat(a):
             if st is None: print(f"\n  {C.yel}[motore terminato]{C.r}"); break
             el=time.time()-t0
             if st.get("tok"):
-                print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}\n")
+                print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
+                if st["tok"]>=a.ngen:
+                    print(f"  {C.yel}…troncato al limite --ngen ({a.ngen}): scrivi :piu per far continuare la risposta{C.r}")
+                print()
             else:
                 print()
     except KeyboardInterrupt:
@@ -271,7 +277,7 @@ def cmd_convert(a):
 def main():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
-    common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=256)
+    common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — GLM-5.2 in locale")
     sub=ap.add_subparsers(dest="cmd")

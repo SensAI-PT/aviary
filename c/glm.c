@@ -1052,6 +1052,21 @@ static void run_serve(Model *m, const char *snap){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
+        if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
+            la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
+            if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
+            int cur=ngen; if(len+cur+g_draft+2>=maxctx) cur=maxctx-len-g_draft-2;
+            uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
+            float *logit=step(m,hist+len-1,1,len-1);
+            EmitStream es={&T,m,now_s(),0,1};
+            int prod=0;
+            if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
+            else free(logit);
+            double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
+            double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
+            printf("\n\x01\x01" "END" "\x01\x01\n");
+            printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
+            fflush(stdout); continue; }
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         int bl=0;                                /* costruisce il testo del turno (con template) */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
