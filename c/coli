@@ -288,13 +288,23 @@ def cmd_chat(a):
 def cmd_bench(a):
     need_model(a.model)
     banner("bench")
-    cmd=[sys.executable, os.path.join(HERE,"eval_glm.py"), "--snap",a.model,
-         "--tasks", ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu",
-         "--limit", str(a.limit), "--data", a.data]
+    # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
+    venv_py=os.path.join(HERE,"mio_env","bin","python3")
+    py = venv_py if os.path.exists(venv_py) else sys.executable
+    tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
+    # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
+    missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
+    if missing:
+        print(f"  {C.dim}scarico i dataset mancanti: {', '.join(missing)}{C.r}")
+        subprocess.call([py, os.path.join(HERE,"fetch_benchmarks.py"),
+                         "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
+    cmd=[py, os.path.join(HERE,"eval_glm.py"), "--snap",a.model,
+         "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]
     e=dict(os.environ)
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
+    print(f"  {C.dim}decode disk-bound: su hardware lento questo richiede ORE. Alza --limit su macchine veloci.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
 def cmd_convert(a):
