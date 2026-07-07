@@ -104,6 +104,90 @@ def env_for(a):
     if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
     return e
 
+# ---------- rendering markdown in STREAMING per il terminale ----------
+class MDStream:
+    """Interpreta il markdown della risposta mentre arriva: i ``` diventano riquadri,
+    **x** grassetto vero, `x` colorato, # titoli, - puntini. I marker non si vedono mai.
+    Regge i chunk spezzati a meta' marker (hold-back) e l'output sporco (``` doppi)."""
+    def __init__(self, indent="  "):
+        self.ind=indent
+        self.cur=""                      # riga parziale non ancora emessa
+        self.code=False; self.lang=""
+        self.bold=False; self.icode=False
+        self.justclosed=False            # l'ultima riga era una chiusura ```? (anti ``` doppi)
+        self.printed=0                   # caratteri della riga corrente gia' emessi
+    def _fence(self, line):
+        lang=line.strip()[3:].strip().strip("`")
+        if not self.code:
+            if not lang and self.justclosed: return   # ``` orfano dopo una chiusura: rumore, ignora
+            self.code=True; self.lang=lang
+            sys.stdout.write(f"{self.ind}{C.dgray}\u256d\u2500 {lang or 'code'}{C.r}\n")
+        elif lang:                       # ```lang mentre siamo GIA' in code: chiudi e riapri
+            sys.stdout.write(f"{self.ind}{C.dgray}\u2570\u2500{C.r}\n{self.ind}{C.dgray}\u256d\u2500 {lang}{C.r}\n")
+            self.lang=lang
+        else:
+            self.code=False; self.justclosed=True
+            sys.stdout.write(f"{self.ind}{C.dgray}\u2570\u2500{C.r}\n")
+    def _inline(self, txt, out):
+        i=0
+        while i<len(txt):
+            ch=txt[i]
+            if ch=="`":
+                self.icode=not self.icode
+                out.append(C.org if self.icode else C.r); i+=1; continue
+            if ch=="*":
+                j=i
+                while j<len(txt) and txt[j]=="*": j+=1
+                if j-i>=2:               # **/***: grassetto on/off, gli asterischi spariscono
+                    self.bold=not self.bold
+                    out.append(C.b if self.bold else C.r)
+                else: out.append("*")    # * singolo: lascialo (moltiplicazioni ecc.)
+                i=j; continue
+            out.append(ch); i+=1
+    def _line(self, line, partial=False):
+        if not partial and line.lstrip().startswith("```"):
+            self._fence(line); self.printed=0; return
+        if line.strip(): self.justclosed=False
+        seg=line[self.printed:]          # emetti solo la parte nuova della riga
+        out=[]
+        if self.code:
+            if self.printed==0: out.append(f"{self.ind}{C.dgray}\u2502{C.r} {C.cyan}")
+            out.append(seg)
+        else:
+            if self.printed==0:
+                out.append(self.ind)
+                st=seg.lstrip()
+                if st.startswith("#"):           # titolo: via i #, grassetto teal
+                    seg=st.lstrip("#").strip(); out.append(f"{C.teal}{C.b}"); self.bold=True
+                elif st.startswith(("- ","* ")): # lista: puntino vero
+                    seg=st[2:]; out.append(f"{C.teal}\u2022{C.r} ")
+            self._inline(seg,out)
+        sys.stdout.write("".join(out)); sys.stdout.flush()
+        self.printed=len(line)
+        if not partial:                  # fine riga: reset stati inline (robusto ai marker orfani)
+            sys.stdout.write(C.r+"\n"); sys.stdout.flush()
+            self.bold=self.icode=False
+            self.printed=0
+    def feed(self, s):
+        self.cur+=s
+        while "\n" in self.cur:
+            line,self.cur=self.cur.split("\n",1)
+            self._line(line)
+        st=self.cur.lstrip()             # riga parziale: possibile fence? aspetta il newline
+        if st and (st.startswith("```") or (len(st)<3 and "```".startswith(st))):
+            return
+        if st.startswith("#") and self.printed==0:
+            return                        # titolo: rendi la riga intera al newline
+        hold=0                            # trattieni marker potenzialmente spezzati in coda
+        while hold<len(self.cur) and self.cur[-1-hold] in "*`": hold+=1
+        safe=self.cur[:len(self.cur)-hold] if hold else self.cur
+        if len(safe)>self.printed: self._line(safe, partial=True)
+    def close(self):
+        if self.cur: self._line(self.cur); self.cur=""
+        if self.code:
+            sys.stdout.write(f"\n{self.ind}{C.dgray}\u2570\u2500{C.r}"); self.code=False
+        sys.stdout.write(C.r); sys.stdout.flush()
+
 class Spinner:
     FRAMES=["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
     def __init__(self,label,tick=None):
@@ -258,14 +342,19 @@ def cmd_chat(a):
                     return pl[-1].replace("[prefill] ","prefill ") if pl else ""
                 except Exception: return ""
             sp2=Spinner("pensa…", tick=prefill_tick); sp2.start()
+            md=MDStream("  ")            # markdown -> terminale, in streaming
+            raw=os.environ.get("COLI_RAW")=="1"
             def echo(bs, _dec=dec, _st=state):
                 if _st["first"]:
                     sp2.stop(); _st["first"]=False
-                    sys.stdout.write("  ")
+                    if raw: sys.stdout.write("  ")
                 s=_dec.decode(bs)
-                if s: sys.stdout.write(s.replace("\n","\n  ")); sys.stdout.flush()
+                if not s: return
+                if raw: sys.stdout.write(s.replace("\n","\n  ")); sys.stdout.flush()
+                else: md.feed(s)
             t0=time.time()
             st=stream_turn(p, END, echo)
+            if not raw: md.close()
             sp2.stop()
             if st is None: print(f"\n  {C.yel}[motore terminato]{C.r}"); break
             el=time.time()-t0
