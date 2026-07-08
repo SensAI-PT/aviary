@@ -55,6 +55,22 @@ This is not fast. It is a 744B frontier-class model **answering correctly on a m
 ### SSD Wear Warning
 Cold starts are heavy on random reads (~11 GB/token). Reads themselves are safe, but the OS page cache can generate writes. Heavy use may accelerate wear on cheaper SSDs. Use with caution and monitor your drive health.
 
+## Download the model
+
+A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face:
+
+**https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4**
+
+Download the repository and point `COLI_MODEL` to its directory:
+
+```bash
+COLI_MODEL=/path/to/GLM-5.2-colibri-int4 ./coli chat
+```
+
+This skips the FP8 → int4 conversion step entirely.
+
+Thanks DatPat for your help!
+
 ### Quick start
 
 ```bash
