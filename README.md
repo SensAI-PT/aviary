@@ -52,8 +52,8 @@ The engine is a single C file (`c/glm.c`, ~1,300 lines) plus small headers. No B
 
 This is not fast. It is a 744B frontier-class model **answering correctly on a machine that costs less than one H100 fan**. Warm cache, pinned hot experts and MTP push the useful-response latency down considerably; the physics of the disk does the rest.
 
-### SSD Wear Warning
-Cold starts are heavy on random reads (~11 GB/token). Reads themselves are safe, but the OS page cache can generate writes. Heavy use may accelerate wear on cheaper SSDs. Use with caution and monitor your drive health.
+### SSD note
+Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningfully wear an SSD — colibrì's streaming is read-only. The real concerns under heavy use are (1) **swap traffic** if the system runs out of RAM (writes do wear the drive — keep a sane `--ram` budget; colibrì's auto-budget is designed to stay clear of swap) and (2) **sustained thermals**: hours at full read duty cycle will heat cheaper drives. Monitor drive temperature and health.
 
 ## Download the model
 
