@@ -409,9 +409,11 @@ def cmd_convert(a):
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
     if a.no_mtp: sys.exit(0)
-    # passo 2: testa MTP (layer 78) -> abilita la decodifica speculativa nativa (piu' veloce)
-    print(f"  {C.dim}[2/2] testa MTP (draft speculativi){C.r}")
-    sys.exit(subprocess.call(base+["--mtp"]))
+    # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
+    # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
+    mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
+    print(f"  {C.dim}[2/2] testa MTP a int8 (draft speculativi){C.r}")
+    sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
 
 def main():
     common=argparse.ArgumentParser(add_help=False)

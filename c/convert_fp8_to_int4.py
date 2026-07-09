@@ -132,7 +132,7 @@ def main():
     ap.add_argument("--repo", default=None)
     ap.add_argument("--indir", default=None)
     ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=4)      # bit residenti: attn/dense-mlp/shared
+    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
     ap.add_argument("--n-layers", type=int, default=78)
@@ -145,6 +145,10 @@ def main():
              "i tensori indexer sono sparsi su ~tutti gli shard: ri-scarica l'intero repo (~756 GB "
              "di traffico) per tenerne pochi GB. Resumabile shard per shard. Consigliato --ebits 8.")
     a = ap.parse_args()
+    if a.ebits is None:
+        # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
+        # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
+        a.ebits = 8 if (a.mtp or a.indexer) else 4
     if a.xbits is None: a.xbits = a.ebits
 
     if a.selftest:
