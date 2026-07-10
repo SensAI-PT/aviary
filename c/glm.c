@@ -22,12 +22,17 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
 #include "st.h"
 #include "tok.h"
+#ifdef COLI_CUDA
+#include <omp.h>
+#include "backend_cuda.h"
+#endif
 #ifdef __AVX2__
 #include <immintrin.h>
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
@@ -58,7 +63,13 @@ typedef struct {
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
-typedef struct { int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I; } QT;
+typedef struct {
+    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+#ifdef COLI_CUDA
+    ColiCudaTensor *cuda;
+#endif
+    int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+} QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
@@ -113,12 +124,53 @@ typedef struct {
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
+    uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (sempre attivo) */
     int64_t resident_bytes;
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
+#ifdef COLI_CUDA
+static int g_cuda_enabled;
+static double g_cuda_expert_gb;
+static int g_cuda_dense;
+static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
+static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+static void qt_cuda_reset(QT *t){
+    if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
+    t->cuda_failed=0;
+}
+static int qt_cuda_upload(QT *t){
+    const void *weights = t->fmt==0 ? (const void*)t->qf
+                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+static void cuda_stats_print(void){
+    size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
+    fprintf(stderr,"[CUDA] resident set: %zu tensor, %.2f GB VRAM\n",n,b/1e9);
+    if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
+        coli_cuda_stats(g_cuda_devices[i],&n,&b);
+        fprintf(stderr,"[CUDA]   device %d: %zu tensor, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+    }
+}
+static int parse_cuda_devices(const char *list, int *out){
+    if(!list||!*list) return 0;
+    int n=0; const char *p=list;
+    while(*p){
+        char *end=NULL; long v=strtol(p,&end,10);
+        if(end==p||v<0||v>INT_MAX||n>=COLI_CUDA_MAX_DEVICES) return 0;
+        for(int i=0;i<n;i++) if(out[i]==(int)v) return 0;
+        out[n++]=(int)v; p=end;
+        while(*p==' '||*p=='\t') p++;
+        if(!*p) break;
+        if(*p++!=',') return 0;
+        while(*p==' '||*p=='\t') p++;
+        if(!*p) return 0;
+    }
+    return n;
+}
+#endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #ifdef __APPLE__
@@ -385,7 +437,21 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 
-static void matmul_qt(float *y, const float *x, const QT *w, int S){
+static void matmul_qt(float *y, const float *x, QT *w, int S){
+#ifdef COLI_CUDA
+    /* The CUDA backend owns persistent copies only for model-resident tensors.
+     * Streaming expert slots are reused for different IDs and must never enter
+     * this cache. Nested OpenMP calls stay on CPU because each device context
+     * intentionally owns one synchronous scratch stream in this stage. */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
+        const void *weights = w->fmt==0 ? (const void*)w->qf
+                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        w->cuda_failed=1;
+        fprintf(stderr,"[CUDA] tensor [%d,%d] su device %d disabilitato dopo errore; fallback CPU\n",
+            w->O,w->I,w->cuda_device);
+    }
+#endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -580,7 +646,15 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
-    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t); return t;
+    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+#ifdef COLI_CUDA
+    if(g_cuda_enabled&&g_cuda_dense){
+        t.cuda_eligible=1;
+        int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
+        g_cuda_dense_projected[slot]+=qt_bytes(&t);
+    }
+#endif
+    return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"manca %s\n",name);exit(1);}
@@ -744,6 +818,11 @@ static void embed_row(Model *m, int tok, float *x){
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
  * THREAD-SAFE su slot distinti (pread posizionale, st_find read-only). */
 static void expert_load(Model *m, int layer, int eid, ESlot *s){
+#ifdef COLI_CUDA
+    /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
+     * Keep its tier assignment, but invalidate the old device weights. */
+    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
@@ -1092,6 +1171,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
+#ifdef COLI_CUDA
+            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+#endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
             matmul_qt(gg, xg, &e->g, nr);
@@ -1479,6 +1561,37 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
 }
 
+static void profile_print(Model *m, double elapsed){
+    double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
+    printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
+           "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
+        m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+}
+
+/* Fixed-token decode benchmark: prefill all but the prompt's last token, then
+ * replay the oracle sequence one token at a time. CPU and CUDA therefore see
+ * identical hidden-state inputs even if their argmax predictions differ. */
+static void run_replay(Model *m, const int *full, int nfull, int np){
+    if(np<2||nfull<=np){ fprintf(stderr,"REPLAY richiede prompt e continuation non vuoti\n"); return; }
+    kv_alloc(m,nfull+2);
+    float *logit=step(m,full,np-1,0); free(logit);
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
+    m->t_edisk=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    double t0=now_s(); int steps=0;
+    for(int i=np-1;i<nfull-1;i++){
+        logit=step(m,full+i,1,i); free(logit); steps++;
+    }
+    double dt=now_s()-t0, tot=m->hits+m->miss;
+    printf("REPLAY decode: %d token in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
+        steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    profile_print(m,dt);
+#ifdef COLI_CUDA
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
+#endif
+}
+
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
@@ -1509,9 +1622,12 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculazione: %.2f token/forward (%llu fw per %llu tok) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
-    double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
-    printf("PROFILO: expert-disk %.1fs | expert-matmul %.1fs | attention %.1fs (di cui kvb %.1fs) | lm_head %.1fs | altro %.1fs\n",
-        m->t_edisk, m->t_emm, m->t_attn, m->t_kvb, m->t_head, dt-acc);
+#ifdef COLI_CUDA
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
+#endif
+    profile_print(m,dt);
     free(pids); free(all);
     usage_save(m);
 }
@@ -1775,6 +1891,59 @@ static void pin_load(Model *m, const char *statspath, double gb){
     m->resident_bytes += (int64_t)npin*eb;
     fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
         npin, npin*eb/1e9, now_s()-t0, statspath);
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && g_cuda_expert_gb>0){
+        double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+        int placed_n[COLI_CUDA_MAX_DEVICES]={0};
+        double budget=g_cuda_expert_gb*1e9, safe_total=0;
+        for(int i=0;i<g_cuda_ndev;i++){
+            size_t free_b=0,total_b=0;
+            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+                /* Dense tensors are assigned round-robin and upload lazily.
+                 * Reserve their projected footprint plus 2 GB per device. */
+                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+                if(remaining[i]<0) remaining[i]=0;
+                safe_total+=remaining[i];
+            }
+        }
+        if(budget>safe_total) budget=safe_total;
+        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
+            int li=r[a].l;
+            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
+                ESlot *s=&m->pin[li][z];
+                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+                if(m->gpu_expert_bytes+need>budget) break;
+                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
+                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
+                    int best=-1;
+                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+                        (best<0||placed_b[i]<placed_b[best])) best=i;
+                    if(best<0) break;
+                    tried[best]=1;
+                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        placed=1;
+                    } else {
+                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                        remaining[best]=0;             /* device rejected its projected capacity */
+                    }
+                }
+                break;
+            }
+        }
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget totale %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
+        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d expert, %.2f GB\n",
+            g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+    }
+#endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
 }
@@ -1873,6 +2042,32 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
+#ifdef COLI_CUDA
+    if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
+        const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
+        if(one&&many){ fprintf(stderr,"usa COLI_GPU oppure COLI_GPUS, non entrambi\n"); return 2; }
+        if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
+        else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
+        else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
+        if(g_cuda_ndev<1){ fprintf(stderr,"COLI_GPUS non valido: usa una lista come 0,1,2\n"); return 2; }
+        g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
+        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
+    }
+    g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE richiede COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB richiede COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s\n",g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
+#else
+    if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
+       getenv("COLI_GPU") || getenv("COLI_GPUS") ||
+       (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
+       (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
+        fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
+        return 2;
+    }
+#endif
     printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
@@ -1934,11 +2129,23 @@ int main(int argc, char **argv){
     int np,nfull; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     int n_new=nfull-np;
 
+    if(getenv("REPLAY")){
+        run_replay(&m,full,nfull,np);
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
+
     if(getenv("TF")){
         int *tf=read_arr(ref,"tf_pred",&(int){0});
-        int *pred=malloc(nfull*sizeof(int)); forward_all(&m, full, nfull, pred);
+        int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
+        forward_all(&m, full, nfull, pred); double tdt=now_s()-tt;
         int ok=0; for(int i=0;i<nfull;i++) ok+=(pred[i]==tf[i]);
-        printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni\n", ok, nfull);
+        printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni | %.1f pos/s\n",
+            ok,nfull,nfull/tdt);
+        profile_print(&m,tdt);
+#ifdef COLI_CUDA
+        if(g_cuda_enabled) cuda_stats_print();
+#endif
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
@@ -1952,6 +2159,12 @@ int main(int argc, char **argv){
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
     printf("Hit-rate cache expert: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
+    profile_print(&m,dt);
+#ifdef COLI_CUDA
+    if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+        m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
+    if(g_cuda_enabled) cuda_stats_print();
+#endif
     if(stats) stats_dump(&m,stats);
     return 0;
 }

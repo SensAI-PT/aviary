@@ -89,6 +89,70 @@ COLI_MODEL=/nvme/glm52_i4 ./coli chat
 
 The engine at runtime is pure C — python is only used by the one-time converter.
 
+### Experimental resident CUDA backend
+
+This fork includes an opt-in CUDA backend for model-resident tensors. Streaming
+experts deliberately remain on the original CPU path for now: copying an expert
+from NVMe to the GPU on every use would only replace the disk bottleneck with a
+PCIe bottleneck. Resident quantized tensors are uploaded lazily once and reused.
+
+```bash
+cd c
+make cuda-test CUDA=1                  # q8/q4/q2/f32 kernel correctness
+make CUDA=1
+# optional dense-path experiment (hot experts are configured below)
+COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+```
+
+Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
+`/usr/local/cuda` (override with `CUDA_HOME=/path/to/cuda`). `CUDA_ARCH=native`
+builds for the GPU in the current machine; set an explicit architecture when
+cross-compiling. Requesting CUDA with a CPU-only binary, an invalid device, or
+an unavailable runtime fails at startup instead of silently falling back.
+
+The normal `make` build and runtime behavior are unchanged. CUDA defaults to an
+expert-only accelerator: resident dense/attention tensors stay on CPU because
+fixture measurements show that moving them does not help while expert I/O is
+the bottleneck. `CUDA_DENSE=1` keeps the earlier all-resident experimental path.
+A measured `PIN` profile can promote its hottest experts into the persistent
+VRAM tier while keeping the rest in RAM:
+
+```bash
+STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
+COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
+PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# multi-GPU expert tier, 96 GB total budget across six devices
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=96 \
+PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+```
+
+Selected experts are uploaded during startup, so capacity failures occur before
+inference and the log reports their exact tensor footprint. The budget is clamped
+against free VRAM after reserving the projected dense resident set and 2 GB of
+runtime headroom per selected device. With `COLI_GPUS`, `CUDA_EXPERT_GB` is a
+total budget across the device set; experts are assigned whole to the
+least-loaded device that can hold them. A NUMA-local RAM backing store is not
+implemented yet.
+
+Current limitations: devices use independent contexts and synchronous
+host-staged activation copies—there is no P2P/NCCL dependency yet. The kernels
+are correctness-first custom kernels rather than cuBLAS/Tensor Core kernels.
+This draft intentionally makes no end-to-end speedup claim before the full model
+is benchmarked.
+
+For a reproducible backend A/B without the full checkpoint, generate the
+deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
+
+```bash
+cd c
+python make_glm_bench_model.py --output /nvme/colibri-bench-medium --device cuda
+python benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 0
+```
+
+The fixture has random weights and is not a language model. It exists only to
+preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
+CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
 Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 
 **The learning cache**: the engine records which experts your usage actually routes to (`.coli_usage` next to the model, updated every turn) and at startup automatically pins the hottest ones in spare RAM. colibrì literally gets faster the more you use it.
