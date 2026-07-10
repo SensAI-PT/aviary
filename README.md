@@ -163,6 +163,8 @@ Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 
 
 **The learning cache**: the engine records which experts your usage actually routes to (`.coli_usage` next to the model, updated every turn) and at startup automatically pins the hottest ones in spare RAM. colibrì literally gets faster the more you use it.
 
+**Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
+
 ## Got a better machine? Try it — here's what to expect
 
 colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4 — never a network/9p mount).

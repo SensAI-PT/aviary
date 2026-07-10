@@ -1795,6 +1795,83 @@ static void repin_pass(Model *m){
             (now_s()-t0)*1e3);
     }
 }
+/* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
+ * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
+ * costa ~182 KB/token. File <SNAP>/.coli_kv append-only: header (magic + dimensioni +
+ * nrec) e un record per posizione [tok i32][Lc+Rc dei 78 layer][Ic DSA]. A fine turno
+ * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
+ * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
+ * al resume kv_start=-1 e la finestra di draft riparte da sola. */
+static char g_kv_path[2048]; static int g_kvsave=1; static int g_kv_nrec=0;
+#define KV_MAGIC "COLIKV1\0"
+static void kv_hdr(Model *m, int32_t *h, int nrec){
+    Cfg *c=&m->c; int nic=0;
+    for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
+    h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
+    h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
+}
+static void kv_disk_reset(void){
+    if(!g_kvsave) return;
+    FILE *f=fopen(g_kv_path,"r+b"); if(!f) return;
+    int32_t nz=0; fseek(f,8+6*4,SEEK_SET); fwrite(&nz,4,1,f); fclose(f);
+    g_kv_nrec=0;
+}
+static void kv_disk_append(Model *m, const int *hist, int len){
+    if(!g_kvsave || len<=g_kv_nrec) return;
+    Cfg *c=&m->c;
+    FILE *f=fopen(g_kv_path,"r+b");
+    if(!f){ f=fopen(g_kv_path,"wb"); if(!f) return;
+        int32_t h[8]; kv_hdr(m,h,0); fwrite(KV_MAGIC,1,8,f); fwrite(h,4,8,f); }
+    int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    fseek(f, 8+8*4 + (int64_t)g_kv_nrec*rec, SEEK_SET);
+    for(int p=g_kv_nrec;p<len;p++){
+        int32_t tk=hist[p]; fwrite(&tk,4,1,f);
+        for(int i=0;i<c->n_layers;i++){
+            fwrite(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f);
+            fwrite(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f);
+        }
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
+            fwrite(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f);
+    }
+    fflush(f);                                   /* dati prima, contatore poi */
+    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f); fclose(f);
+    g_kv_nrec=len;
+}
+static int kv_disk_load(Model *m, int *hist, int maxctx){
+    if(!g_kvsave) return 0;
+    Cfg *c=&m->c;
+    FILE *f=fopen(g_kv_path,"rb"); if(!f) return 0;
+    char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
+    if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
+       h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
+        fprintf(stderr,"[KV] .coli_kv di un altro modello/versione: ignorato\n"); fclose(f); return 0; }
+    int nrec=h[6];
+    if(nrec<1){ fclose(f); return 0; }
+    if(nrec>=maxctx-8-g_draft){
+        fprintf(stderr,"[KV] conversazione salvata (%d token) piu' grande del contesto: riparto da zero\n",nrec);
+        fclose(f); return 0; }
+    double t0=now_s();
+    for(int p=0;p<nrec;p++){
+        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
+        for(int i=0;i<c->n_layers;i++){
+            if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
+               fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
+        }
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
+            if(fread(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f)!=(size_t)c->index_hd){ nrec=p; goto out; }
+    }
+out:
+    fclose(f);
+    if(nrec>0){
+        if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
+        fprintf(stderr,"[KV] conversazione ripresa dal disco: %d token in %.1fs (niente re-prefill)\n",
+            nrec, now_s()-t0);
+    }
+    g_kv_nrec=nrec;
+    return nrec;
+}
+
 static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
@@ -1809,11 +1886,15 @@ static void run_serve(Model *m, const char *snap){
     int len=0, first=1;                          /* len = contesto gia' in KV (persiste tra turni) */
     int *hist=malloc(maxctx*sizeof(int));        /* storia token (= contenuto della KV): serve
                                                   * al lookup n-gram e resta allineata a len */
+    g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
+    { int r=kv_disk_load(m,hist,maxctx); if(r>0){ len=r; first=0; } }
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+            kv_disk_reset();
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
             la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
@@ -1829,7 +1910,7 @@ static void run_serve(Model *m, const char *snap){
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
-            fflush(stdout); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         int bl=0;                                /* costruisce il testo del turno (con template) */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
@@ -1841,7 +1922,7 @@ static void run_serve(Model *m, const char *snap){
         else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",line);
         int k=tok_encode(&T,buf,bl,hist+len,maxctx-len);
         if(k<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
-        if(len+k+8+g_draft>=maxctx){ len=0; first=1;   /* contesto pieno: azzera e ricomincia */
+        if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset();   /* contesto pieno: azzera e ricomincia */
             bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",line,tk); }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",line);
             k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft; }
@@ -1859,6 +1940,7 @@ static void run_serve(Model *m, const char *snap){
         printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
         fflush(stdout);
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
+        kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
     }
     free(line); free(hist); free(buf);
     usage_save(m);
