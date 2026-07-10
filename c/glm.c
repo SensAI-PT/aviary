@@ -181,7 +181,11 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
     return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
 #endif
 }
-static float *falloc(int64_t n){ float *p=malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static float *falloc(int64_t n){
+    /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
+     * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
+    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld fuori range\n",(long long)n); exit(1); }
+    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
@@ -638,6 +642,20 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"questo motore assume n_group=1 (GLM-5.2)\n"); exit(1); }
+    /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
+     * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
+    #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
+        fprintf(stderr,"config: %s=%d fuori range [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
+    CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
+    CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
+    CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
+    CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
+    CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
+    CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
+    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
+    CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
+    CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    #undef CKR
     free(ar);
 }
 
