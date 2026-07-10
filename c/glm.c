@@ -23,6 +23,8 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <pthread.h>                              /* thread I/O del PILOTA */
+#include <unistd.h>
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
@@ -537,6 +539,18 @@ static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward v
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
                           * rifiutato paga comunque i suoi expert dal disco = ~3x piu' lento.
                           * Opt-in (DRAFT=4) per testi ripetitivi dove l'acceptance e' alta. */
+static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
+                          * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
+                          * pilotato dal router puo' riempire i tempi morti del disco.
+                          * [0] token precedente, stesso layer (cio' che usa gia' SPEC/PREFETCH)
+                          * [1] ingresso del layer -> routing dello STESSO layer (salta l'attention)
+                          * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
+                          *     un'attention di anticipo: il punto dove il prefetch avrebbe
+                          *     un intero giro di disco per lavorare in ombra). */
+static int64_t la_hit[3], la_tot[3];
+static int la_pred[2][130][16]; static signed char la_val[2][130];
+static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
+static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -1130,6 +1144,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
+    if(g_looka && S==1 && layer<c->n_layers){
+        int Ke=keff[0];
+        if(m->enr[layer]>0){                       /* [0] vs routing del token precedente */
+            for(int kk=0;kk<Ke;kk++) for(int z=0;z<m->enr[layer];z++)
+                if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
+            la_tot[0]+=Ke;
+        }
+        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+            for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
+                if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
+            la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
+        }
+    }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
@@ -1212,14 +1239,89 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
+/* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
+ * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
+ * kind 0 = stesso layer saltando l'attention, kind 1 = layer successivo. */
+static void la_predict(Model *m, int target, const float *h, int kind){
+    Cfg *c=&m->c; Layer *l=&m->L[target]; int D=c->hidden, E=c->n_experts, K=c->topk;
+    float *nrm=falloc(D), *ch=falloc(E);
+    rmsnorm(nrm,h,l->post_ln,D,c->eps);
+    matmul(ch,nrm,l->router,1,D,E);
+    for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+    int *pred=la_pred[kind][target];
+    for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+        for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+            if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+        pred[kk]=best; }
+    la_val[kind][target]=1;
+    free(nrm); free(ch);
+}
+
+/* PILOTA: prefetch guidato dal router. Predice il top-K del layer L+1 dallo stato
+ * post-attention di L (recall misurato 71.6% su GLM-5.2, vs 41.3% del token precedente)
+ * e lancia il WILLNEED degli expert mancanti MENTRE il MoE di L legge i suoi: il disco
+ * lavora nei tempi morti del calcolo invece di aspettare il routing vero. Con MTP attiva
+ * predice per TUTTE le posizioni del draft: la speculazione pilota anche l'I/O.
+ * PILOT_K limita alle prime k predizioni (la testa del ranking e' piu' affidabile
+ * della coda: meno banda sprecata sulle predizioni sbagliate).
+ *
+ * I WILLNEED partono da un THREAD I/O dedicato: con la coda disco satura la submit
+ * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
+ * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
+ * (un hint perso non e' un errore). */
+static struct { int l,e; } pilot_q[4096];
+static volatile unsigned pilot_w=0, pilot_r=0;
+static Model *pilot_m=NULL;
+static void *pilot_worker(void *arg){
+    (void)arg;
+    for(;;){
+        unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+        unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+        if(r==w){ usleep(200); continue; }
+        expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
+    Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
+    int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
+    if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    float *nrm=falloc(D), *ch=falloc(E);
+    for(int s=0;s<S;s++){
+        rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
+        matmul(ch, nrm, l->router, 1, D, E);
+        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        for(int kk=0;kk<K;kk++){
+            int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
+            ch[best]=-2e30f;
+            int found=0; ESlot *P=m->pin[lnext];
+            for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
+            ESlot *Sl=m->ecache[lnext];
+            for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
+            if(!found){
+                unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
+                if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
+                    pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=best;
+                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+                }
+            }
+        }
+    }
+    free(nrm); free(ch);
+}
+
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
+    if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -1628,6 +1730,12 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
+    if(g_looka){
+        const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
+        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
+        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+            la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
+    }
     free(pids); free(all);
     usage_save(m);
 }
@@ -2012,8 +2120,26 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
         m->ecap=capmax;
     } else {
-        fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (proiezione picco %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
-            (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
+        /* AUTO-RAISE (issue #12): il budget consente PIU' cache di quella chiesta.
+         * Senza questo, una macchina da 128 GB girava con la LRU di una da 16
+         * (cap=8 di default in coli): hit 23-28% con decine di GB inutilizzati.
+         * Tetto a n_experts: oltre, ogni layer avrebbe slot che non puo' riempire.
+         * CAP_RAISE=0 ripristina il comportamento fisso. */
+        int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):1;
+        int newcap = capmax>c->n_experts ? c->n_experts : capmax;
+        if(raise_on && newcap>m->ecap){
+            for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
+                m->ecache[i]=realloc(m->ecache[i],(size_t)newcap*sizeof(ESlot));
+                memset(m->ecache[i]+m->ecap,0,(size_t)(newcap-m->ecap)*sizeof(ESlot));
+            }
+            fprintf(stderr,"[RAM_GB=%.1f%s] cap ALZATO %d->%d: il budget lo consente "
+                "(proiezione picco %.1f GB; CAP_RAISE=0 per disattivare)\n",
+                ram_gb, auto_b?" auto":"", m->ecap, newcap,
+                (m->resident_bytes + (double)newcap*nsp*eb + slack)/1e9);
+            m->ecap=newcap;
+        } else
+            fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (proiezione picco %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
+                (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
     }
 }
 
@@ -2029,6 +2155,10 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
+    g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */
+    g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
+    g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):8;
+    if(g_pilot_k<1) g_pilot_k=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
@@ -2165,6 +2295,12 @@ int main(int argc, char **argv){
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
+    if(g_looka){
+        const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
+        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
+        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+            la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
+    }
     if(stats) stats_dump(&m,stats);
     return 0;
 }
