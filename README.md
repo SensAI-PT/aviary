@@ -62,21 +62,23 @@ Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningful
 
 ## Download the model
 
-A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face:
+A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face — **use the version with the int8 MTP heads** (matey-0's clone):
 
-**https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4**
+**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
 
-If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+> ⚠️ **The MTP head must be int8.** The original mirror ([jlnsrk/GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4)) ships **int4** MTP heads, which give **0% draft acceptance** — speculation silently never engages and you lose the ~2× MTP lever. This is the single most common "why is MTP stuck at 0%?" report ([#8](https://github.com/JustVugg/colibri/issues/8), [#102](https://github.com/JustVugg/colibri/issues/102)). The int8 head gives the measured **39–59% acceptance**. matey-0's clone above is the original int4 model with the three `out-mtp-*` files already swapped to int8 — download that one and you're done.
+>
+> Check what you have: `ls -l <model>/out-mtp-*`
+> · **int8 (correct):** `3527131672 / 5366238584 / 1065950496`
+> · **int4 (0% acceptance):** `1765523544 / 2686077736 / 536747200` — if you see these, replace just those three files from the int8 mirror.
 
 Download the repository and point `COLI_MODEL` to its directory:
 
 ```bash
-COLI_MODEL=/path/to/GLM-5.2-colibri-int4 ./coli chat
+COLI_MODEL=/path/to/GLM-5.2-colibri-int4-with-int8-mtp ./coli chat
 ```
 
-This skips the FP8 → int4 conversion step entirely.
-
-Thanks DatPat for your help!
+This skips the FP8 → int4 conversion step entirely. Thanks to DatPat for the original mirror and matey-0 for the int8-head clone.
 
 ### Quick start
 
