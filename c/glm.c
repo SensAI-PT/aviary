@@ -2611,6 +2611,17 @@ int main(int argc, char **argv){
     char *ar=NULL; jval *ref=json_parse(b,&ar);
     int np,nfull; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     int n_new=nfull-np;
+    /* L'oracolo (ref_glm.json in repo) e' del modello TINY: contro il 744B da' 0/20
+     * garantito su OGNI piattaforma (prompt-token tiny = spazzatura per il modello vero).
+     * Non e' un bug del motore — vedi #76. */
+    { int maxid=0; for(int i=0;i<nfull;i++) if(full[i]>maxid) maxid=full[i];
+      if(m.c.vocab>1000 && maxid<1000 && !getenv("REF_FORCE")){
+        fprintf(stderr,"ERRORE: ref_glm.json e' l'oracolo del modello TINY (token max %d, ma il tuo vocab e' %d).\n"
+                       "        Self-test motore:  SNAP=./glm_tiny TF=1 ./glm 64 16 16   (atteso 32/32)\n"
+                       "        Prova reale:       PROMPT=\"Ciao\" NGEN=32 SNAP=<modello> ./glm 64\n"
+                       "        REF_FORCE=1 per eseguire comunque il confronto (senza senso).\n", maxid, m.c.vocab);
+        return 1;
+      } }
 
     if(getenv("REPLAY")){
         run_replay(&m,full,nfull,np);
