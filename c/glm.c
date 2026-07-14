@@ -2419,9 +2419,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
     /* EXPERT_BUDGET: cap distinct experts per layer to reduce disk I/O on cold/low-RAM
-     * hosts. Keep the highest-aggregate-gate-weight experts; drop the rest from idxs[]
-     * so they're never loaded. (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93%
-     * routing weight.) Complementary to TOPP (per-position) — this trims cross-position. */
+     * hosts. MISS-AWARE: always keep cache hits (pin/LRU — they're free, no disk I/O),
+     * only drop from misses. From the misses, keep the highest-aggregate-gate-weight
+     * ones up to the budget; drop the rest from idxs[] so they're never loaded.
+     * (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93% routing weight.)
+     * Complementary to TOPP (per-position) — this trims cross-position. */
     if(g_expert_budget>0 && nu>g_expert_budget){
         /* compute aggregate gate weight per unique expert */
         float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
@@ -2429,14 +2431,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             int e=idxs[(int64_t)s*K+kk];
             for(int j=0;j<nu;j++) if(uniq[j]==e){ wsum[j]+=ws[(int64_t)s*K+kk]; break; }
         }
-        /* mark which unique experts to keep (1) or drop (0) */
+        /* residency pre-scan: which experts are already in pin or ecache (hits)? */
+        unsigned char *is_hit=calloc(nu,1); int nhits=0;
+        for(int j=0;j<nu;j++){ int eid=uniq[j];
+            int found=0;
+            ESlot *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ found=1; break; }
+            if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
+            if(found){ is_hit[j]=1; nhits++; }
+        }
+        /* budget for misses = total budget - hits already kept (min 0) */
+        int miss_budget = g_expert_budget - nhits; if(miss_budget<0) miss_budget=0;
+        /* mark which unique experts to keep (1) or drop (0): keep all hits, fill rest
+         * with top-weight misses up to miss_budget */
         unsigned char *keep=calloc(nu,1); int nkeep=0;
-        {   /* simple selection: find top-budget by weight */
-            for(int rank=0;rank<g_expert_budget && rank<nu;rank++){
-                int best=-1; float bv=-1e30f;
-                for(int j=0;j<nu;j++) if(!keep[j] && wsum[j]>bv){ bv=wsum[j]; best=j; }
-                if(best<0) break; keep[best]=1; nkeep++;
-            }
+        for(int j=0;j<nu;j++) if(is_hit[j]){ keep[j]=1; nkeep++; }
+        for(int rank=0;rank<miss_budget;rank++){
+            int best=-1; float bv=-1e30f;
+            for(int j=0;j<nu;j++) if(!keep[j] && wsum[j]>bv){ bv=wsum[j]; best=j; }
+            if(best<0) break; keep[best]=1; nkeep++;
         }
         /* build a lookup: for each expert id, is it kept? (reuse seen[]) */
         memset(seen,0,(size_t)E);
@@ -2463,7 +2477,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         int nu2=0;
         for(int j=0;j<nu;j++) if(keep[j]) uniq[nu2++]=uniq[j];
         nu=nu2;
-        free(wsum); free(keep);
+        free(wsum); free(is_hit); free(keep);
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
