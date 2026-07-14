@@ -461,6 +461,7 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #else
 #define IDOT_KERNEL "scalar"
 #endif
+static int g_lmhead_exact=0;   /* PROBE: LMHEAD_EXACT=1 -> pin lm_head to the exact int8 kernel */
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
@@ -706,7 +707,16 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     *xq=g_qscratch.xq; *sx=g_qscratch.sx;
 }
 
-static void matmul_qt(float *y, const float *x, QT *w, int S){
+/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
+ * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
+ * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
+ * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
+ * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
+ * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
+ * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
+static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
     /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
      * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
@@ -737,7 +747,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
-    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
+    if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
@@ -1578,23 +1588,38 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #endif
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
-    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
-    /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache.
-     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA. */
+    int cw=c->kv_lora+c->qk_rope;
+    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc((int64_t)S*cw);
+    /* 1) query roped + latente normato e k_rot roped -> in cache.
+     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA.
+     *
+     * BATCH-ROWS: le tre proiezioni girano su tutte le S righe in un colpo solo, come gia' fa
+     * o_proj (matmul_qt(...,S) sotto) e come fa moe() con la batch-union. Una riga per volta
+     * il peso veniva ri-letto per OGNI token; a S righe si legge una volta sola.
+     * matmul_qt_ex(...,0): restano sul kernel int4 ESATTO. Con l'IDOT (che il gate S>=g_i4s
+     * abiliterebbe da solo appena S>1) il prefill sarebbe molto piu' veloce ma la qualita'
+     * cala: -5040.33 -> -5158.68 di log-lik su 1023 token (~+12% perplexity). Il batch da
+     * solo e' bit-identical all'originale; il kernel no. Vedi issue.
+     * EN: batch the three projections over all S rows, like o_proj below and moe()'s
+     * batch-union. matmul_qt_ex(...,0) keeps them on the EXACT int4 kernel: letting S>1 pull
+     * them into IDOT is much faster but costs ~12% perplexity (measured). Batching alone is
+     * bit-identical to upstream; the kernel switch is not. */
+    matmul_qt_ex(QR, x, &l->q_a, S, 0);
+    for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
+        rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */
+    matmul_qt_ex(Q, QR, &l->q_b, S, 0);
+    matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
-        const float *xs=x+(int64_t)s*D; int pos=positions?positions[s]:pos_base+s;
-        float *qresid=QR+(int64_t)s*c->q_lora;
-        matmul_qt(qresid, xs, &l->q_a, 1);
-        rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
-        float *qfull=Q+(int64_t)s*H*qh; matmul_qt(qfull, qresid, &l->q_b, 1);
+        int pos=positions?positions[s]:pos_base+s;
+        float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
-        matmul_qt(comp, xs, &l->kv_a, 1);
+        const float *cs=comp+(int64_t)s*cw;
         float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
         float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
-        memcpy(Ldst, comp, c->kv_lora*sizeof(float));
+        memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
-        memcpy(Rdst, comp+c->kv_lora, c->qk_rope*sizeof(float));
+        memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
         rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
     }
     /* ---- DSA lightning indexer ----
@@ -1605,14 +1630,23 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
+            /* BATCH-ROWS, come le proiezioni di attenzione sopra: ix_wk (D x index_hd) veniva
+             * ri-letto per OGNI token. matmul_qt_ex(...,0) lo tiene sul kernel int4 ESATTO:
+             * il batch da solo supererebbe il gate S>=g_i4s e cambierebbe la quantizzazione
+             * delle attivazioni. Cosi' l'output resta bit-identical.
+             * EN: batch ix_wk over all S rows like the attention projections; allow_idot=0
+             * keeps it on the exact int4 kernel so the result stays bit-identical. */
+            float *KD=falloc((int64_t)S*hd);
+            matmul_qt_ex(KD, x, &m->ix_wk[layer], S, 0);
             for(int s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
-                const float *xs=x+(int64_t)s*D; int pos=positions?positions[s]:pos_base+s;
+                int pos=positions?positions[s]:pos_base+s;
                 float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
-                matmul_qt(kd, xs, &m->ix_wk[layer], 1);
+                memcpy(kd, KD+(int64_t)s*hd, (size_t)hd*sizeof(float));
                 layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, 1e-6f);
                 rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
             }
+            free(KD);
             if((int64_t)S*dtopk > m->dsa_scap){
                 free(m->dsa_sel); free(m->dsa_nsel);
                 m->dsa_scap=(int64_t)S*dtopk;
@@ -2475,7 +2509,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
-    float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
+    float *logit=falloc(c->vocab); matmul_qt_ex(logit,last,&m->lm_head,1,!g_lmhead_exact);
     m->t_head += now_s()-th0;
     free(x); free(last); return logit;
 }
@@ -2490,7 +2524,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+        matmul_qt_ex(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1, !g_lmhead_exact); }
     free(x); free(row); return lo;
 }
 
@@ -2524,7 +2558,7 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
     double th0=now_s();
     float *logit=falloc((int64_t)S*c->vocab);
-    matmul_qt(logit,norm,&m->lm_head,S);
+    matmul_qt_ex(logit,norm,&m->lm_head,S,!g_lmhead_exact);
     m->t_head+=now_s()-th0;
     free(x); free(norm);
     return logit;
@@ -2573,12 +2607,12 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
-        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
+        if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt_ex(logit, row, &m->lm_head, 1, !g_lmhead_exact);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
         double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
-        matmul_qt(logit, row, &m->lm_head, 1);
+        matmul_qt_ex(logit, row, &m->lm_head, 1, !g_lmhead_exact);
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
@@ -2826,8 +2860,8 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     float *lo=falloc(c->vocab);
     float *row=falloc(D);
     for(int s=0;s<S;s++){
-        rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt(lo, row, &m->lm_head, 1);
+        rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
+        matmul_qt_ex(lo, row, &m->lm_head, 1, !g_lmhead_exact);   /* exact-mode knob (#152) */
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
     }
@@ -2864,7 +2898,7 @@ static void run_score(Model *m, const char *path){
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt(lo,row,&m->lm_head,1);
+            matmul_qt_ex(lo,row,&m->lm_head,1,!g_lmhead_exact);
             int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
@@ -4014,6 +4048,12 @@ int main(int argc, char **argv){
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
+    g_lmhead_exact = getenv("LMHEAD_EXACT")?atoi(getenv("LMHEAD_EXACT")):0;
+    /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
+     * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
+     * EN: matmul_qt documents the int4 IDOT threshold as "configurable via I4S", but the
+     * getenv was missing, so the knob did nothing. I4S=<n> -> int4 IDOT only for S>=n. */
+    if(getenv("I4S")) g_i4s=atoi(getenv("I4S"));
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
