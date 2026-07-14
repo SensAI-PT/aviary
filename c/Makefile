@@ -71,6 +71,12 @@ EXE     =
 endif
 endif
 
+# --- install ---
+PREFIX     ?= /usr/local
+BINDIR     ?= $(PREFIX)/bin
+LIBEXECDIR ?= $(PREFIX)/libexec/colibri
+INSTALL    ?= install
+
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
 #
@@ -222,7 +228,23 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
+install: glm$(EXE) olmoe$(EXE)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
+	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
+	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
+	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/coli
+	rm -rf $(DESTDIR)$(LIBEXECDIR)
+
 clean:
 	$(PYTHON) tools/clean.py
 
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
+bench: iobench$(EXE)
+	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
