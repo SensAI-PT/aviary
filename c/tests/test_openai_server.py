@@ -99,6 +99,16 @@ class TemplateTest(unittest.TestCase):
             generation_options({"response_format": {"type": "yaml"}}, 8)
         with self.assertRaises(APIError):
             generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        with self.assertRaises(APIError):   # non-dict response_format
+            generation_options({"response_format": "json"}, 8)
+        with self.assertRaises(APIError):   # empty gbnf
+            generation_options({"response_format": {"type": "gbnf", "grammar": "  "}}, 8)
+        with self.assertRaises(APIError):   # oversized grammar (> 1 MiB pre-check)
+            generation_options({"response_format": {"type": "gbnf", "grammar": "x" * ((1 << 20) + 1)}}, 8)
+        # malformed GBNF passes the gateway by design: the ENGINE fail-softs it
+        # (draft source only — bad grammar costs the speedup, never the request)
+        opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
+        self.assertEqual(opts[3], "not a grammar ::=")
 
 
 class ProtocolTest(unittest.TestCase):

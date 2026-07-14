@@ -468,6 +468,9 @@ def generation_options(body, limit):
             raise APIError(400, "`response_format.type` must be \"text\", \"json_object\", "
                                 "\"json_schema\" or \"gbnf\".",
                            "response_format", "unsupported_value")
+        if grammar is not None and len(grammar.encode("utf-8")) > (1 << 20):
+            raise APIError(400, "`response_format` grammar/schema exceeds 1 MiB.",
+                           "response_format", "invalid_value")
 
     maximum = body.get("max_completion_tokens")
     maximum_param = "max_completion_tokens"
