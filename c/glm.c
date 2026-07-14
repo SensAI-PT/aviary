@@ -3418,6 +3418,14 @@ static void run_serve_mux(Model *m, const char *snap){
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+#ifdef _WIN32
+    /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
+     * fread() payloads (waits forever for the missing bytes) and expands LF on the
+     * way out (corrupting the READY/STAT sentinels). BINARY on both ends. (#195) */
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
     setvbuf(stdin,NULL,_IONBF,0);
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     hwinfo_emit(m);
@@ -3441,16 +3449,16 @@ static void run_serve_mux(Model *m, const char *snap){
 #elif defined(_WIN32)
             HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
             DWORD avail=0;
-            /* WaitForSingleObject(handle, 0) is non-blocking and works on both
-             * pipe and console handles; for pipes PeekNamedPipe gives the byte
-             * count. Either returns "data is there right now". When a decode
-             * is active we poll (timeout 0); when idle we block until input. */
-            if(active){
-                ready=(WaitForSingleObject(ih,0)==WAIT_OBJECT_0)?1:0;
-            } else {
-                ready=(WaitForSingleObject(ih,INFINITE)==WAIT_OBJECT_0)?1:0;
-            }
-            if(ready && PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)
+            /* Anonymous pipes are NOT waitable objects: WaitForSingleObject on them is
+             * undefined (always-signaled or WAIT_FAILED), and PeekNamedPipe fails on
+             * file/console handles — the old gate never dispatched (#195). New rule:
+             * idle -> block in getline() inside mux_submit (same semantics as the
+             * POSIX select(NULL)); active -> poll the pipe with PeekNamedPipe, and on
+             * non-pipe stdin just defer submits until the batch finishes. */
+            if(eof) ready=0;
+            else if(!active) ready=1;
+            else ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
+            if(ready)
 #endif
                 if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
         }
