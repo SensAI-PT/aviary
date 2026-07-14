@@ -174,6 +174,12 @@ typedef struct {
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
+    /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
+     * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
+    int ld_ctx;
+    uint64_t miss_draft, miss_absorb;            /* miss in moe() per contesto */
+    uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
+    uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -835,6 +841,11 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (miss LRU) in
+                          * draft MTP / absorb / verify-main e in layer MTP (int8) vs main
+                          * (int4), con i byte letti. Default OFF: a flag spento gli atomic
+                          * non vengono MAI toccati (zero overhead), le righe extra di stats
+                          * non vengono stampate. Solo misura: nessun effetto sull'output. */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
  * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
 static void *qalloc(size_t n){
@@ -1222,6 +1233,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
+    }
+    if(g_disk_split){ /* split load/byte per tipo layer; atomici: expert_load gira anche su OMP/pipe/pilot */
+        int64_t tb=0; for(int k=0;k<3;k++) tb+=tw[k]->nbytes+tq[k]->nbytes;
+        if(layer==c->n_layers){ __atomic_add_fetch(&m->ld_mtp,1,__ATOMIC_RELAXED);
+                                __atomic_add_fetch(&m->bytes_mtp,(uint64_t)tb,__ATOMIC_RELAXED); }
+        else                  { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED);
+                                __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
     }
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
@@ -1848,7 +1866,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
+                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
         int metal_done=0;
 #ifdef COLI_METAL
@@ -2445,6 +2464,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h, m->hlast, D*sizeof(float));
     int tok=next_tok, n=0;
+    m->ld_ctx=1;                                 /* DISK_SPLIT: i load da qui sono draft-path */
     int prenorm = getenv("MTP_PRENORM")!=NULL;
     for(int g=0; g<G; g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
@@ -2469,6 +2489,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
         draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
     }
+    m->ld_ctx=0;
     free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
     return n;
 }
@@ -2492,7 +2513,9 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
         matmul_qt(hx+(int64_t)i*D, cat, &m->eh_proj, 1);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+    m->ld_ctx=2;                                 /* DISK_SPLIT: load del layer MTP in absorb */
     layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
+    m->ld_ctx=0;
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
 
@@ -2843,6 +2866,13 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
     if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
+    if(g_disk_split) printf("disk-load split: draft %llu + absorb %llu + verify/main %llu misses | "
+           "MTP-layer %llu loads %.2f GB | main-layers %llu loads %.2f GB (MTP %.1f%% of bytes)\n",
+        (unsigned long long)m->miss_draft, (unsigned long long)m->miss_absorb,
+        (unsigned long long)(m->miss - m->miss_draft - m->miss_absorb),
+        (unsigned long long)m->ld_mtp, m->bytes_mtp/1e9,
+        (unsigned long long)m->ld_main, m->bytes_main/1e9,
+        (m->bytes_mtp+m->bytes_main)?100.0*m->bytes_mtp/(m->bytes_mtp+m->bytes_main):0.0);
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
@@ -3721,6 +3751,7 @@ int main(int argc, char **argv){
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
+    g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
