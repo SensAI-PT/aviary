@@ -3962,10 +3962,36 @@ static void repin_pass(Model *m){ repin_pass_limit(m,16); }
  * grammar_draft propone lo span FORZATO successivo (un solo byte legale per posizione)
  * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
  * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
+/* Compile grammar TEXT into g: raw GBNF, or — if the first non-space byte is '{'
+ * — a JSON-Schema compiled via schema_gbnf.h. Takes ownership of txt (always
+ * freed). Fail-soft: returns -1 with g->on=0, engine runs without a grammar. */
+static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
+    const char *p=txt; while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+    if(*p=='{'){
+        char serr[160];
+        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
+        free(txt);
+        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",label,serr); return -1; }
+        txt=gbnf;
+    }
+    if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
+    free(txt);
+    gr_state_init(&g->st,&g->gram);
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(g->max<1) g->max=24;
+    if(g->max>48) g->max=48;
+    g->T=T; g->on=1; g->armed=0;
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",label,g->gram.n,g->max);
+    return 0;
+}
+/* Release a per-request grammar so the slot can host the next request (keeps max). */
+static void grammar_teardown(GrDraft *g){
+    if(g->gram.n) gr_free(&g->gram);
+    int max=g->max; memset(g,0,sizeof(*g)); g->max=max;
+}
 static void grammar_setup(GrDraft *g, Tok *T){
     /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
-     * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
-     * runs without a grammar and output is unchanged. */
+     * to GBNF. Both fail soft: the engine runs without a grammar, output unchanged. */
     const char *gf=getenv("GRAMMAR");
     const char *sf=(gf&&*gf)?NULL:getenv("SCHEMA");
     if((!gf||!*gf)&&(!sf||!*sf)) return;
@@ -3977,22 +4003,8 @@ static void grammar_setup(GrDraft *g, Tok *T){
     if(!txt || fread(txt,1,(size_t)n,f)!=(size_t)n){
         fprintf(stderr,"[GRAMMAR] failed to read %s\n",path); fclose(f); free(txt); return; }
     fclose(f); txt[n]=0;
-    if(sf){ /* schema -> GBNF, then the same gr_parse as the GRAMMAR path */
-        char serr[160];
-        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
-        free(txt);
-        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",sf,serr); return; }
-        txt=gbnf;
-    }
-    if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g->gram.err); free(txt); return; }
-    free(txt);
-    gr_state_init(&g->st,&g->gram);
-    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
     if(getenv("GRAMMAR_DRAFT")) g->max=atoi(getenv("GRAMMAR_DRAFT"));
-    if(g->max<1) g->max=1;
-    if(g->max>48) g->max=48;
-    g->T=T; g->on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g->gram.n,g->max);
+    grammar_setup_text(g,T,txt,path);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
 static void grammar_reset(GrDraft *g){
@@ -4811,8 +4823,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
-static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
-                      int maxctx, int eos){
+static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *grd,
+                      int nctx, int maxctx, int eos){
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
@@ -4833,21 +4845,31 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
+    char *gtxt=NULL;                     /* optional per-request grammar/schema text */
+    if(sub.gbytes){
+        gtxt=malloc((size_t)sub.gbytes+1);
+        if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
+        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
+            free(gtxt); free(raw); free(line); return -1; }
+        gtxt[sub.gbytes]=0;
+    }
     int delim=fgetc(stdin);
     if(delim!='\n'){
         printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
-        free(raw); free(line); return -1;
+        free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
-        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     if(req[sub.slot].active){
-        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
-        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
+    grammar_teardown(&grd[sub.slot]);    /* new request owns the slot's grammar state */
+    if(gtxt) grammar_setup_text(&grd[sub.slot],T,gtxt,"request");   /* fail-soft; owns gtxt */
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
@@ -4873,6 +4895,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
     if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next);
     if(r->emitted>=r->maximum) mux_done(m,sc,r);
     return 1;
@@ -4881,14 +4904,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
-    g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
+    g_draft=0; /* one scheduler owns every forward; MTP/n-gram speculation is not ragged-safe.
+                * Grammar-forced drafts ARE mux-safe (below): a drafting slot leaves the shared
+                * batch for one forward and runs the proven single-sequence verify path
+                * (kv_bind + step_all), exactly like prefill already does per submission. */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
-    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    GrDraft *grd=calloc(nctx,sizeof(*grd));   /* per-slot request grammars (SUBMIT 7th field) */
+    for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx); grd[i].max=24; }
 #ifdef _WIN32
     /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
      * fread() payloads (waits forever for the missing bytes) and expands LF on the
@@ -4936,14 +4963,47 @@ static void run_serve_mux(Model *m, const char *snap){
             else ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
             if(ready)
 #endif
-                if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+                if(mux_submit(m,&T,ctx,req,grd,nctx,maxctx,eos)<0) eof=1;
         }
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[512]; int slots[512], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){
-            rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
+            ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i]; GrDraft *gd=&grd[i];
+            /* grammar-forced drafts (greedy requests only: verification under sampling
+             * needs rejection resampling, out of scope here). The slot leaves the shared
+             * batch for one forward and runs the single-sequence verify path. */
+            int draft[49], k=0;
+            if(gd->on && r->temp==0) k=grammar_draft(gd,draft,gd->max);
+            if(k>0 && sc->len+1+k<maxctx-1){
+                if(sc->len+1+k>=(int)sc->kv.max_t) k=(int)sc->kv.max_t-sc->len-2;
+                if(k<1){ rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i; continue; }
+                kv_bind(m,&sc->kv);
+                int seq[50]; seq[0]=r->pending;
+                memcpy(seq+1,draft,(size_t)k*sizeof(int));
+                float *lo=step_all(m,seq,1+k,sc->len); m->n_fw++;
+                gd->prop+=(uint64_t)k;
+                int done=0;
+                for(int j=0;j<=k && !done;j++){
+                    g_temp=r->temp; g_nuc=r->top_p;
+                    int next=pick_tok(lo+(int64_t)j*m->c.vocab,m->c.vocab,-1);
+                    sc->len++;                       /* seq[j] joins the committed history */
+                    if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
+                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+                    if(gd->on) gr_feed(gd,next);
+                    mux_data(&T,r->id,next);
+                    if(r->emitted>=r->maximum){ mux_done(m,sc,r); done=1; break; }
+                    if(j<k){
+                        if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
+                        gd->acc++;
+                    }
+                }
+                free(lo);
+                continue;                            /* handled outside the shared batch */
+            }
+            rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i;
         }
+        if(S==0) continue;               /* every active slot drafted this round */
         double tf0=g_prof?now_s():0;
         float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
         m->n_fw++;
@@ -4954,13 +5014,15 @@ static void run_serve_mux(Model *m, const char *snap){
             int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next);
             if(r->emitted>=r->maximum) mux_done(m,sc,r);
         }
         free(lo);
     }
     usage_save(m);
-    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
+    for(int i=0;i<nctx;i++){ serve_ctx_free(m,&ctx[i]); grammar_teardown(&grd[i]); }
+    free(ctx); free(req); free(grd);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
