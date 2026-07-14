@@ -3677,7 +3677,7 @@ static void ehit_mark(Model *m, int layer, int eid){
 
 /* HWINFO: hardware snapshot for the web dashboard — emitted once at READY. */
 static void hwinfo_emit(Model *m){
-    Cfg *c=&m->c;
+    Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
     /* CPU */
     char cpu[256]=""; FILE *ci=fopen("/proc/cpuinfo","r");
     if(ci){ char ln[256];
