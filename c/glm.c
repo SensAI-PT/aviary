@@ -1282,6 +1282,29 @@ static void load_cfg(Cfg *c, const char *snap){
     free(ar);
 }
 
+/* Derive the fmt=4 group size from the scale-array byte count. A grouped-int4
+ * tensor stores ceil(I/gs) f32 scales per output row, so:
+ *     ns_bytes == O * ceil(I/gs) * 4   =>   gs == I * 4 / (ns_bytes/O - ... )
+ * We probe candidate group sizes (must be a multiple of 16, the AVX2 vector
+ * width the grouped kernel requires) from finest to coarsest and return the
+ * first whose predicted scale-array size matches ns_bytes. Returns 0 if no
+ * candidate fits (then it's plain per-row int4, fmt=2, not grouped).
+ * Data-driven: g64/g128/g256 all just work; adding a size means listing it. */
+static int detect_group_size(int O, int I, int64_t ns){
+    if(O<=0 || ns<=(int64_t)O*4 || I<=0) return 0;   /* not grouped */
+    /* ns/O is the per-row scale bytes; groups = (ns/O)/4; gs = ceil(I/groups).
+     * Probe from small gs (finest granularity) upward so the most granular
+     * match wins — that's what we want, since finer groups are unambiguous. */
+    static const int cands[]={16,32,48,64,96,128,192,256};
+    for(int ci=0; ci<(int)(sizeof(cands)/sizeof(cands[0])); ci++){
+        int gs=cands[ci];
+        if(gs>I) break;
+        int ng=(I+gs-1)/gs;
+        if(ns==(int64_t)O*ng*4) return gs;
+    }
+    return 0;
+}
+
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1292,15 +1315,11 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         int64_t nb=st_nbytes(&m->S,name);
         int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
         /* Detect int4-grouped (fmt=4): packed int4 weight bytes BUT scale array is
-         * larger than O*4 — check if it matches O*ceil(I/gs)*4 for gs=128. */
+         * larger than O*4 — the group size is derived from the scale-array size. */
         int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;
         int gs=0;
-        if(fmt==2 && ns > (int64_t)O*4){
-            /* could be grouped; try gs=128 */
-            int ng128=(I+127)/128;
-            if(ns==(int64_t)O*ng128*4){ fmt=4; gs=128; }
-            /* future: try other group sizes here */
-        }
+        if(fmt==2) gs=detect_group_size(O,I,ns);
+        if(gs>0) fmt=4;
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1630,10 +1649,8 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
                 /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
                 int gs=0;
-                if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
-                    int ng128=(II[k]+127)/128;
-                    if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
-                }
+                if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
+                if(gs>0) fmt=4;
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1749,10 +1766,8 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         int64_t nb=tw[k]->nbytes;
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         int gs=0;
-        if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
-            int ng128=(II[k]+127)/128;
-            if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
-        }
+        if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
+        if(gs>0) fmt=4;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
