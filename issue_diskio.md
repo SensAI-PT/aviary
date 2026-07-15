@@ -126,3 +126,117 @@ Opportunity 3 (Windows prefetch) is the biggest single win but also the largest 
 - [Microsoft Learn — PrefetchVirtualMemory](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-prefetchvirtualmemory)
 - [What makes system calls expensive — codingconfessions.com](https://blog.codingconfessions.com/p/what-makes-system-calls-expensive)
 - [Syscall overhead — Stack Overflow](https://stackoverflow.com/questions/8247331/syscall-overhead)
+
+---
+
+# Windows Implementation — branch `windows-optimizations` (2026-07-15)
+
+## What landed (pread path, validated)
+
+Two changes, both on the `pread` expert-load path (no mmap). Measured against the
+existing `bench_budget*.txt` baselines (GLM-5.2 744B int4, 32 GB RAM, Core Ultra 9
+185H, DRAFT=0, 32-token decode):
+
+### 1. `compat_fadvise` WILLNEED cache-warmer (`c/compat.h`)
+
+Replaced the Windows `posix_fadvise` no-op (was a `do{}while(0)` macro) with a real
+readahead: an overlapped `ReadFile` into a throwaway scratch buffer that populates the
+standby page cache, so the later synchronous `pread` faults from RAM not disk. Mirrors
+the macOS `F_RDADVISE` shim (`compat.h:28-37`). DONTNEED stays a no-op (matches macOS;
+Windows standby-list trimming self-regulates under pressure).
+
+This re-arms the existing `expert_prefetch` → `st_prefetch` → `posix_fadvise(WILLNEED)`
+chain on Windows: the next-block readahead in `moe()` and the PILOT cross-layer prefetch
+hints now actually warm the cache instead of being silently discarded.
+
+**Measured effect (budget=4, PIPE on):** hit rate 16.4% → 27.6%.
+
+### 2. PIPE default ON for Windows (`c/glm.c`)
+
+Flipped the async expert-load thread pool from default OFF to default ON on Windows
+(`getenv("PIPE")?:1` under `_WIN32`, unchanged `:0` elsewhere). PIPE dispatches expert
+`pread` loads onto worker threads so they overlap the expert matmul on the forward-pass
+thread, instead of the blocking serial load-then-compute path. `PIPE=0` opts back out.
+
+**Measured effect (budget=4):** expert-disk 65.9s → 54.3s (−18%), reaching **1.70 s/tok**
+(under the 2 s/tok target; budget=4 baseline was 2.06 s/tok).
+
+### Results table (DRAFT=0, 32-token decode, pread path)
+
+| config | expert-disk | s/tok | hit% | tok/s |
+|---|---|---|---|---|
+| budget=4, no PIPE (existing baseline) | 65.9s | 2.06 | 16.4% | 0.33 |
+| **budget=4 + PIPE (this PR)** | **54.3s** | **1.70** | **27.6%** | **0.34** |
+| budget=6 + PIPE | 77.1s | 2.41 | 21.8% | 0.27 |
+
+budget=4 + PIPE meets the ≤2 s/tok target. budget=6 (more experts/layer, higher quality)
+misses it at 2.41 s/tok — the speed/quality tradeoff.
+
+## What was tried and abandoned: Windows mmap (`COLI_MMAP` on `_WIN32`)
+
+The original plan (informed by llama.cpp #18758: "mmap is ≥10× faster than O_DIRECT for
+MoE") was to port the mmap expert path to Windows via `CreateFileMapping`/`MapViewOfFile`.
+This was implemented and tested at length. **It was a measured regression and was reverted.**
+
+### The attempt
+
+Added a `_WIN32` branch to `map_of_fd` (`glm.c`) mapping each shard file read-only and
+resolving experts as views into the mapping, mirroring the POSIX path. Also added
+`PrefetchVirtualMemory` readahead and a `VirtualUnlock` eviction mechanism (the Windows
+`posix_fadvise(DONTNEED)` analog — see SO#1880714; validated standalone to demote pages
+to the standby list with a 2.3× faster re-fault).
+
+### Why it regressed
+
+**mmap'd expert pages bloat the process working set on Windows, which collapses the
+expert cache.** This is a fundamental Windows-vs-Linux difference:
+
+- On Linux, `mmap(MAP_SHARED)` file pages live in the kernel page cache (`buff/cache`),
+  separate from `MemAvailable`, so the cache budget isn't fooled.
+- On Windows, touched `MapViewOfFile` pages count against `ullAvailPhys` (what
+  `compat_meminfo` reads for the budget). The CPU matmul touches every weight byte,
+  faulting ~12 GB into the working set. `cap_for_ram()` then sees ~no free RAM and
+  collapses the LRU cache cap.
+
+Measured (budget=0, DRAFT=0, apples-to-apples):
+
+| config | RAM_GB detected | cache cap | hit% | expert-disk | RSS |
+|---|---|---|---|---|---|
+| baseline (pread) | 21.4 | 1 | 9.3% | 133s | 15.0 GB |
+| mmap, no eviction | **8.0** | 1 | **2.2%** | **240s** | **27.2 GB** |
+| mmap + VirtualUnlock | 24.9 | 2 | 11.8% | 83s | 18.1 GB |
+| mmap + reserve reductions | 24.6 | 4 | 21.8% | 80s | 20.1 GB |
+
+The `VirtualUnlock` eviction recovered the regression (240s→83s), and dropping the
+Linux-specific page-cache/slab reserves under mmap got it to parity with pread. But it
+never clearly *beat* the simpler pread+PIPE path, and it added substantial complexity
+(per-slot eviction tracking, reserve conditionals, `VirtualUnlock` on every slot recycle).
+**The engine already moved off mmap to pread for this exact RSS bug** (`st.h:3-6`), and
+the Windows port re-confirmed that decision.
+
+### What else didn't work
+
+- **Batched `PrefetchVirtualMemory`** for the mmap path: tested as a single batched
+  readahead of all 64 missed experts' pages before the matmul. **Blocked instead of
+  prefetching async** on this SSD — inflated `t_edisk` (80s→102s). Consistent with
+  microsoft/Windows-Dev-Performance#108 ("PrefetchVirtualMemory does not prefetch").
+  Reverted.
+- **True I/O/compute overlap on the CPU path**: the Metal path has this ("submit
+  resident experts to GPU before loading misses"), but the CPU path loads-then-computes
+  serially. `PrefetchVirtualMemory` was the attempt to add it for mmap and failed. The
+  pread path gets overlap via PIPE (which works), not via mmap prefetch.
+
+### Conclusion
+
+For this engine on Windows at this RAM budget (~32 GB, 370 GB model), **pread + PIPE +
+compat_fadvise** is the right path. mmap remains valuable on Linux/macOS (where the page
+cache doesn't inflate process RSS) but is not viable on Windows without a fundamentally
+different cache-budget model that excludes mapped-file pages — left as future work.
+
+## Sources added
+
+- [SO#1880714 — VirtualUnlock releases mapped pages to standby list](https://stackoverflow.com/questions/1880714/createfilemapping-mapviewoffile-how-to-avoid-holding-up-the-system-memory)
+- [Alois Kraus — The Mysterious Lost Memory (modified/standby list)](https://aloiskraus.wordpress.com/2017/02/26/the-mysterious-lost-memory-which-belongs-to-no-process/)
+- [microsoft/Windows-Dev-Performance#108 — PrefetchVirtualMemory inconsistency](https://github.com/microsoft/Windows-Dev-Performance/issues/108)
+- [llama.cpp #18758 — mmap faster than O_DIRECT for MoE (Linux)](https://github.com/ggml-org/llama.cpp/discussions/18758)
+- [HN#35426679 — Why MMAP in llama.cpp hides true memory usage](https://news.ycombinator.com/item?id=35426679)

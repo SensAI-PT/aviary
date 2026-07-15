@@ -1622,7 +1622,10 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
  * condvar exist ONLY to park/wake idle workers, never for correctness. Gated
  * behind PIPE=1; OFF => the original blocking-load + serial-matmul path runs
  * byte-identically. */
-static int g_pipe=0;      /* PIPE=1: async expert-load pipeline (default OFF) */
+static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for Windows
+                           * (parsed in main: getenv("PIPE")?:1 on _WIN32, :0 elsewhere).
+                           * Keeps expert pread off the forward-pass thread so loads overlap
+                           * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
 typedef struct {
     _Atomic uint64_t cur;                         /* (gen<<8)|index; gen main-only, index 0..njobs (≤64) */
@@ -5078,7 +5081,13 @@ int main(int argc, char **argv){
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
-    g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
+    g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
+#ifdef _WIN32
+        1                        /* default ON: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=0 opts out */
+#else
+        0
+#endif
+        ;
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
