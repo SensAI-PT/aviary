@@ -84,6 +84,9 @@ int main(void){
         }
         close(fd); return fail("io_uring_setup");
     }
+    if(coli_uring_set_workers(&ring,4)){
+        coli_uring_close(&ring); close(fd); return fail("io-wq worker limit");
+    }
     for(int i=0;i<N;i++) if(coli_uring_prep_read(&ring,fd,dst[i],SZ,(off_t)i*SZ,(uint64_t)i+1)){
         coli_uring_close(&ring); close(fd); return fail("prepare read");
     }

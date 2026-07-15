@@ -5259,6 +5259,7 @@ int main(int argc, char **argv){
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
+    g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
     if(g_uring){
 #ifdef __linux__
@@ -5267,13 +5268,17 @@ int main(int argc, char **argv){
         if(uring_batch_init(&g_ub_pipe) || (g_pilot_real&&uring_batch_init(&g_ub_pilot))){
             fprintf(stderr,"URING=1: io_uring_setup failed: %s\n",strerror(errno)); return 2;
         }
-        fprintf(stderr,"[URING] queued expert I/O active (depth=%d%s)\n",URING_REQ_MAX,
-                g_pilot_real?", batched PILOT_REAL":"");
+        unsigned uw=(unsigned)(g_pipe_nw>64?64:g_pipe_nw);
+        if(coli_uring_set_workers(&g_ub_pipe.ring,uw) ||
+           (g_pilot_real&&coli_uring_set_workers(&g_ub_pilot.ring,uw)))
+            fprintf(stderr,"[URING] warning: cannot set io-wq workers=%u: %s\n",uw,strerror(errno));
+        fprintf(stderr,"[URING] queued expert I/O active (depth=%d, workers=%u, %s%s)\n",URING_REQ_MAX,uw,
+                g_direct?"O_DIRECT":"buffered",g_pilot_real?", batched PILOT_REAL":"");
+        if(!g_direct) fprintf(stderr,"[URING] cold NVMe: DIRECT=1 avoids page-cache copy/readahead bottlenecks\n");
 #else
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
 #endif
     }
-    g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");

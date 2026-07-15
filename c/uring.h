@@ -81,6 +81,11 @@ static inline int coli_uring_init(ColiUring *r,unsigned entries){
     return 0;
 }
 
+static inline int coli_uring_set_workers(ColiUring *r,unsigned workers){
+    unsigned limits[2]={workers,workers};          /* bounded, unbounded io-wq workers */
+    return (int)syscall(SYS_io_uring_register,r->fd,IORING_REGISTER_IOWQ_MAX_WORKERS,limits,2);
+}
+
 static inline int coli_uring_prep_read(ColiUring *r,int fd,void *buf,size_t len,
                                        int64_t off,uint64_t user_data){
     if(!len || len>UINT32_MAX){ errno=EINVAL; return -1; }
@@ -91,6 +96,12 @@ static inline int coli_uring_prep_read(ColiUring *r,int fd,void *buf,size_t len,
     struct io_uring_sqe *sqe=&r->sqes[idx];
     memset(sqe,0,sizeof(*sqe));
     sqe->opcode=IORING_OP_READ;
+    /* Cold regular-file reads are allowed to execute inline during
+     * io_uring_enter() unless forced async.  That serializes the submitter on
+     * filesystems without native nonblocking buffered reads and destroys the
+     * intended I/O/compute overlap.  io-wq gives the ring a real bounded worker
+     * pool while CQEs retain completion ordering/ownership here. */
+    sqe->flags=IOSQE_ASYNC;
     sqe->fd=fd;
     sqe->off=(uint64_t)off;
     sqe->addr=(uint64_t)(uintptr_t)buf;
