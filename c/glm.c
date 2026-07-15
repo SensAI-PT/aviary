@@ -3916,6 +3916,14 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         for(int i=0;i<4;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
+    /* TOKENS=1: dump the generated token ids (newline-separated) to stderr,
+     * for exact A/B comparison across decode paths (e.g. resident vs CPU).
+     * The ids are all[np .. np+produced-1]. */
+    if(getenv("TOKENS") && atoi(getenv("TOKENS"))){
+        fprintf(stderr,"[TOKENS] %d generated:",produced);
+        for(int i=np;i<np+produced;i++) fprintf(stderr," %d",all[i]);
+        fprintf(stderr,"\n");
+    }
     free(pids); free(all);
     usage_save(m);
 }
