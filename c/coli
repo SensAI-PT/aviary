@@ -438,6 +438,8 @@ def cmd_chat(a):
         try: errlog.write(p.stderr.read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
         errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
+    p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
+                          # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
     # the engine is still alive (blocked on stdin), so a plain read() would
     # hang forever waiting for EOF. A short bounded drain grabs the ~400 bytes
