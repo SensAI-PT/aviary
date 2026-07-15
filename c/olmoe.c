@@ -89,8 +89,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+static volatile int g_curr_layer = 0; /* current layer processed by the main thread */
+static const int g_asymmetric_caps[16] = {
+    34, 36, 34, 34, 28, 30, 26, 28, 34, 34, 34, 34, 34, 36, 30, 30
+};
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
+static void pilot_prefetch_next_token(Model *m, int lnext);
 
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
@@ -254,7 +259,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
     m->total_cap = cap;
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    for (int i = 0; i < c->n_layers; i++) {
+        m->cache[i].cap = cap;
+        m->cache[i].slots = calloc(cap, sizeof(Slot));
+    }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
     m->hot_pinned = 0; m->freq_token_count = 0;
@@ -347,26 +355,41 @@ static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
     if (m->hot_n <= 0 || m->hot_pinned) return;
     m->hot_pinned = 1;
-    int hn = m->hot_n < c->n_experts ? m->hot_n : c->n_experts;
+    
+    int is_dynamic = (m->hot_n >= 20);
+    double thresh = is_dynamic ? (double)m->hot_n / 1000.0 : 0.0;
+    
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
         uint32_t *freq_l = m->freq + (int64_t)l * c->n_experts;
+        
+        uint64_t layer_total = 0;
+        for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
+        if (layer_total == 0) continue;
+        
+        int max_pin = m->cache[l].cap - 8;
+        if (max_pin < 4) max_pin = 4;
+        
+        int hn = is_dynamic ? max_pin : (m->hot_n < c->n_experts ? m->hot_n : c->n_experts);
         int hot_eids[256];
-        /* Find top hn experts by activation frequency */
+        int actual_hn = 0;
+        
         for (int k = 0; k < hn; k++) {
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < c->n_experts; e++) {
                 int already = 0;
-                for (int j = 0; j < k; j++) if (hot_eids[j] == e) { already=1; break; }
+                for (int j = 0; j < k; j++) if (hot_eids[j] == e) { already = 1; break; }
                 if (!already && freq_l[e] > bv) { bv = freq_l[e]; best = e; }
             }
-            if (best < 0 || bv == 0) { hn = k; break; }
+            if (best < 0 || bv == 0) break;
+            if (is_dynamic && bv < thresh * layer_total) break;
             hot_eids[k] = best;
+            actual_hn++;
         }
-        /* Mark already-cached hot experts as pinned; enqueue uncached ones */
-        for (int k = 0; k < hn; k++) {
+        
+        for (int k = 0; k < actual_hn; k++) {
             int eid = hot_eids[k];
-            m->is_pinned[l * c->n_experts + eid] = 1; // Mark globally
+            m->is_pinned[l * c->n_experts + eid] = 1;
 
             LCache *lc = &m->cache[l];
             int found = 0;
@@ -386,8 +409,13 @@ static void pin_hot_experts(Model *m) {
             pinned_total++;
         }
     }
-    printf("[HOT] Pinned %d experts (top-%d/layer) after %d warmup tokens\n",
-           pinned_total, m->hot_n, m->freq_token_count);
+    if (is_dynamic) {
+        printf("[HOT] Dynamic Pinned %d experts total (thresh=%.1f%%) after %d warmup tokens\n",
+               pinned_total, thresh * 100.0, m->freq_token_count);
+    } else {
+        printf("[HOT] Pinned %d experts (top-%d/layer) after %d warmup tokens\n",
+               pinned_total, m->hot_n, m->freq_token_count);
+    }
 }
 
 /* ---------- IMPROVEMENT 3: adaptive per-layer cache rebalancing ---------- */
@@ -484,6 +512,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
+        if (layer == 0 && m->momentum_logits) {
+            float *ema = m->momentum_logits;
+            int is_zero = 1;
+            for (int e = 0; e < E; e++) { if (ema[e] != 0.f) { is_zero = 0; break; } }
+            if (is_zero) {
+                for (int e = 0; e < E; e++) ema[e] = pr[e];
+            } else {
+                for (int e = 0; e < E; e++) {
+                    ema[e] = (1.f - m->pilot_smooth) * pr[e] + m->pilot_smooth * ema[e];
+                }
+            }
+        }
+
         softmax_row(pr, E);
         /* top-K indici (selezione parziale) */
         int idx[64]; float val[64];
@@ -544,6 +585,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             pilot_prefetch(m, i + 2, x, S);
         if (g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
             pilot_prefetch(m, i + 3, x, S);
+        
     }
     /* IMPROVEMENT 2: count tokens; trigger hot pinning after warmup */
     m->token_count++; m->freq_token_count++;
@@ -744,6 +786,65 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     free(logits);
 }
 
+static void pilot_prefetch_next_token(Model *m, int lnext) {
+    if (lnext < 0 || lnext >= m->c.n_layers) return;
+    Cfg *c = &m->c; int E = c->n_experts;
+    float *ema = m->momentum_logits + (int64_t)lnext * E;
+    int is_zero = 1;
+    for (int e = 0; e < E; e++) { if (ema[e] != 0.f) { is_zero = 0; break; } }
+    if (is_zero) return;
+
+    int cand = c->topk;
+    int idx[64];
+    for (int kk = 0; kk < cand; kk++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            int taken = 0; for (int j = 0; j < kk; j++) if (idx[j] == e) { taken = 1; break; }
+            if (!taken && ema[e] > bv) { bv = ema[e]; best = e; }
+        }
+        idx[kk] = best;
+    }
+
+    for (int a = 0; a < cand - 1; a++)
+        for (int b = a + 1; b < cand; b++)
+            if (idx[b] >= 0 && (idx[a] < 0 || idx[a] > idx[b])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+
+    for (int kk = 0; kk < cand; kk++) {
+        int eid = idx[kk];
+        if (eid < 0) continue;
+        int found = 0;
+        pthread_mutex_lock(&g_pilot_mx);
+        LCache *lc = &m->cache[lnext];
+        for (int z = 0; z < lc->n; z++) {
+            if (lc->slots[z].eid == eid) { found = 1; break; }
+        }
+        pthread_mutex_unlock(&g_pilot_mx);
+        if (!found) {
+            int gidx = lnext * E + eid;
+            pthread_mutex_lock(&g_pilot_mx);
+            int already_queued = m->is_queued[gidx];
+            if (!already_queued) {
+                m->is_queued[gidx] = 1;
+            }
+            pthread_mutex_unlock(&g_pilot_mx);
+
+            if (!already_queued) {
+                unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+                unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+                if (w2 - r2 < 4096) {
+                    pilot_q[w2 & 4095].l = lnext;
+                    pilot_q[w2 & 4095].e = eid;
+                    __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
+                } else {
+                    pthread_mutex_lock(&g_pilot_mx);
+                    m->is_queued[gidx] = 0;
+                    pthread_mutex_unlock(&g_pilot_mx);
+                }
+            }
+        }
+    }
+}
+
 /* generazione greedy. prompt[np] -> riempie out[np+n_new] */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
@@ -821,6 +922,8 @@ int main(int argc, char **argv) {
     printf("\nPEAK RSS: %.2f GB\n", rss_gb());
     printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+
+
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     return 0;
