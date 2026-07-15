@@ -2821,7 +2821,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
                 for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
-                m->t_edisk += now_s()-t0; }
+                m->t_ewait += now_s()-t0; }        /* blocking: whole load stalls compute */
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
@@ -2850,7 +2850,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * correct (and free) when a subset falls back to the CPU. */
             if(g_pipe && nmiss){ double tw=now_s();
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
-                m->t_edisk += now_s()-tw; }
+                m->t_ewait += now_s()-tw; }        /* blocking: drain stalled compute */
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
             if(nbb>0){
                 double t0=now_s();
@@ -2874,7 +2874,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * Stays ABOVE the METAL skip: a subset that fell back to the CPU still needs its
              * slot drained here, and under METAL the block-level drain above already ran (this
              * spin is then a no-op). */
-            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk += now_s()-tw; }
+            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }  /* blocking */
 #ifdef COLI_METAL
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
@@ -4103,7 +4103,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double accounted=m->t_edisk+m->t_ewait+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
