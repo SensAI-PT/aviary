@@ -536,6 +536,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define IDOT_KERNEL "neon-i8mm"
 #elif defined(__ARM_NEON)
 #define IDOT_KERNEL "neon"
 #elif defined(__VSX__)
@@ -789,8 +791,131 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
     return sum;
 }
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+/* SMMLA (i8mm): vmmlaq_s32 vede ogni int8x16_t come matrice 2x8 row-major (byte 0-7 =
+ * riga 0, byte 8-15 = riga 1) e accumula C += A*B^T nel 2x2 int32: lane0=a0.b0,
+ * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine di due mezze-righe costruisce la
+ * matrice: A = due righe di peso (o,o+1), B = due righe di attivazione (s,s+1), quindi
+ * meta' traffico pesi e doppio lavoro per istruzione a S>=2. EN: vmmlaq_s32 treats each
+ * int8x16_t as a 2x8 row-major matrix and does C += A*B^T on a 2x2 int32 tile; vcombine
+ * of vget_low/high halves builds the 2-row register from two weight/activation rows. */
+static inline int32x4_t mm_tile16(int32x4_t acc, int8x16_t wo, int8x16_t wo1,
+                                  int8x16_t xs, int8x16_t xs1){
+    acc=vmmlaq_s32(acc, vcombine_s8(vget_low_s8(wo), vget_low_s8(wo1)),
+                        vcombine_s8(vget_low_s8(xs), vget_low_s8(xs1)));
+    return vmmlaq_s32(acc, vcombine_s8(vget_high_s8(wo), vget_high_s8(wo1)),
+                           vcombine_s8(vget_high_s8(xs), vget_high_s8(xs1)));
+}
+static void matmul_q_idot_mm(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                             const float *scale, int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<(O&~1);o+=2){
+        const int8_t *wo=q+(int64_t)o*I, *wo1=q+(int64_t)(o+1)*I;
+        float sc0=scale[o], sc1=scale[o+1];
+        for(int s=0;s<(S&~1);s+=2){
+            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
+            /* 4 accumulatori indipendenti: una sola catena vmmla e' latency-bound.
+             * EN: 4 independent accumulators; a single vmmla chain is latency-bound. */
+            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
+            for(;i+64<=I;i+=64){
+                a0=mm_tile16(a0,vld1q_s8(wo+i),   vld1q_s8(wo1+i),   vld1q_s8(xs+i),   vld1q_s8(xs1+i));
+                a1=mm_tile16(a1,vld1q_s8(wo+i+16),vld1q_s8(wo1+i+16),vld1q_s8(xs+i+16),vld1q_s8(xs1+i+16));
+                a2=mm_tile16(a2,vld1q_s8(wo+i+32),vld1q_s8(wo1+i+32),vld1q_s8(xs+i+32),vld1q_s8(xs1+i+32));
+                a3=mm_tile16(a3,vld1q_s8(wo+i+48),vld1q_s8(wo1+i+48),vld1q_s8(xs+i+48),vld1q_s8(xs1+i+48));
+            }
+            for(;i+16<=I;i+=16)
+                a0=mm_tile16(a0,vld1q_s8(wo+i),vld1q_s8(wo1+i),vld1q_s8(xs+i),vld1q_s8(xs1+i));
+            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
+            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
+            for(;i<I;i++){ int a=wo[i],b=wo1[i],u=xs[i],v=xs1[i];
+                d00+=a*u; d01+=a*v; d10+=b*u; d11+=b*v; }
+            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
+            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
+            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
+        }
+        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*O+o]    =(float)dot_i8i8(wo, xs,I)*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]=(float)dot_i8i8(wo1,xs,I)*sc1*sx[s]; }
+    }
+    if(O&1){ int o=O-1; const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
+                              const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<(O&~1);o+=2){
+        const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+        const uint8_t *wo=q4+(int64_t)o*rb, *wo1=q4+(int64_t)(o+1)*rb;
+        float sc0=scale[o], sc1=scale[o+1];
+        for(int s=0;s<(S&~1);s+=2){
+            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
+            /* 4 accumulatori indipendenti (vedi matmul_q_idot_mm).
+             * EN: 4 independent accumulators, see matmul_q_idot_mm. */
+            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
+            for(;i+64<=I;i+=64){
+                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
+                uint8x16_t cyo=vld1q_u8(wo+(i>>1)+16), cyo1=vld1q_u8(wo1+(i>>1)+16);
+                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
+                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
+                uint8x16x2_t ko =vzipq_u8(vandq_u8(cyo, m4q), vshrq_n_u8(cyo, 4));
+                uint8x16x2_t ko1=vzipq_u8(vandq_u8(cyo1,m4q), vshrq_n_u8(cyo1,4));
+                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
+                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
+                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
+                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
+                a2=mm_tile16(a2, vsubq_s8(vreinterpretq_s8_u8(ko.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[0]),b8q),
+                                 vld1q_s8(xs+i+32), vld1q_s8(xs1+i+32));
+                a3=mm_tile16(a3, vsubq_s8(vreinterpretq_s8_u8(ko.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[1]),b8q),
+                                 vld1q_s8(xs+i+48), vld1q_s8(xs1+i+48));
+            }
+            for(;i+32<=I;i+=32){
+                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
+                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
+                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
+                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
+                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
+                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
+                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
+            }
+            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
+            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
+            for(;i+1<I;i+=2){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
+                int a0=(int)(bo&0xF)-8, a1=(int)(bo>>4)-8, b0=(int)(bo1&0xF)-8, b1=(int)(bo1>>4)-8;
+                int u0=xs[i],u1=xs[i+1],v0=xs1[i],v1=xs1[i+1];
+                d00+=a0*u0+a1*u1; d01+=a0*v0+a1*v1; d10+=b0*u0+b1*u1; d11+=b0*v0+b1*v1; }
+            if(i<I){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
+                int a0=(int)(bo&0xF)-8, b0=(int)(bo1&0xF)-8;
+                d00+=a0*xs[i]; d01+=a0*xs1[i]; d10+=b0*xs[i]; d11+=b0*xs1[i]; }
+            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
+            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
+            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
+        }
+        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*O+o]    =(float)dot_i4i8(wo, xs,I)*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]=(float)dot_i4i8(wo1,xs,I)*sc1*sx[s]; }
+    }
+    if(O&1){ int o=O-1; const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+#endif
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
@@ -798,6 +923,9 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2){ matmul_i4_idot_mm(y,xq,sx,q4,scale,S,I,O); return; }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }

@@ -47,6 +47,12 @@ OMPC    =
 OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+# Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
+# no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+ifneq ($(ARCH),)
+CFLAGS += -mcpu=$(ARCH)
+endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
 else ifneq ($(IS_WIN),)
