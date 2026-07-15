@@ -3080,17 +3080,30 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
-    /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
-    moe(m,l,li,nrm_host,S,out_host,0);
+    /* OVERLAP: issue the shared expert on the GPU BEFORE moe() runs on the CPU.
+     * The shared expert reads nrm_d (valid after the download above) and writes its
+     * residual into x_dev (async). While the GPU computes this, the CPU enters moe()
+     * for routing + expert disk loads + matmul — ~50ms of work that previously left
+     * the GPU idle. The shared expert (~0.5ms) finishes early in that window.
+     *
+     * After moe(), the routed-expert result is uploaded (sync pipe_upload) and added
+     * to x_dev (async). Both residual adds (shared + routed) are ordered on the same
+     * stream — the next layer's pipe_rmsnorm reads x_dev after both complete.
+     *
+     * No pipe_sync at the end: the next layer's pipe_download (sync cudaMemcpy)
+     * provides the implicit sync point. The fallback path (caller downloads x_dev)
+     * also uses pipe_download which syncs. This lets GPU work chain across layers
+     * without a per-layer stall. */
     double te=now_s();
-    if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;
-    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_gate.cuda,sg_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_up.cuda,su_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*sI)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_down.cuda,y_d,sg_d,S)) return 0;
-    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
-    if(!coli_cuda_pipe_sync(dev)) return 0;
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
+    /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
+    moe(m,l,li,nrm_host,S,out_host,0);
+    if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
     m->t_emm+=now_s()-te;
     return 1;
 }
@@ -4920,7 +4933,8 @@ static double kv_pool_bytes(Model *m, int max_ctx){
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
-    double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb
+    double ws_b = (g_expert_budget>0 && g_expert_budget<64) ? (double)(g_expert_budget+4)*(double)eb : 64.0*(double)eb;
+    double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
@@ -4942,11 +4956,22 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
      *  attivazioni+logits+overhead ~1.2 GB */
     double ws_b  = 64.0*(double)eb;
+    /* Under EXPERT_BUDGET, the block-of-64 working set is capped at budget experts
+     * per layer — only ws[0..budget-1] are populated, not all 64. The 64×eb reserve
+     * overcounts by 16x at budget=4, starving the LRU cache (cap 3 instead of 4).
+     * Cap=4 matches budget=4, eliminating LRU thrashing that causes excessive disk
+     * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
+    if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    /* RISERVA PAGE-CACHE (misurato 2026-07-06): strangolarla fa crollare le pread
-     * buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di quanto
-     * costino in banda disco persa. 2.5 GB restano SEMPRE al kernel. */
+    /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
+     * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
+     * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
+     * NOTE: tested removing this under Windows+DIRECT (it should be dead weight when
+     * O_DIRECT bypasses the buffer cache). Result: cap went 4->5 but RSS hit 24 GB
+     * on a 32 GB machine, causing memory pressure that DROPPED the hit rate (73%->57%)
+     * and slowed decode (1.03->0.83 tok/s). The reserve is a legitimate safety margin
+     * for OS + CUDA + file metadata, not just buffered pread throughput. Keep it. */
     double pc_b  = 2.5e9;
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
