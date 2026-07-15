@@ -3198,10 +3198,20 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
 #ifdef COLI_CUDA
     /* PIPE2 (Inc.2a): il residuo resta sul device del layer, saltando tra le schede
-     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva. */
+     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva.
+     *
+     * S threshold is device-count-dependent (#273): on a single GPU the resident
+     * stream wins at S=1 (evicts the CPU round-trips that dominate small-batch
+     * decode — +49% on a 5070 Ti). With layers sharded across multiple GPUs each
+     * resident forward crosses P2P per layer group, and at one token per forward
+     * those hops don't amortize — A/B on 6x5090 showed S=1 is a wash there. So:
+     * single-GPU engages at S=1, multi-GPU keeps the original S>=8 prefill gate.
+     * COLI_CUDA_PIPE_S_MIN overrides for anyone who wants to measure. */
     float *x_dev=NULL; int x_dev_on=-1;
     size_t xb=(size_t)S*(size_t)D*4;
-    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=1 && g_cuda_enabled && c->kv_lora<=512 &&
+    int pipe_s_min = getenv("COLI_CUDA_PIPE_S_MIN") ? atoi(getenv("COLI_CUDA_PIPE_S_MIN"))
+                                                     : (g_cuda_ndev<=1 ? 1 : 8);
+    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
     for(int i=0;i<c->n_layers;i++){
