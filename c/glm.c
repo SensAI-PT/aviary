@@ -4528,6 +4528,7 @@ typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
+static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
@@ -4553,7 +4554,19 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
     int64_t eb=expert_bytes_probe(m,m->ebits);
-    int npin=gb<0?n:(int)(gb*1e9/eb); if(npin>n) npin=n;
+    /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
+     * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
+     * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
+     * budget RAM, come AUTOPIN; il pin aggiorna resident_bytes, quindi cap_for_ram
+     * dopo restringe la LRU di conseguenza (nessun doppio conteggio). */
+    int npin;
+    if(gb<0){
+        double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
+        double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
+        npin=avail>0?(int)(avail/eb):0;
+    } else npin=(int)(gb*1e9/eb);
+    if(npin>n) npin=n;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
