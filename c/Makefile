@@ -67,7 +67,11 @@ else ifneq ($(IS_WIN),)
 CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -static
+# -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
+# #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
+# (warns), so link psapi explicitly or the build fails undefined-reference on
+# modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
+LDFLAGS = -lm -fopenmp -static -lpsapi
 EXE     = .exe
 else
 ifneq (,$(PPC64))
