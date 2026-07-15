@@ -134,8 +134,11 @@ def main():
         for r in reqs[:3]: print("  example request:", r[:80], "...", file=sys.stderr)
         print("DRY: request construction and tokenization passed. Engine was not run.", file=sys.stderr); return
 
-    req_path = tempfile.mktemp(suffix=".txt")
-    open(req_path, "w").write("\n".join(reqs) + "\n")
+    # mkstemp (non mktemp): crea il file atomicamente con permessi 0600, niente
+    # race TOCTOU/symlink su una tmp dir condivisa (CWE-377).
+    fd, req_path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(reqs) + "\n")
     env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()
