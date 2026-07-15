@@ -542,6 +542,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
          * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
         if (g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
             pilot_prefetch(m, i + 2, x, S);
+        if (g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
+            pilot_prefetch(m, i + 3, x, S);
     }
     /* IMPROVEMENT 2: count tokens; trigger hot pinning after warmup */
     m->token_count++; m->freq_token_count++;
