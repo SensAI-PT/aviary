@@ -3188,7 +3188,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
      * ai confini di layer. x host diventa STALE finche' la residenza e' attiva. */
     float *x_dev=NULL; int x_dev_on=-1;
     size_t xb=(size_t)S*(size_t)D*4;
-    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=8 && g_cuda_enabled && c->kv_lora<=512 &&
+    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=1 && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
     for(int i=0;i<c->n_layers;i++){
