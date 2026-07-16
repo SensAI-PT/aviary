@@ -5632,7 +5632,30 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
+    int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
     if(capmax<1) capmax=1;
+    /* Il floor a 1 e' una bugia comoda: con avail negativo capmax sarebbe 0, cioe'
+     * "non ci sto nel tuo budget". Alzarlo a 1 e proseguire trasforma "non ci sto"
+     * in "sforo" -- ed e' esattamente l'OOM-kill a meta' generazione che questa
+     * funzione esiste per evitare. Il kernel uccide con SIGKILL: nessun errore,
+     * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
+     * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
+    if(floored){
+        double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
+        fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB).%s\n",
+            ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
+            m->resident_bytes/1e9,slack/1e9,
+            getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+        if(g_mem_avail_boot>0 && peak > g_mem_avail_boot*1e9 &&
+           !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
+            fprintf(stderr,"[RAM] refusing to start: that peak also exceeds the %.1f GB actually "
+                "available on this machine, so the kernel would OOM-kill this run mid-generation.\n"
+                "[RAM] lower PIN_GB, lower the context, or raise the RAM budget if the box really has it "
+                "(COLI_RAM_OVERCOMMIT=1 overrides this check).\n", g_mem_avail_boot);
+            exit(2);
+        }
+    }
     if(capmax < m->ecap){
         fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
             "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
