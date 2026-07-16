@@ -14,7 +14,6 @@ TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 MINGW  := $(findstring mingw,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
-PPC64  := $(findstring powerpc64,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
@@ -27,7 +26,6 @@ ifeq ($(IS_WIN),)
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DARWIN  := $(findstring Darwin,$(UNAME_S))
-PPC64   := $(findstring ppc64,$(UNAME_M))
 endif
 endif
 
@@ -37,6 +35,7 @@ TARGET_CPU := $(UNAME_M)
 endif
 X86_64  := $(filter x86_64 amd64,$(TARGET_CPU))
 AARCH64 := $(filter aarch64 arm64,$(TARGET_CPU))
+PPC64   := $(filter powerpc64% ppc64%,$(TARGET_CPU))
 
 ifneq (,$(DARWIN))
 # --- macOS / Apple Silicon ---
@@ -47,7 +46,7 @@ CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
 # `brew --prefix libomp` can print the formula's prospective path even when it
 # is not installed, so verify both artifacts before adding unusable flags.
-ifneq ($(and $(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
 OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
 OMPL    = -L$(OMPDIR)/lib -lomp
 else

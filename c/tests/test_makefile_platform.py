@@ -52,6 +52,7 @@ class MakefilePlatformTests(unittest.TestCase):
             ("x86_64-unknown-linux-gnu", "-march=x86-64-v3"),
             ("aarch64-unknown-linux-gnu", "-march=armv8-a"),
             ("powerpc64le-unknown-linux-gnu", "-mcpu=power8"),
+            ("ppc64le-unknown-linux-gnu", "-mcpu=power8"),
         )
 
         for triplet, expected_flag in cases:
