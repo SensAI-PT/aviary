@@ -14,7 +14,6 @@ TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 MINGW  := $(findstring mingw,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
-PPC64  := $(findstring powerpc64,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
@@ -27,9 +26,16 @@ ifeq ($(IS_WIN),)
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DARWIN  := $(findstring Darwin,$(UNAME_S))
-PPC64   := $(findstring ppc64,$(UNAME_M))
 endif
 endif
+
+TARGET_CPU := $(firstword $(subst -, ,$(TRIPLET)))
+ifeq ($(TARGET_CPU),)
+TARGET_CPU := $(UNAME_M)
+endif
+X86_64  := $(filter x86_64 amd64,$(TARGET_CPU))
+AARCH64 := $(filter aarch64 arm64,$(TARGET_CPU))
+PPC64   := $(filter powerpc64% ppc64%,$(TARGET_CPU))
 
 ifneq (,$(DARWIN))
 # --- macOS / Apple Silicon ---
@@ -38,7 +44,9 @@ ifneq (,$(DARWIN))
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
 CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
-ifneq ($(OMPDIR),)
+# `brew --prefix libomp` can print the formula's prospective path even when it
+# is not installed, so verify both artifacts before adding unusable flags.
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
 OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
 OMPL    = -L$(OMPDIR)/lib -lomp
 else
@@ -247,9 +255,23 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-# binario portabile da distribuire su altre macchine x86-64
+# Use a baseline that matches the compiler target. macOS already targets a
+# portable baseline when ARCH is empty; forcing the x86 value there breaks
+# Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+ifneq (,$(DARWIN))
+PORTABLE_ARCH =
+else ifneq (,$(AARCH64))
+PORTABLE_ARCH = armv8-a
+else ifneq (,$(PPC64))
+PORTABLE_ARCH = power8
+else ifneq (,$(X86_64))
+PORTABLE_ARCH = x86-64-v3
+else
+PORTABLE_ARCH = native
+endif
+
 portable:
-	$(MAKE) glm$(EXE) ARCH=x86-64-v3
+	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
