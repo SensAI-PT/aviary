@@ -198,7 +198,9 @@ typedef struct {
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
     uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
-    double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
+    double t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (wall del
+                                                  * thread di compute; il servizio disco
+                                                  * overlappato vive in g_edisk_ns) */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
     /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
@@ -215,6 +217,7 @@ static void ehit_mark(Model *m, int layer, int eid);
 static void emap_emit(Model *m);
 static void hits_emit(Model *m);
 static void hwinfo_emit(Model *m);
+static int64_t expert_bytes_probe(Model *m, int ebits);   /* PROF: tier sizes in the report */
 static int g_repin;
 static uint64_t g_last_repin;
 #ifdef COLI_CUDA
@@ -280,6 +283,38 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
     return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
 #endif
 }
+/* ---- PROF=1: opt-in performance profile ----------------------------------
+ * Records per-forward decode latency and expert-file bytes fetched, then
+ * reports percentiles, I/O totals, phase shares and a tuning verdict next to
+ * the existing PROFILE line. Additive only: with PROF unset the output of
+ * every mode stays byte-identical. */
+static int g_prof=0;
+static _Atomic int64_t g_prof_io;                /* bytes pread()/faulted from expert files */
+/* Disk service: wall time inside expert_load on whichever thread runs the read
+ * (PIPE I/O workers, OMP loaders, the speculative pilot). It overlaps compute,
+ * so it is NOT a wall-time phase — the stall the compute thread actually felt
+ * is m->t_ewait. Thread-seconds, so it can exceed wall time under parallel
+ * reads; wait << service means overlap/parallelism is hiding the reads,
+ * wait ~ service means the loads block the compute thread. */
+static _Atomic int64_t g_edisk_ns;
+static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_order_relaxed)*1e-9; }
+#define PROF_LAT_CAP 32768
+static double g_prof_lat[PROF_LAT_CAP];          /* per-forward decode wall clock (ring) */
+static uint64_t g_prof_nlat;                     /* forwards recorded (monotonic) */
+static void prof_lat(double s){ g_prof_lat[g_prof_nlat++ % PROF_LAT_CAP]=s; }
+/* snapshot for windowed reports (serve mode: one report per turn) */
+typedef struct {
+    double edisk,ewait,emm,attn,head;
+    int64_t io; uint64_t hits,miss,ereq,n_fw,n_emit,nlat;
+} ProfBase;
+static void prof_base(Model *m, ProfBase *b){
+    b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
+    b->attn=m->t_attn; b->head=m->t_head;
+    b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
+    b->hits=m->hits; b->miss=m->miss; b->ereq=m->ereq;
+    b->n_fw=m->n_fw; b->n_emit=m->n_emit; b->nlat=g_prof_nlat;
+}
+
 static float *falloc(int64_t n){
     /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
      * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
@@ -1705,7 +1740,7 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     }
     return 0;
 }
-static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -1721,6 +1756,8 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
+        atomic_fetch_add_explicit(&g_prof_io,
+            st_nbytes(&m->S,nm[0])+st_nbytes(&m->S,nm[1])+st_nbytes(&m->S,nm[2]),memory_order_relaxed);
         s->eid=eid; return 0;
     }
     st_tensor *tw[3], *tq[3];
@@ -1776,6 +1813,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                  * leak locked pages for every GPU-tier expert). See pin_wire() below: it wires
                  * the final resident set only, after GPU release has already nulled out the
                  * pointers for anything that isn't genuinely RAM-tier. */
+                atomic_fetch_add_explicit(&g_prof_io,(int64_t)(n+nq),memory_order_relaxed);
             }
             s->eid=eid; return 0;
         }
@@ -1865,6 +1903,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     for(int k=0;k<3;k++){
         if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
+    atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */
         posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
@@ -1881,6 +1920,14 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; return 0;
+}
+/* Every expert read goes through here: time the whole load (pread/fault +
+ * bookkeeping) on the thread that runs it, into the disk-service counter. */
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+    double t0=now_s();
+    int rc=expert_load_impl(m,layer,eid,s,fatal);
+    atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
+    return rc;
 }
 
 #ifdef __linux__
@@ -3080,11 +3127,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 double t0=now_s();
                 int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
                 pipe_dispatch(m,layer,eids,nmiss);
-                m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
+                m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
+                                                     * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
                 for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
-                m->t_ewait += now_s()-t0; }        /* blocking: whole load stalls compute */
+                m->t_ewait += now_s()-t0; }         /* compute thread blocked for the whole load */
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
@@ -3113,7 +3161,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * correct (and free) when a subset falls back to the CPU. */
             if(g_pipe && nmiss){ double tw=now_s();
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
-                m->t_ewait += now_s()-tw; }        /* blocking: drain stalled compute */
+                m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
             if(nbb>0){
                 double t0=now_s();
@@ -3137,7 +3185,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * Stays ABOVE the METAL skip: a subset that fell back to the CPU still needs its
              * slot drained here, and under METAL the block-level drain above already ran (this
              * spin is then a no-op). */
-            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }  /* blocking */
+            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }
 #ifdef COLI_METAL
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
@@ -4283,7 +4331,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g<0) g=0;
         if(gsrc==1) g_gr_prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
+        double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
+        if(g_prof) prof_lat(now_s()-tf0);
         int k=0;                                        /* verifica: accetta finche' coincide */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
             fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
@@ -4432,10 +4482,10 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_edisk+m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
-        m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+        edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
 #ifdef COLI_METAL
@@ -4450,8 +4500,73 @@ static void profile_print(Model *m, double elapsed){
 }
 
 static void profile_reset(Model *m){
-    m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
+    m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
+    atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
+}
+
+/* PROF=1 report: forward-latency percentiles, expert I/O totals, phase shares
+ * of wall time, and a plain-language verdict naming the knob most likely to
+ * move tok/s on THIS machine with THIS config. `b` marks the window start
+ * (serve mode reports per turn; batch modes snapshot right after reset). */
+static int prof_cmp_d(const void *a,const void *b){
+    double x=*(const double*)a, y=*(const double*)b; return (x>y)-(x<y); }
+static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens, FILE *f){
+    Cfg *c=&m->c; if(elapsed<1e-9) elapsed=1e-9;
+    uint64_t nw=g_prof_nlat-b->nlat; if(nw>PROF_LAT_CAP) nw=PROF_LAT_CAP;  /* ring keeps the tail */
+    uint64_t nfw=m->n_fw-b->n_fw, nem=m->n_emit-b->n_emit;
+    if(nw){
+        double *v=malloc((size_t)nw*sizeof(double));
+        if(v){
+            for(uint64_t i=0;i<nw;i++) v[i]=g_prof_lat[(g_prof_nlat-nw+i)%PROF_LAT_CAP];
+            qsort(v,(size_t)nw,sizeof(double),prof_cmp_d);
+            double p50=v[(nw-1)/2], p90=v[(uint64_t)((nw-1)*0.90)], p99=v[(uint64_t)((nw-1)*0.99)], mx=v[nw-1];
+            fprintf(f,"[PROF] decode forwards: %llu | latency p50 %.1f ms | p90 %.1f ms | p99 %.1f ms | max %.1f ms | %.2f tok/forward\n",
+                (unsigned long long)nfw,p50*1e3,p90*1e3,p99*1e3,mx*1e3,nfw?(double)nem/nfw:0.0);
+            if(nw>=32 && p99>3*p50)
+                fprintf(f,"[PROF] tail: p99 is %.1fx p50 — the slow forwards are cold-cache expert loads; "
+                          "a warm-up turn or a pinned hot-store (PIN / AUTOPIN history) shrinks them\n",p99/p50);
+            free(v);
+        }
+    }
+    int64_t io=atomic_load_explicit(&g_prof_io,memory_order_relaxed)-b->io;
+    uint64_t dh=m->hits-b->hits, dm=m->miss-b->miss, dq=m->ereq-b->ereq;
+    double hitp=(dh+dm)?100.0*dh/(dh+dm):100.0;
+    double eb=(double)expert_bytes_probe(m,m->ebits);
+    int pinned=0,lru=0;
+    for(int i=0;i<=c->n_layers;i++){ if(m->npin)pinned+=m->npin[i]; if(m->ecn)lru+=m->ecn[i]; }
+    double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
+    double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
+    fprintf(f,"[PROF] expert I/O: %.3f GB fetched (%.1f MB/token, %.2f GB/s over the run%s) | "
+              "hit %.1f%% (%llu hit / %llu load) | %.1f loads/token | %.1fs read service / %.1fs felt wait\n",
+        io/1e9, tokens>0?io/1e6/tokens:0.0, io/1e9/elapsed,
+        g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
+        hitp,(unsigned long long)dh,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
+        io_svc,io_w);
+    fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
+        pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
+    double emm=m->t_emm-b->emm, attn=m->t_attn-b->attn, head=m->t_head-b->head;
+    double other=elapsed-io_w-emm-attn-head; if(other<0) other=0;
+    double f_io=io_w/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
+    fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | other %.0f%%\n",
+        100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
+    if(f_io>=0.30){
+        fprintf(f,"[PROF] verdict: I/O-bound — %.0f%% of the time waits on expert reads (hit %.0f%%).",100*f_io,hitp);
+        if(hitp<90) fprintf(f," More cache is the lever: raise RAM_GB (or add RAM).");
+        else fprintf(f," The cache is already warm — the routed working set streams from disk; a faster disk or a bigger pinned tier (PIN_GB) is the lever.");
+        if(!g_pipe) fprintf(f," Try PIPE=1 (overlap reads with matmul).");
+        if(!g_direct) fprintf(f," On NVMe try DIRECT=1.");
+        fprintf(f,"\n");
+    } else if(f_emm>=0.40){
+        fprintf(f,"[PROF] verdict: compute-bound in expert matmuls (%.0f%%) — more cores/threads help; keep IDOT=1, or move hot experts to a GPU tier (COLI_CUDA / COLI_METAL).%s\n",
+            100*f_emm, g_mmap?" Note: with COLI_MMAP=1 page-fault I/O is accounted inside matmul.":"");
+    } else if(f_attn>=0.35){
+        fprintf(f,"[PROF] verdict: attention-bound (%.0f%%) — context length is the cost (DSA %s). A lower CTX helps if the workload allows.\n",
+            100*f_attn, m->has_dsa?"on":"not available for this model");
+    } else {
+        fprintf(f,"[PROF] verdict: balanced — no phase dominates (I/O %.0f%%, matmul %.0f%%, attention %.0f%%); this config is a reasonable fit for this machine.\n",
+            100*f_io,100*f_emm,100*f_attn);
+    }
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -4463,14 +4578,18 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
     profile_reset(m);
+    ProfBase pb; prof_base(m,&pb);
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
+        double tf0=g_prof?now_s():0;
         logit=step(m,full+i,1,i); free(logit); steps++;
+        if(g_prof){ prof_lat(now_s()-tf0); m->n_fw++; m->n_emit++; }
     }
     double dt=now_s()-t0, tot=m->hits+m->miss;
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
     profile_print(m,dt);
+    if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
@@ -4511,6 +4630,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     m->n_emit=m->n_fw=0;
     g_last_repin=0;
     profile_reset(m);
+    ProfBase pb; prof_base(m,&pb);
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
     grammar_reset();
@@ -4554,6 +4674,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
+    if(g_prof) prof_report(m,&pb,dt,produced,stdout);
     if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
@@ -4860,6 +4981,8 @@ typedef struct {
     float temp, top_p;
     double started;
     uint64_t hits0, miss0;
+    ProfBase pb;                         /* phase-time window start (same convention as hits0):
+                                            feeds the PROF protocol line and the PROF=1 report */
 } ServeReq;
 
 static void mux_data(Tok *T, unsigned long long id, int token){
@@ -4876,10 +4999,26 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     tiers_emit(m);
     emap_emit(m);
     hits_emit(m);
+    /* PROF: per-turn phase timings for the dashboard profiling page —
+     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>".
+     * edisk = disk service (expert_load wall on the reading threads, overlaps
+     * compute); ewait = the stall the compute thread felt — only ewait belongs
+     * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
+     * batched forwards, so the shares describe the whole engine over the
+     * window, not the single request (same convention as the STAT hit% below). */
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
+           r->prompt_tokens,r->emitted,
+           edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
+           m->t_attn-r->pb.attn,m->t_head-r->pb.head,
+           (unsigned long long)(m->n_fw-r->pb.n_fw));
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
+     * share the batched forwards, so the shares describe the engine, not the
+     * single request (same convention as the STAT hit%% above). */
+    if(g_prof) prof_report(m,&r->pb,dt,r->emitted,stderr);
     r->active=0;
 }
 
@@ -4942,6 +5081,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
@@ -5018,8 +5158,10 @@ static void run_serve_mux(Model *m, const char *snap){
         for(int i=0;i<nctx;i++) if(req[i].active){
             rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
         }
+        double tf0=g_prof?now_s():0;
         float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
         m->n_fw++;
+        if(g_prof) prof_lat(now_s()-tf0);
         for(int s=0;s<S;s++){
             int i=slots[s]; ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
             sc->len++; g_temp=r->temp; g_nuc=r->top_p;
@@ -5089,6 +5231,7 @@ static void run_serve(Model *m, const char *snap){
             if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
             int cur=ngen; if(len+cur+g_draft+2>=maxctx) cur=maxctx-len-g_draft-2;
             uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
+            ProfBase pb; if(g_prof) prof_base(m,&pb);
             float *logit=step(m,hist+len-1,1,len-1);
             EmitStream es={&T,m,now_s(),0,1};
             int prod=0;
@@ -5098,7 +5241,9 @@ static void run_serve(Model *m, const char *snap){
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
-            fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            fflush(stdout);
+            if(g_prof) prof_report(m,&pb,tdt,prod,stderr);   /* per-turn window; stdout is the framed protocol */
+            kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
          * line protocol this accepts newlines. The tokenized prompt is matched
@@ -5166,6 +5311,7 @@ static void run_serve(Model *m, const char *snap){
         uint64_t agh0=m->route_agree_hit, agt0=m->route_agree_tot;
         uint64_t kln0=m->route_kl_n; double kls0=m->route_kl_sum;
         double tt0=now_s();
+        ProfBase pb; if(g_prof) prof_base(m,&pb);
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
@@ -5192,6 +5338,7 @@ static void run_serve(Model *m, const char *snap){
                 agree_pct,kl_mean);
         printf("\n");
         fflush(stdout);
+        if(g_prof) prof_report(m,&pb,tdt,prod,stderr);   /* per-turn window; stdout is the framed protocol */
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
@@ -5252,10 +5399,10 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 
 /* HWINFO: hardware snapshot for the web dashboard — emitted once at READY. */
-static void hwinfo_emit(Model *m){
-    Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
-    /* CPU */
-    char cpu[256]="";
+/* CPU model + cores + RAM (GB); empty/zero where unavailable.
+ * Shared by the dashboard HWINFO line and the PROF=1 header. */
+static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double *ram_avail){
+    cpu[0]=0;
 #ifdef _WIN32
     /* niente /proc su Windows: brand string via CPUID (0x80000002..4), zero
      * dipendenze extra. La dashboard mostrava "0 GB RAM / 0 cores" perche'
@@ -5265,7 +5412,7 @@ static void hwinfo_emit(Model *m){
       for(unsigned int f=0x80000002u; f<=0x80000004u; f++,w+=4)
           __get_cpuid(f,&w[0],&w[1],&w[2],&w[3]);
       char *b=(char*)r; b[47]=0; while(*b==' ')b++;
-      snprintf(cpu,sizeof(cpu),"%s",b); }
+      snprintf(cpu,cn,"%s",b); }
 #endif
 #else
     FILE *ci=fopen("/proc/cpuinfo","r");
@@ -5273,27 +5420,32 @@ static void hwinfo_emit(Model *m){
         while(fgets(ln,sizeof(ln),ci)) if(!strncmp(ln,"model name",10)){
             char *p=strchr(ln,':'); if(p){ p++; while(*p==' ')p++;
             int n=(int)strlen(p); if(n>0&&p[n-1]=='\n')p[--n]=0;
-            snprintf(cpu,sizeof(cpu),"%s",p); } break; }
+            snprintf(cpu,cn,"%s",p); } break; }
         fclose(ci); }
 #endif
-    int cores=0;
+    *cores=0;
 #ifdef _WIN32
-    { SYSTEM_INFO si; GetSystemInfo(&si); cores=(int)si.dwNumberOfProcessors; }
+    { SYSTEM_INFO si; GetSystemInfo(&si); *cores=(int)si.dwNumberOfProcessors; }
 #elif defined(_SC_NPROCESSORS_ONLN)
-    cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
+    *cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    /* RAM */
-    double ram_total=0,ram_avail=0;
+    *ram_total=*ram_avail=0;
 #ifdef _WIN32
-    compat_meminfo(&ram_total,&ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
+    compat_meminfo(ram_total,ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;
         while(fgets(ln,sizeof(ln),mi)){
-            if(sscanf(ln,"MemTotal: %lf",&mt)==1) ram_total=mt/1e6;
-            if(sscanf(ln,"MemAvailable: %lf",&ma)==1) ram_avail=ma/1e6;
+            if(sscanf(ln,"MemTotal: %lf",&mt)==1) *ram_total=mt/1e6;
+            if(sscanf(ln,"MemAvailable: %lf",&ma)==1) *ram_avail=ma/1e6;
         } fclose(mi); }
 #endif
+}
+
+static void hwinfo_emit(Model *m){
+    Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
+    char cpu[256]; int cores; double ram_total,ram_avail;
+    hw_probe(cpu,sizeof(cpu),&cores,&ram_total,&ram_avail);
     /* GPU */
     int ngpu=0; double vram_total=0;
     char gpu_name[128]="";
@@ -5796,6 +5948,34 @@ static const char *coli_user_prompt(void){
     return p;
 }
 
+/* PROF=1 startup header: one self-describing block so a saved log answers
+ * "what machine, what config" when comparing runs after changing RAM_GB,
+ * knobs, or moving to another host. */
+static void prof_config(Model *m, double ram_env, int est_ctx){
+    Cfg *c=&m->c;
+    char cpu[256]; int cores; double rt,ra;
+    hw_probe(cpu,sizeof(cpu),&cores,&rt,&ra);
+    const char *backend="CPU";
+#ifdef COLI_CUDA
+    if(g_cuda_enabled) backend="CUDA";
+#endif
+#ifdef COLI_METAL
+    if(g_metal_enabled) backend="Metal";
+#endif
+    int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+    int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
+    int pinned=0; for(int i=0;i<=c->n_layers;i++) if(m->npin) pinned+=m->npin[i];
+    double eb=(double)expert_bytes_probe(m,m->ebits);
+    fprintf(stderr,"[PROF] machine: %s | %d cores (%d omp threads) | RAM %.1f GB total, %.1f GB available | backend %s\n",
+        cpu[0]?cpu:"unknown CPU",cores,omp_get_max_threads(),rt,ra,backend);
+    fprintf(stderr,"[PROF] config: RAM_GB=%s%.1f CTX=%d | expert cache cap %d/layer (up to %.1f GB) | pinned %d (%.1f GB) | "
+        "DRAFT=%d PIPE=%d DIRECT=%d MMAP=%d IDOT=%d DSA=%s PILOT=%d CACHE_ROUTE=%d\n",
+        ram_env<=0?"auto ":"",ram_env<=0?g_mem_avail_boot*0.88:ram_env,est_ctx,
+        m->ecap,(double)m->ecap*rows*eb/1e9,pinned,pinned*eb/1e9,
+        g_draft,g_pipe,g_direct,g_mmap,g_idot,
+        (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
+}
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -6104,7 +6284,9 @@ int main(int argc, char **argv){
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-      cap_for_ram(&m, ram_env, ebits, est_ctx); }
+      cap_for_ram(&m, ram_env, ebits, est_ctx);
+      g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
+      if(g_prof) prof_config(&m, ram_env, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
@@ -6181,6 +6363,7 @@ int main(int argc, char **argv){
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
+    ProfBase pb; prof_base(&m,&pb);
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
     int match=0;
     printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
@@ -6192,6 +6375,7 @@ int main(int argc, char **argv){
     printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
     profile_print(&m,dt);
+    if(g_prof) prof_report(&m,&pb,dt,n_new,stdout);
 #ifdef COLI_CUDA
     if(m.gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
