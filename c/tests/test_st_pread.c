@@ -8,8 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include "../st.h"
 
@@ -35,8 +37,10 @@ static void write_snap(const char *dir, int truncate_bytes) {
 }
 
 int main(void) {
-    char dir[] = "/tmp/st_pread_XXXXXX";
-    if (!mkdtemp(dir)) { char alt[] = "st_pread_XXXXXX"; if (!mkdtemp(alt)) return 1; strcpy(dir, alt); }
+    /* relative to the CWD, per test_stops: MinGW .exe files resolve Windows
+     * paths and "/tmp" is not one */
+    char dir[] = "test_st_pread_XXXXXX";
+    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
 
     /* 1) chunk loop: 96-byte tensor read 7 bytes at a time, content exact */
     write_snap(dir, 0);
@@ -45,6 +49,7 @@ int main(void) {
     st_read_raw(&S, "t", out, 0);
     for (int i = 0; i < 96; i++) CHECK(out[i] == (unsigned char)(i * 7 + 3));
 
+#ifndef _WIN32
     /* 2) shard truncated AFTER st_init (init validates static bounds, so the
      * pread path only fires when the file shrinks underneath a live handle):
      * child must exit(1) with an honest message, not perror's "Success" */
@@ -67,8 +72,17 @@ int main(void) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
     CHECK(strstr(err, "short read") != NULL);
     CHECK(strstr(err, "Success") == NULL);
+#else
+    /* fork/pipe/truncate are POSIX; Windows still runs the chunk-loop check */
+    printf("test_st_pread: truncation subtest skipped on Windows\n");
+#endif
 
-    char cmd[600]; snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    char cmd[600];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "rmdir /s /q %s", dir);
+#else
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+#endif
     if (system(cmd)) {}
     printf("test_st_pread: chunk loop + honest truncation error: ok\n");
     return 0;
