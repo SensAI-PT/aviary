@@ -14,7 +14,7 @@ TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 MINGW  := $(findstring mingw,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
-PPC64  := $(findstring powerpc64,$(TRIPLET))
+LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
 # Fallbacks for the rare toolchain that does not answer -dumpmachine: keep the
@@ -26,9 +26,16 @@ ifeq ($(IS_WIN),)
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DARWIN  := $(findstring Darwin,$(UNAME_S))
-PPC64   := $(findstring ppc64,$(UNAME_M))
 endif
 endif
+
+TARGET_CPU := $(firstword $(subst -, ,$(TRIPLET)))
+ifeq ($(TARGET_CPU),)
+TARGET_CPU := $(UNAME_M)
+endif
+X86_64  := $(filter x86_64 amd64,$(TARGET_CPU))
+AARCH64 := $(filter aarch64 arm64,$(TARGET_CPU))
+PPC64   := $(filter powerpc64% ppc64%,$(TARGET_CPU))
 
 ifneq (,$(DARWIN))
 # --- macOS / Apple Silicon ---
@@ -37,7 +44,9 @@ ifneq (,$(DARWIN))
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
 CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
-ifneq ($(OMPDIR),)
+# `brew --prefix libomp` can print the formula's prospective path even when it
+# is not installed, so verify both artifacts before adding unusable flags.
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
 OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
 OMPL    = -L$(OMPDIR)/lib -lomp
 else
@@ -46,6 +55,12 @@ OMPC    =
 OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+# Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
+# no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+ifneq ($(ARCH),)
+CFLAGS += -mcpu=$(ARCH)
+endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
 else ifneq ($(IS_WIN),)
@@ -60,7 +75,11 @@ else ifneq ($(IS_WIN),)
 CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -static
+# -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
+# #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
+# (warns), so link psapi explicitly or the build fails undefined-reference on
+# modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
+LDFLAGS = -lm -fopenmp -static -lpsapi
 EXE     = .exe
 else
 ifneq (,$(PPC64))
@@ -70,18 +89,19 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
-# --- Linux x86-64 (percorso originale, invariato) ---
+# --- Linux / *BSD x86-64 (percorso originale, invariato) ---
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
+# -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
+CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
 endif
@@ -105,22 +125,51 @@ INSTALL    ?= install
 #                   clean. See backend_loader.c and README "cuda-dll" below.
 CUDA      ?= 0
 CUDA_DLL  ?= 0
+ifneq ($(IS_WIN),)
+# the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
+# GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
+# NVCC defaults to plain `nvcc` from PATH: CUDA_PATH contains spaces, which the
+# unquoted recipe checks cannot survive — and the cuda-dll recipe already
+# requires an MSVC environment (vcvars64) on PATH, so requiring the CUDA bin
+# directory too is symmetric. The installer adds it by default.
+CUDA_HOME ?= $(subst \,/,$(CUDA_PATH))
+NVCC      ?= nvcc
+# Host compiler override for nvcc (e.g. Fedora ships g++16 but CUDA needs 15):
+#   make glm CUDA=1 NVCC_CCBIN=g++-15        (opt-in: unset = nvcc's own default)
+ifneq ($(NVCC_CCBIN),)
+NVCCFLAGS += -ccbin $(NVCC_CCBIN)
+endif
+else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
+endif
 CUDA_ARCH ?= native
-# -Xcompiler passes flags to nvcc's HOST compiler. On Windows that host is MSVC
-# cl.exe, which rejects the gcc/clang-style -Wall,-Wextra (D8021). Gate them
-# behind a non-MSVC host so the Linux/macOS (gcc/clang) build keeps the warnings
-# and the Windows cuda-dll build doesn't fail. (#306)
-NVCC_HOST_WARN ?= $(if $(IS_WIN),,-Xcompiler=-Wall,-Wextra)
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) $(NVCC_HOST_WARN)
-ifeq ($(IS_WIN),)
-PYTHON    ?= python3
+ifneq ($(IS_WIN),)
+# nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
+# -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
+# '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
+# the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
+# slash-form into a filesystem path).
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
 else
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+endif
+# PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
+# so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
+# triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
+# mingw32-gcc ... on Linux) sets IS_WIN and picks `python`, breaking clean/test
+# on hosts where only `python3` exists. $(OS)=Windows_NT in every Windows shell
+# (the #129 signal) and is empty on Linux/macOS.
+ifeq ($(OS),Windows_NT)
 PYTHON    ?= python
+else
+PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+ifneq (,$(LINUX))
+TEST_BINS += tests/test_uring$(EXE)
+endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -148,7 +197,7 @@ endif
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
 METAL_OBJ  =
-METALXX    = clang++ -x objective-c++ -fobjc-arc -O3
+METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
@@ -177,7 +226,7 @@ $(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
 endif
 .build-config: ;
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
@@ -188,7 +237,7 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
-# __declspec(dllexport) so the 11 API symbols are exported.
+# __declspec(dllexport) so the 15 API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
@@ -220,9 +269,23 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-# binario portabile da distribuire su altre macchine x86-64
+# Use a baseline that matches the compiler target. macOS already targets a
+# portable baseline when ARCH is empty; forcing the x86 value there breaks
+# Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+ifneq (,$(DARWIN))
+PORTABLE_ARCH =
+else ifneq (,$(AARCH64))
+PORTABLE_ARCH = armv8-a
+else ifneq (,$(PPC64))
+PORTABLE_ARCH = power8
+else ifneq (,$(X86_64))
+PORTABLE_ARCH = x86-64-v3
+else
+PORTABLE_ARCH = native
+endif
+
 portable:
-	$(MAKE) glm$(EXE) ARCH=x86-64-v3
+	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
@@ -239,16 +302,25 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)

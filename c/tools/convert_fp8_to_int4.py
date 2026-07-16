@@ -51,6 +51,38 @@ def quant_int4(w, bits):                        # -> (qbytes U8 [O*ceil(I/2)], s
         out[:, :v1.shape[1]] |= (v1 << 4)
     return out.reshape(-1), s[:, 0].astype(np.float32)
 
+def quant_int4_grouped(w, bits, gs=128):
+    """Group-scaled int4: one scale per group of `gs` elements along the input dim.
+    Drastically reduces quantization error vs per-row scaling — matches the FP8
+    source's 128x128 block-scale granularity. Output layout:
+      qbytes: same packed nibble format as quant_int4
+      scales: f32 [O * ngroups] where ngroups = ceil(I/gs), laid out as
+              s[o * ngroups + g] = scale for row o, group g.
+    The engine detects this format (fmt=4) by checking the .qs array size."""
+    O, I = w.shape
+    qmax = (1 << (bits - 1)) - 1
+    ngroups = (I + gs - 1) // gs
+    # pad I to a multiple of gs for clean reshape, then trim
+    Ipad = ngroups * gs
+    wpad = np.zeros((O, Ipad), np.float32)
+    wpad[:, :I] = w
+    wr = wpad.reshape(O, ngroups, gs)                     # [O, ngroups, gs]
+    amax = np.abs(wr).max(axis=2, keepdims=True)          # [O, ngroups, 1]
+    s = np.maximum(amax / qmax, 1e-8)                     # [O, ngroups, 1]
+    q = np.clip(np.rint(wr / s), -8, qmax).astype(np.int32)  # [O, ngroups, gs]
+    q = q.reshape(O, Ipad)[:, :I]                         # trim padding -> [O, I]
+    # pack nibbles (identical to quant_int4)
+    rb = (I + 1) // 2
+    out = np.zeros((O, rb), np.uint8)
+    v0 = (q[:, 0::2] + 8).astype(np.uint8)
+    out[:, :v0.shape[1]] = v0
+    if I > 1:
+        v1 = (q[:, 1::2] + 8).astype(np.uint8)
+        out[:, :v1.shape[1]] |= (v1 << 4)
+    # scales: flatten [O, ngroups] -> [O * ngroups]
+    s_flat = s[:, :, 0].astype(np.float32).reshape(-1)
+    return out.reshape(-1), s_flat
+
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
     qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
@@ -84,7 +116,7 @@ def layer_idx(name):
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
-    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro .weight U8.
+    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
     # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
     li = layer_idx(name)
@@ -105,7 +137,20 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
     if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
-    if name.endswith(".weight"): return "q"              # attn/dense-mlp/shared (residente)
+    # Split resident weights by type for mixed-precision control:
+    #   "sh" = shared expert (fires on every token, highest sensitivity)
+    #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
+    #   "kvb" = kv_b_proj (reconstructs KV cache on every decode step)
+    #   "attn" = other attention projections (q_a, q_b, kv_a)
+    #   "dmlp" = dense MLP (first 3 layers)
+    if "shared_experts" in name: return "sh"
+    if name.endswith("o_proj.weight"): return "o"
+    if name.endswith("kv_b_proj.weight"): return "kvb"
+    if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
+                                       "kv_a_proj_with_mqa.weight")): return "attn"
+    if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                       "mlp.down_proj.weight")): return "dmlp"
+    if name.endswith(".weight"): return "q"              # fallback: other resident weights
     return "f32"
 
 # ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
@@ -169,7 +214,8 @@ def dequant(f, name, keys):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
@@ -180,11 +226,22 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
             if kind == "f32":
                 out_dict[name] = w.astype(np.float32)
             else:
-                bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                # Resolve bits for this tensor type: use bits_map override if provided,
+                # otherwise fall back to the classic ebits/xbits/io_bits scheme.
+                if bits_map and kind in bits_map:
+                    bits = bits_map[kind]
+                else:
+                    bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                # Any unknown kind that fell through classify as "q"
+                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                    bits = ebits
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
                     out_dict[name] = w.astype(np.float32); continue
-                q, s = (quant_int2(w, bits) if bits <= 2 else
-                        quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+                if group_size > 0 and bits <= 4:
+                    q, s = quant_int4_grouped(w, bits, group_size)
+                else:
+                    q, s = (quant_int2(w, bits) if bits <= 2 else
+                            quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
 
@@ -198,6 +255,20 @@ def main():
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
+    # Set these higher to protect sensitive tensors from quantization error.
+    ap.add_argument("--shared-bits", type=int, default=None,
+        help="bits for shared expert (fires on every token, highest sensitivity). Default=ebits")
+    ap.add_argument("--o-bits", type=int, default=None,
+        help="bits for o_proj attention (reconstructs output, biggest attn tensor). Default=ebits")
+    ap.add_argument("--kvb-bits", type=int, default=None,
+        help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
+    ap.add_argument("--attn-bits", type=int, default=None,
+        help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
+    ap.add_argument("--dmlp-bits", type=int, default=None,
+        help="bits for dense MLP (first 3 layers). Default=ebits")
+    ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
+        help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
@@ -216,6 +287,17 @@ def main():
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
         a.ebits = 8 if (a.mtp or a.indexer) else 4
     if a.xbits is None: a.xbits = a.ebits
+
+    # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
+    # converter falls back to ebits for that type.
+    bits_map = {}
+    if a.shared_bits is not None: bits_map["sh"] = a.shared_bits
+    if a.o_bits is not None:      bits_map["o"] = a.o_bits
+    if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
+    if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
+    if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
+    if bits_map:
+        print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
 
     if a.selftest_nvfp4:
         import torch
@@ -298,7 +380,7 @@ def main():
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
         # copia config + tokenizer
         for fn in ["config.json"]:
@@ -541,7 +623,7 @@ def main():
             if os.path.exists(outp): print(f"[MTP] {outp} already done"); continue
             print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
             save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
@@ -561,7 +643,7 @@ def main():
             if os.path.exists(outp): continue             # gia' fatto -> ripartibile
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
             if out: save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
@@ -575,7 +657,7 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):

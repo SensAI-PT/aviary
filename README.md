@@ -17,14 +17,40 @@ $ ./coli chat
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
 
+
+## See it running
+
+<p align="center">
+  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
+</p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model answering at 4+ tok/s end-to-end on 6× RTX 5090 —
+with live token metrics, the hardware panel, and the VRAM/RAM/disk expert tiers.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
+</p>
+<p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
+brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
+<a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+
+## Contents
+
+- [The idea](#the-idea)
+- [See it running](#see-it-running)
+- [What's implemented](#whats-implemented)
+- [Honest numbers](#honest-numbers-wsl2-12-cores-25-gb-ram-nvme-via-vhdx)
+- [Download the model](#download-the-model)
+- [Web dashboard](#web-dashboard)
+- [Got a better machine?](#got-a-better-machine-try-it--heres-what-to-expect)
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and only ~11 GB of those change from token to token (the routed experts). So:
 
 - the **dense part** (attention, shared experts, embeddings — ~17B params) stays **resident in RAM at int4** (~9.9 GB);
-- the **21,504 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
+- the **19,456 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
 
-The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
+The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented
 
@@ -354,6 +380,10 @@ PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+# large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
+COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
+CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
+SNAP=/nvme/glm52_i4 ./glm 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -375,6 +405,25 @@ replay from 1.87 to 2.16 tok/s (+15.7%), reduced expert disk wait from 5.144s to
 3.948s, and kept the projected RAM peak below `RAM_GB=226`. The cache cap adjusts
 down automatically (54 to 40 in that run) so the larger pinned tier does not exceed
 the process budget. Start lower on hosts with less available RAM.
+
+`CUDA_EXPERT_GB=auto` fills each selected device only up to its measured free
+memory minus projected dense tensors and 2 GB of runtime headroom. `PIN_GB=all`
+then loads every remaining routed expert into RAM, eliminating decode-time disk
+misses when the host budget permits it. The regular `RAM_GB` guard still clamps
+the per-layer working cache and rejects unsafe projections; this mode is intended
+for dedicated high-memory inference hosts, not desktops running other workloads.
+On a dedicated 251 GiB host with six RTX 5090s, this mode selected a 176.7 GB
+VRAM expert tier and a 191.3 GB RAM tier (all 19,456 experts resident). The
+mode also adapts the VRAM tier every 16 emitted tokens by swapping hot RAM
+experts into existing GPU slots. A real 64-token greedy GLM-5.2 generation
+measured **6.00 tok/s decode**, up from
+2.20 tok/s end-to-end with the earlier 150 GB tier; expert hit rate was 100%
+and disk wait was zero. Prompt prefill is reported separately. This is a
+host-specific capacity result, not a portable default.
+
+Text-mode timing reports prefill separately from decode. The decode rate starts
+after the prompt KV is built, so it is comparable to `REPLAY` throughput without
+hiding time-to-first-token.
 MTP speculation defaults off on CUDA because cold draft routes increase expert
 traffic; an explicit `DRAFT=n` still overrides the default.
 
@@ -406,8 +455,8 @@ CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
 
 ### Web interface
 
-`web/` contains a community-contributed browser UI (React + TypeScript, ~390
-lines of source, a pure API client — it never touches the engine directly):
+`web/` contains a community-contributed browser UI (React + TypeScript, a pure
+API client — it never touches the engine directly):
 
 ```bash
 cd web
@@ -419,7 +468,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `URING=1` Linux-only batched expert I/O (implies `PIPE=1`; also batches `PILOT_REAL`), `PIPE=0` disable the async expert-load pool (**default ON on Windows** — overlaps expert `pread` with the matmul so the CPU isn't idle waiting on the SSD; measured −18% disk service time), `RAM_GB=<n>` claim more RAM for the expert cache than the conservative auto-detect (e.g. `RAM_GB=31` on a 32 GB host raises the cache cap and hit rate measurably), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 ### Resource policy
 
@@ -444,10 +493,10 @@ Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output
 quality does not.
 
-Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
+Cold expert reads can use a deferred pipeline: resident RAM/VRAM experts execute
 while missing experts are loaded in a bounded background I/O pool, then the
-cold results join before the layer completes. `IO_THREADS=n` overrides the
-default eight loader threads when foreground work exists. Profiling reports
+cold results join before the layer completes. The pool engages only under
+`PIPE=1`; `PIPE_WORKERS=n` sets its worker count (default 8). Profiling reports
 both disk service time and the smaller foreground-visible wait time so overlap
 is explicit rather than credited as unexplained speedup.
 
@@ -477,6 +526,23 @@ refresh the same VRAM tier budget. A 25% hysteresis and a four-swap limit preven
 thrashing. Persistent `.coli_usage` remains the long-term signal and is not decayed.
 
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
+
+## Web dashboard
+
+One command serves the OpenAI-compatible API **and** the web console on the same port, then opens your browser when the engine is ready:
+
+```bash
+cd web && npm install && npm run build   # once
+./coli web --model <model-dir>
+```
+
+What you get:
+
+- **Chat** with live metrics: a flashing token counter while generating, then tok/s, time-to-first-token, prompt→completion counts and queue wait;
+- **Runtime panel**: your hardware (CPU, GPUs + VRAM, RAM, cores), the scheduler, and the live expert-tier bar — how many of the 19,456 experts sit in VRAM / RAM / disk right now;
+- **Brain**: the whole model as a 76×256 cortex, one cell per expert. Colour = tier, brightness = routing heat, and the experts routed in each turn flash white and decay — you watch the model think. Hover any cell for its tier, heat and [measured topic affinity](https://github.com/JustVugg/colibri/issues/175) (specialists for code, Chinese, math, law… live in layers 11–22).
+
+The dashboard talks to the engine over two tiny protocol lines (`TIERS`, `EMAP`/`HITS`) and plain JSON endpoints — nothing heavier than the engine itself.
 
 ## Got a better machine? Try it — here's what to expect
 
@@ -591,6 +657,7 @@ c/
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client, community-maintained)
+desktop/                  Tauri v2 desktop shell wrapping the web UI
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small

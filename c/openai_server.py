@@ -410,8 +410,11 @@ def generation_options(body, limit):
     top_p = body.get("top_p")
     temperature = 0.7 if temperature is None else temperature
     top_p = 0.9 if top_p is None else top_p
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
-        raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)
+    if maximum > limit:
+        maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
+                          # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
             not math.isfinite(temperature) or not 0 <= temperature <= 2):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
@@ -731,12 +734,16 @@ class APIHandler(BaseHTTPRequestHandler):
         Read-only, no auth (same trust level as /health), traversal-safe."""
         if path.startswith("/v1/") or path == "/health":
             return False
-        base = self.WEB_DIST
+        base = self.WEB_DIST.resolve()
         if not base.is_dir():
             return False
         rel = unquote(path).lstrip("/") or "index.html"
         target = (base / rel).resolve()
-        if not str(target).startswith(str(base)) or not target.is_file():
+        try:
+            target.relative_to(base)
+        except ValueError:
+            target = None
+        if target is None or not target.is_file():
             if path == "/" or "." not in rel:      # SPA fallback
                 target = base / "index.html"
                 if not target.is_file():
@@ -1045,6 +1052,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+        if not prompt:
+            raise APIError(400, "`prompt` must not be empty.", "prompt")
         self.generation(body, prompt, request_id, False)
 
 
