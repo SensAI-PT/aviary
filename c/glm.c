@@ -3562,18 +3562,26 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * No pipe_sync at the end: the next layer's pipe_download (sync cudaMemcpy)
      * provides the implicit sync point. The fallback path (caller downloads x_dev)
      * also uses pipe_download which syncs. This lets GPU work chain across layers
-     * without a per-layer stall. */
+     * without a per-layer stall.
+     *
+     * Profiling: moe() self-times its own t_emm (routed expert matmul). We time only
+     * the GPU work that moe() does NOT cover: the shared-expert dispatch and the
+     * routed-expert upload+add. Previously a single outer span wrapped everything
+     * including moe(), double-counting the routed-expert time and driving the
+     * profile's "other" bucket negative (#292). */
     double te=now_s();
     if(!coli_cuda_pipe_gemm(l->sh_gate.cuda,sg_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_up.cuda,su_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*sI)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_down.cuda,y_d,sg_d,S)) return 0;
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
+    m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
-    moe(m,l,li,nrm_host,S,out_host,0);
+    moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
+    te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
-    m->t_emm+=now_s()-te;
+    m->t_emm += now_s()-te;                                       /* routed-expert upload + add only */
     return 1;
 }
 #endif
@@ -5751,7 +5759,16 @@ int main(int argc, char **argv){
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){
 #ifdef COLI_CUDA
-        g_draft = (m.has_mtp&&!g_cuda_enabled) ? 3 : 0;
+        /* MTP is disabled under CUDA by default: cold (streaming) experts still
+         * run on the CPU, where the S==1 fused-pair kernel and the S>=2 IDOT
+         * kernel diverge in FP accumulation order, collapsing draft acceptance
+         * (#163). GPU-resident experts have no divergence, but the cold subset
+         * always exists on a single 16 GB card. COLI_CUDA_MTP=1 opts in for
+         * users who want to test speculation under CUDA — the #163 thread shows
+         * acceptance can still reach 30-50% even with the cold-expert mismatch.
+         * See #292 for the diagnostic sweep that identified this. */
+        int cuda_mtp = getenv("COLI_CUDA_MTP") ? atoi(getenv("COLI_CUDA_MTP")) : 0;
+        g_draft = (m.has_mtp && (!g_cuda_enabled || cuda_mtp)) ? 3 : 0;
 #else
         g_draft = m.has_mtp ? 3 : 0;
 #endif
