@@ -313,8 +313,11 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    result.setdefault("OMP_PROC_BIND", "spread")
-    result.setdefault("OMP_PLACES", "cores")
+    if sys.platform != "win32":
+        # la libgomp di MinGW non supporta l'affinity su Windows
+        # ("Affinity not supported on this configuration"): non impostarle li'.
+        result.setdefault("OMP_PROC_BIND", "spread")
+        result.setdefault("OMP_PLACES", "cores")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
