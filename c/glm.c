@@ -1277,6 +1277,35 @@ static void load_cfg(Cfg *c, const char *snap){
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
                 c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
+    /* generation_config.json e' il file AUTOREVOLE per la generazione secondo HuggingFace:
+     * config.json ne porta spesso una copia legacy o parziale. Un tool di conversione che
+     * rigenera un config.json ridotto lascia il motore fermo su MENO stop del dovuto, e i
+     * token di controllo che restano finiscono stampati in chat come testo (woolcoxm, #298:
+     * "the stop token being printed to chat", verificato sui token id). Unione dei due:
+     * uno stop in piu' non fa danno, uno in meno si' -- e chi converte i pesi non siamo noi.
+     * EN: generation_config.json is HF's authority for generation; config.json often carries
+     * a partial legacy copy. Union both -- an extra stop is harmless, a missing one is not. */
+    { char gp[2100]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap);
+      FILE *gf=fopen(gp,"rb");                  /* assente = nessun problema: e' opzionale */
+      if(gf){
+        fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
+        if(gn>0){
+            char *gb=malloc(gn+1); size_t gg=fread(gb,1,gn,gf); gb[gg]=0;
+            char *ga=NULL; jval *gr=json_parse(gb,&ga);
+            jval *ge=gr?json_get(gr,"eos_token_id"):NULL;
+            if(ge){
+                int add[8], na=0;
+                if(ge->t==J_NUM) add[na++]=(int)ge->num;
+                else if(ge->t==J_ARR) for(int i=0;i<ge->len && na<8;i++) add[na++]=(int)ge->kids[i]->num;
+                for(int i=0;i<na && c->n_stop<8;i++){
+                    int dup=0; for(int j=0;j<c->n_stop;j++) if(c->stop_ids[j]==add[i]) dup=1;
+                    if(!dup) c->stop_ids[c->n_stop++]=add[i];
+                }
+            }
+            free(ga); free(gb);
+        }
+        fclose(gf);
+      } }
     /* DSA lightning indexer: parametri + tipo per-layer (lista esplicita o formula freq/offset) */
     c->index_topk=gi(r,"index_topk"); c->index_nh=gi(r,"index_n_heads"); c->index_hd=gi(r,"index_head_dim");
     { jval *it=json_get(r,"indexer_types");
@@ -4107,18 +4136,34 @@ static int pick_tok(const float *lo, int V, int ban){
 
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
-static int g_stop[9], g_nstop=0;
+static int g_stop[64], g_nstop=0;   /* config eos + ogni added-token "special" del tokenizer */
 static void repin_pass_limit(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
-static void stops_arm(const Cfg *c, int tok_eos){
+/* T=NULL -> solo gli stop del config (validazione/oracolo, dove il tokenizer non serve). */
+static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     g_nstop=0;
-    for(int i=0;i<c->n_stop;i++) g_stop[g_nstop++]=c->stop_ids[i];
-    if(tok_eos>=0 && !is_stop(tok_eos)) g_stop[g_nstop++]=tok_eos;
+    for(int i=0;i<c->n_stop && g_nstop<64;i++) g_stop[g_nstop++]=c->stop_ids[i];
+    if(tok_eos>=0 && !is_stop(tok_eos) && g_nstop<64) g_stop[g_nstop++]=tok_eos;
+    int nsp=0;
+    /* DIFESA IN PROFONDITA' (woolcoxm, #298): il tokenizer marca "special":true i token di
+     * CONTROLLO -- <|user|>, <|assistant|>, <|observation|>, <sop>, [gMASK], i marker
+     * image/video/audio. Nessuno di questi e' contenuto legittimo di una risposta: se il
+     * modello ne emette uno, il turno e' finito (infatti GLM ne elenca tre fra gli eos
+     * ufficiali). Senza questo, uno di quei token non elencato nel config veniva
+     * DETOKENIZZATO E STAMPATO IN CHAT come testo, e la generazione proseguiva oltre la
+     * fine reale -- l'"added stuff on the end" riportato su un checkpoint convertito.
+     * Fidarsi del config di pesi convertiti da terzi e' precisamente cio' che non
+     * possiamo controllare; il flag del tokenizer lo possiamo leggere.
+     * NB: <think>/<tool_call>/<arg_key> hanno "special":false e restano contenuto vero. */
+    if(T) for(int id=0; id<T->n_ids && g_nstop<64; id++)
+        if(T->id_special[id] && !is_stop(id)){ g_stop[g_nstop++]=id; nsp++; }
     fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
     for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
+    if(nsp) fprintf(stderr," (%d from the tokenizer's special set)",nsp);
     fprintf(stderr,"\n");
 }
+static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c,tok_eos,NULL); }
 
 /* decode greedy con SELF-SPECULATION n-gram: LOSSLESS (output identico al greedy puro).
  * Ogni forward verifica fino a g_draft token proposti dal contesto: i token accettati
@@ -4399,7 +4444,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
+    stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
@@ -4869,7 +4914,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
+    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
@@ -4970,7 +5015,7 @@ static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
+    stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
