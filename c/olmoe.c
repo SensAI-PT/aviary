@@ -382,7 +382,15 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
-        if (lru < 0) lru = 0; /* all pinned/in-flight: fallback evict oldest */
+        if (lru < 0) {
+            /* All slots are pinned or in-flight; find oldest non-in-flight slot
+             * (may be pinned, but never select one currently being loaded). */
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
+        if (lru < 0) lru = 0; /* absolute last resort: all in-flight, evict slot 0 */
         s = &lc->slots[lru];
         s->pinned = 0;
     }
@@ -449,13 +457,20 @@ static void pin_hot_experts(Model *m) {
                 if (lc->slots[i].eid == eid) { lc->slots[i].pinned = 1; found = 1; break; }
             }
             pthread_mutex_unlock(&g_pilot_mx);
-            if (!found) {
+            if (!found && g_pilot > 0) {
+                /* Only enqueue when the prefetch worker is active (PILOT>0). */
+                ensure_pilot_worker_started(m);
                 unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
                 unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-                if (w - r < 4096) {
+                int gidx = l * c->n_experts + eid;
+                pthread_mutex_lock(&g_pilot_mx);
+                int already = m->is_queued[gidx];
+                if (!already && w - r < 4096) {
                     pilot_q[w & 4095].l = l; pilot_q[w & 4095].e = eid;
+                    m->is_queued[gidx] = 1;
                     __atomic_store_n(&pilot_w, w + 1, __ATOMIC_RELEASE);
                 }
+                pthread_mutex_unlock(&g_pilot_mx);
             }
             pinned_total++;
         }
@@ -617,8 +632,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             pilot_prefetch(m, i + 3, x, S);
         
     }
-    /* IMPROVEMENT 2: count tokens; trigger hot pinning after warmup */
-    m->token_count++; m->freq_token_count++;
+    /* count actual tokens processed (S>1 during prefill) */
+    m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
     m->kv_len = pos_base + S;
