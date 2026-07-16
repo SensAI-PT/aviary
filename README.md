@@ -48,9 +48,9 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and only ~11 GB of those change from token to token (the routed experts). So:
 
 - the **dense part** (attention, shared experts, embeddings — ~17B params) stays **resident in RAM at int4** (~9.9 GB);
-- the **21,504 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
+- the **19,456 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
 
-The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
+The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented
 
@@ -455,8 +455,8 @@ CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
 
 ### Web interface
 
-`web/` contains a community-contributed browser UI (React + TypeScript, ~390
-lines of source, a pure API client — it never touches the engine directly):
+`web/` contains a community-contributed browser UI (React + TypeScript, a pure
+API client — it never touches the engine directly):
 
 ```bash
 cd web
@@ -493,10 +493,10 @@ Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output
 quality does not.
 
-Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
+Cold expert reads can use a deferred pipeline: resident RAM/VRAM experts execute
 while missing experts are loaded in a bounded background I/O pool, then the
-cold results join before the layer completes. `IO_THREADS=n` overrides the
-default eight loader threads when foreground work exists. Profiling reports
+cold results join before the layer completes. The pool engages only under
+`PIPE=1`; `PIPE_WORKERS=n` sets its worker count (default 8). Profiling reports
 both disk service time and the smaller foreground-visible wait time so overlap
 is explicit rather than credited as unexplained speedup.
 
@@ -657,6 +657,7 @@ c/
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client, community-maintained)
+desktop/                  Tauri v2 desktop shell wrapping the web UI
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
