@@ -5749,6 +5749,9 @@ int main(int argc, char **argv){
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+#ifdef _WIN32
+    _setmode(fileno(stdout), O_BINARY);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;
     if(getenv("I4_ACC512_TEST")){
