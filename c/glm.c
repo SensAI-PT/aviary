@@ -37,6 +37,9 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
+#if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
+#endif
 #include "st.h"
 #ifdef __linux__
 #include "uring.h"
@@ -1578,6 +1581,14 @@ static void embed_row(Model *m, int tok, float *x){
 static int g_mmap=0;
 static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
 static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
+/* forward decls: mem_should_wire/mem_wire live near pin_wire() further down, but
+ * qt_wire_mmap() (also further down, used by pin_wire()'s COLI_MMAP path) needs
+ * them declared before its own definition. Real mlock-ing of mmap'd pinned
+ * experts happens there, not in expert_load() -- see qt_wire_mmap() for why. */
+static int mem_should_wire(void);
+static int mem_wire(void *addr, size_t len);
+static void qt_unwire_mmap(QT *t);   /* def. presso pin_wire / defined near pin_wire */
+static int64_t g_mmap_wired=0; static long g_mmap_wire_failed=0;
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
@@ -1691,6 +1702,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 acc+=p[n-1]; (void)acc;
                 char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
                 for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+                /* mlock deliberately NOT done here: this fires for every expert_load call,
+                 * including the transient VRAM-staging pass in pin_load (host copy loaded,
+                 * uploaded to GPU, then "released" via expert_host_release -- which only
+                 * knows how to munlock s->slab, always NULL under mmap, so wiring here would
+                 * leak locked pages for every GPU-tier expert). See pin_wire() below: it wires
+                 * the final resident set only, after GPU release has already nulled out the
+                 * pointers for anything that isn't genuinely RAM-tier. */
             }
             s->eid=eid; return 0;
         }
@@ -4562,6 +4580,9 @@ static void repin_pass_limit(Model *m,int limit){
                 if(!qt_cuda_update(hq[k])) ok=0;
             }
             if(!ok){ fprintf(stderr,"[REPIN] refresh VRAM fallito\n"); exit(1); }
+            /* promoted expert now computes from VRAM: drop its host mlock
+             * (mmap path; no-op otherwise) or every swap leaks locked pages */
+            qt_unwire_mmap(&hot->g); qt_unwire_mmap(&hot->u); qt_unwire_mmap(&hot->d);
             if(g_cuda_release_host) expert_host_release(m,hot);
             gpu_swaps++;
             if(getenv("REPIN_VERBOSE")) fprintf(stderr,
@@ -5144,25 +5165,45 @@ static void ehit_mark(Model *m, int layer, int eid){
 static void hwinfo_emit(Model *m){
     Cfg *c=&m->c; (void)c;   /* silence -Wunused on builds without /proc (#148 report) */
     /* CPU */
-    char cpu[256]=""; FILE *ci=fopen("/proc/cpuinfo","r");
+    char cpu[256]="";
+#ifdef _WIN32
+    /* niente /proc su Windows: brand string via CPUID (0x80000002..4), zero
+     * dipendenze extra. La dashboard mostrava "0 GB RAM / 0 cores" perche'
+     * tutto questo blocco era solo-Linux mentre il ramo CUDA funzionava. */
+#if defined(__x86_64__) || defined(__i386__)
+    { unsigned int r[12]={0}; unsigned int *w=r;
+      for(unsigned int f=0x80000002u; f<=0x80000004u; f++,w+=4)
+          __get_cpuid(f,&w[0],&w[1],&w[2],&w[3]);
+      char *b=(char*)r; b[47]=0; while(*b==' ')b++;
+      snprintf(cpu,sizeof(cpu),"%s",b); }
+#endif
+#else
+    FILE *ci=fopen("/proc/cpuinfo","r");
     if(ci){ char ln[256];
         while(fgets(ln,sizeof(ln),ci)) if(!strncmp(ln,"model name",10)){
             char *p=strchr(ln,':'); if(p){ p++; while(*p==' ')p++;
             int n=(int)strlen(p); if(n>0&&p[n-1]=='\n')p[--n]=0;
             snprintf(cpu,sizeof(cpu),"%s",p); } break; }
         fclose(ci); }
+#endif
     int cores=0;
-#ifdef _SC_NPROCESSORS_ONLN
+#ifdef _WIN32
+    { SYSTEM_INFO si; GetSystemInfo(&si); cores=(int)si.dwNumberOfProcessors; }
+#elif defined(_SC_NPROCESSORS_ONLN)
     cores=(int)sysconf(_SC_NPROCESSORS_ONLN);
 #endif
     /* RAM */
     double ram_total=0,ram_avail=0;
+#ifdef _WIN32
+    compat_meminfo(&ram_total,&ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
+#else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;
         while(fgets(ln,sizeof(ln),mi)){
             if(sscanf(ln,"MemTotal: %lf",&mt)==1) ram_total=mt/1e6;
             if(sscanf(ln,"MemAvailable: %lf",&ma)==1) ram_avail=ma/1e6;
         } fclose(mi); }
+#endif
     /* GPU */
     int ngpu=0; double vram_total=0;
     char gpu_name[128]="";
@@ -5317,8 +5358,57 @@ static int mem_wire(void *addr, size_t len){
 }
 /* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
  * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
+/* mlock a single mmap'd QT's weight + scale ranges. Skips VRAM-tier QTs
+ * (cuda_eligible): their compute runs from device memory, so wiring the host
+ * mmap range would pin ~137 GB of never-touched file pages. NOTE the q8/q4
+ * NULL check alone is NOT enough here: expert_host_release() early-returns
+ * for mmap experts (no slab) without nulling the host pointers, so GPU-tier
+ * slots keep live-looking q8/q4 forever -- that was the bug that wired 363 GB
+ * instead of 231 GB and starved the kernel into page-cache thrashing.
+ * wired/failed are accumulated into the caller's counters. */
+/* undo qt_wire_mmap for one QT: used when a REPIN gpu_swap promotes a wired
+ * RAM-tier expert into VRAM -- without this every promotion leaks its locked
+ * host range and the dead-weight lock re-grows over a long session. */
+static void qt_unwire_mmap(QT *t){
+    if(!g_mmap || !mem_should_wire()) return;
+    if(!t->q8 && !t->q4) return;
+    int64_t scale_b=(int64_t)t->O*4;
+    int64_t weight_b=qt_bytes(t)-scale_b;
+    void *wp=t->q8?(void*)t->q8:(void*)t->q4;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if(weight_b>0 && !munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
+    if(t->s && scale_b>0 && !munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+#elif defined(_WIN32)
+    if(weight_b>0 && !compat_munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
+    if(t->s && scale_b>0 && !compat_munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+#endif
+}
+static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
+    if(!t->q8 && !t->q4) return;
+    if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
+    int64_t scale_b=(int64_t)t->O*4;
+    int64_t weight_b=qt_bytes(t)-scale_b;
+    void *wp=t->q8?(void*)t->q8:(void*)t->q4;
+    if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
+    if(t->s && scale_b>0){ if(mem_wire(t->s,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }
+}
 static void pin_wire(Model *m){
     if(!mem_should_wire()) return;
+    if(g_mmap){
+        /* Wire the FINAL resident set only, after pin_load's GPU-upload pass
+         * has already run -- qt_wire_mmap() skips cuda_eligible (VRAM-tier)
+         * slots, so only the genuinely RAM-tier experts get locked. */
+        Cfg *c=&m->c; double t0=now_s();
+        for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
+            ESlot *s=&m->pin[i][z];
+            qt_wire_mmap(&s->g,&g_mmap_wired,&g_mmap_wire_failed);
+            qt_wire_mmap(&s->u,&g_mmap_wired,&g_mmap_wire_failed);
+            qt_wire_mmap(&s->d,&g_mmap_wired,&g_mmap_wire_failed);
+        }
+        fprintf(stderr,"[PIN] mlock (mmap): %.1f GB wired in physical RAM%s in %.0fs\n",
+            g_mmap_wired/1e9, g_mmap_wire_failed?" (some allocations failed -- raise: ulimit -l unlimited)":"", now_s()-t0);
+        return;
+    }
     Cfg *c=&m->c; double t0=now_s(); int64_t wired=0; long failed=0;
     for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
         ESlot *s=&m->pin[i][z];

@@ -161,6 +161,34 @@ def resource_request(a, env):
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    if sys.platform == "win32":
+        # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
+        # self-exec di glm.c; presence-based come nel motore: impostarla a
+        # qualsiasi valore, anche 0, disattiva). I default I/O piu' sotto
+        # restano attivi: kill-switch dedicati = le var stesse (DIRECT=0 ecc.)
+        if not e.get("COLI_NO_OMP_TUNE"):
+            # parita' col tuning OMP self-exec di glm.c (solo Linux/FreeBSD, e
+            # comunque saltato sotto CUDA/Metal): libgomp legge queste variabili
+            # prima di main, quindi su Windows vanno nell'ambiente del figlio.
+            # niente OMP_PROC_BIND/OMP_PLACES: la libgomp di MinGW non supporta
+            # l'affinity su Windows ("Affinity not supported on this configuration")
+            from resource_plan import physical_cpu_count
+            for k, v in (("OMP_WAIT_POLICY", "active"),
+                         ("GOMP_SPINCOUNT", "200000"),
+                         ("OMP_DYNAMIC", "FALSE"),
+                         ("OMP_NUM_THREADS", str(physical_cpu_count()))):
+                e.setdefault(k, v)
+        # Default Windows misurati sul box di riferimento (docs/tuning-9950x3d-5090.md),
+        # tutti lossless e tutti setdefault (un override esplicito vince sempre):
+        # - DIRECT=1: 10.7 GB/s O_DIRECT vs 9.0 buffered (iobench, anche a cache
+        #   calda); nel motore 0.48 -> 1.02 tok/s. Upstream #162: 1.47x.
+        # - PIPE=1: overlap load/matmul, +8% sopra DIRECT (byte-identico, riordina
+        #   solo l'I/O). PIPE_WORKERS resta al default 8 (sweep 4/8/16 piatto).
+        # - PILOT_REAL=1: prefetch cross-layer con load veri (unico prefetch
+        #   funzionante su Windows: fadvise e' no-op), +11%, hit rate +19 punti.
+        e.setdefault("DIRECT", "1")
+        e.setdefault("PIPE", "1")
+        e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
