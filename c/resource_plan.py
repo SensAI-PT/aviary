@@ -461,11 +461,18 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    if sys.platform != "win32":
-        # la libgomp di MinGW non supporta l'affinity su Windows
-        # ("Affinity not supported on this configuration"): non impostarle li'.
-        result.setdefault("OMP_PROC_BIND", "spread")
-        result.setdefault("OMP_PLACES", "cores")
+    # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
+    # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
+    # self-exec) sets OMP_PROC_BIND=close with overwrite=0 -- it prefers
+    # packing the team onto adjacent cores for the tiny back-to-back per-expert
+    # matmuls. Pre-setting OMP_PROC_BIND=spread here ran first and won (the
+    # engine's overwrite=0 setenv could not override an already-set var), and
+    # spread + OMP_PLACES=cores collapsed the team to one CPU on some libgomp /
+    # multi-socket topologies (#325: --auto-tier pinned decode to 1 core on a
+    # 64-core box even with OMP_NUM_THREADS=64). Leaving affinity to the engine
+    # makes --auto-tier match the plain (working) path. A user who wants a
+    # specific policy can still set OMP_PROC_BIND/OMP_PLACES in the environment
+    # themselves -- setdefault above only covers OMP_NUM_THREADS.
     tune = plan.get("tune", {})
     for key, entry in tune.items():
         if key.startswith("_"):

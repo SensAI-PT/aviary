@@ -109,6 +109,19 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(plan["cpu"]["physical_cores"], 12)
         self.assertEqual(env["OMP_NUM_THREADS"], "12")
 
+    def test_plan_does_not_set_omp_affinity_vars(self):
+        # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
+        # OMP_PLACES=cores, which ran before the engine's overwrite=0 setenv and
+        # so won, collapsing the OpenMP team to one CPU on the reporter's 64-core
+        # Linux box even though OMP_NUM_THREADS was correct. The plan must leave
+        # affinity to the engine's own hot-thread tuning (which prefers 'close').
+        plan = build_plan(self.model, available_memory=16 * GB,
+                          available_disk=1, gpus=[], physical_cpus=64)
+        env = environment_for_plan(plan)
+        self.assertEqual(env["OMP_NUM_THREADS"], "64")
+        self.assertNotIn("OMP_PROC_BIND", env)
+        self.assertNotIn("OMP_PLACES", env)
+
     def test_plan_conserves_budget_and_experts_above_256gb(self):
         # Regression for #325's reporter: a 512 GB machine loading the whole
         # model into RAM. Verify the budget math stays exact at large RAM sizes
@@ -164,13 +177,13 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
-        if sys.platform == "win32":
-            # MinGW libgomp: niente affinity su Windows, le chiavi non vanno emesse
-            self.assertNotIn("OMP_PROC_BIND", env)
-            self.assertNotIn("OMP_PLACES", env)
-        else:
-            self.assertEqual(env["OMP_PROC_BIND"], "spread")
-            self.assertEqual(env["OMP_PLACES"], "cores")
+        # The plan must NOT set OMP_PROC_BIND / OMP_PLACES on any platform:
+        # the engine's own hot-thread tuning owns affinity (it prefers
+        # OMP_PROC_BIND=close for the back-to-back per-expert matmuls). Setting
+        # spread + cores here ran before the engine's overwrite=0 setenv and so
+        # won, collapsing the team to one CPU on some libgomp topologies (#325).
+        self.assertNotIn("OMP_PROC_BIND", env)
+        self.assertNotIn("OMP_PLACES", env)
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
