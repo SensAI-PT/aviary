@@ -53,7 +53,9 @@ typedef struct {
  * Ogni weight [out,in] tenuto come int8 (per-riga) + scala float per riga.
  * Cosi' la RAM-cache scende da 4 byte/param (f32) a 1 byte/param: e' il
  * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
-/* IMPROVEMENT 2: pinned=1 means this slot is never evicted (hot expert). */
+/* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
+ * not be evicted during normal LRU eviction, but may be displaced under extreme
+ * cache pressure when all slots are pinned or in-flight. */
 typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
@@ -71,10 +73,10 @@ typedef struct {
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
     int token_count;
-    /* PREDICTION IMPROVEMENT A: per-layer smoothed gate logits across tokens.
-     * momentum_logits[l*E .. (l+1)*E-1] = EMA of recent gate outputs.
-     * Blended with fresh gate prediction: final = (1-smooth)*fresh + smooth*ema.
-     * Captures routing consistency across tokens (same token tends to reuse experts). */
+    /* PREDICTION IMPROVEMENT A: per-layer EMA of gate logits across tokens.
+     * momentum_logits[l*E .. (l+1)*E-1] = EMA of gate outputs for layer l.
+     * Used exclusively by the PILOT prefetcher to stabilise routing predictions
+     * across tokens; does NOT affect actual MoE routing (pr is unchanged). */
     float *momentum_logits; /* [n_layers * n_experts], EMA of gate logits */
     float pilot_smooth;     /* SMOOTH env: EMA coefficient 0.0-0.9 (default 0.3) */
     uint8_t *is_pinned;     /* [n_layers * n_experts], 1 if expert is globally pinned */
@@ -357,7 +359,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
     st_read_raw(&m->S, nm, s->g, 1);
-    st_read_raw(&m->S, qsnm, s->gs, 1);
+    st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
@@ -603,8 +605,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
-        unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-        __atomic_store_n(&pilot_w, r, __ATOMIC_RELEASE);
+        /* Flush stale prefetch requests: clear is_queued so pilot_realload
+         * will skip any entries still sitting in pilot_q for the previous
+         * token.  We deliberately do NOT move pilot_w backwards; that would
+         * break the ring-buffer invariant (pilot_r could exceed pilot_w if
+         * the worker consumed an entry concurrently).  The worker will drain
+         * the stale slots harmlessly because pilot_realload already exits
+         * early when the expert is already cached or is_queued is clear. */
         pthread_mutex_lock(&g_pilot_mx);
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
         pthread_mutex_unlock(&g_pilot_mx);
@@ -650,6 +657,11 @@ static void pilot_realload(Model *m, int layer, int eid) {
     Cfg *c = &m->c;
 
     pthread_mutex_lock(&g_pilot_mx);
+    /* Early-exit if entry was flushed (is_queued cleared) while waiting. */
+    if (!m->is_queued[layer * c->n_experts + eid]) {
+        pthread_mutex_unlock(&g_pilot_mx);
+        return;
+    }
     for (int i = 0; i < lc->n; i++) {
         if (lc->slots[i].eid == eid) {
             m->is_queued[layer * c->n_experts + eid] = 0;
