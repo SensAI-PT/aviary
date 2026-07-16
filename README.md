@@ -22,8 +22,9 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
 </p>
-<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model answering on 6× RTX 5090 —
-live token metrics, the hardware panel, and the VRAM/RAM/disk expert tiers.</em></p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model at <strong>4 tok/s, TTFT 1.6 s, disk 0</strong> —
+full expert residency on 6× RTX 5090, with live token metrics, the per-turn time breakdown,
+the VRAM/RAM/disk tier bar and the live mini-brain in the corner.</em></p>
 
 <p align="center">
   <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
@@ -31,6 +32,13 @@ live token metrics, the hardware panel, and the VRAM/RAM/disk expert tiers.</em>
 <p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
 brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
 <a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-atlas.png" width="900" alt="the Atlas page — the measured expert atlas as a 3-D galaxy">
+</p>
+<p align="center"><em>The <strong>Atlas</strong> page: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a>
+as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
+(poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
 
 ## The idea
 

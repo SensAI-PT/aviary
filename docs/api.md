@@ -98,3 +98,13 @@ The dashboard talks to the engine over a small line protocol and plain JSON
 endpoints — nothing heavier than the engine itself. `web/` is a pure OpenAI-API
 client (React + TypeScript) and also works against any other compatible
 endpoint; the terminal `coli chat` remains the first-class interface.
+
+The layout is responsive down to phone widths, and the sidebar carries the full
+telemetry stack — hardware, scheduler, tier bar, per-turn time breakdown, tok/s
+trend and per-GPU expert counts:
+
+<p align="center">
+  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport">
+  &nbsp;&nbsp;
+  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar">
+</p>
