@@ -16,10 +16,13 @@ int main(void) {
     if (!T.o200k) { fprintf(stderr, "test_tok_o200k: o200k pattern not detected\n"); return 1; }
     FILE *f = fopen("tests/tok_o200k_cases.txt", "rb");
     if (!f) { perror("tests/tok_o200k_cases.txt"); return 1; }
-    char *line = NULL; size_t cap = 0; ssize_t nr;
+    /* fgets, not getline: MinGW's UCRT lacks getline and this must run on
+     * the windows job. Case lines are short; 8 KB is generous. */
+    char line[8192];
     int pass = 0, tot = 0, dpass = 0;
-    while ((nr = getline(&line, &cap, f)) >= 0) {
-        if (nr > 0 && line[nr-1] == '\n') line[--nr] = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t nr = strlen(line);
+        while (nr > 0 && (line[nr-1] == '\n' || line[nr-1] == '\r')) line[--nr] = 0;
         if (nr == 0) continue;
         char *tab = strchr(line, '\t'); if (!tab) continue;
         *tab = 0;
