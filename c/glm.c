@@ -5701,9 +5701,9 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
  * self-test, and would "generate" from "$P$G". So on Windows a PROMPT carrying
  * cmd's $-metacodes is ignored; set COLI_PROMPT to pass a real prompt from cmd. */
 static const char *coli_user_prompt(void){
-    const char *p = getenv("COLI_PROMPT");
+    const char *p = getenv_utf8("COLI_PROMPT");
     if(p) return p;
-    p = getenv("PROMPT");
+    p = getenv_utf8("PROMPT");
 #ifdef _WIN32
     if(p) for(const char *q=p; q[0]; q++)
         if(q[0]=='$' && q[1] && strchr("ABCDEFGHLNPQSTV_+|$", q[1]&~0x20)){ p=NULL; break; }
