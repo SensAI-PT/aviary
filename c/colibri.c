@@ -2516,6 +2516,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
 #ifdef COLI_CUDA
         ESlot *group_e[64]; int group_n[64]; int ngroup=0;
+        /* Inc.4 overlap stash: pass-1 packing kept for the take phase after the CPU loop */
+        ESlot *eg_e[64]; int eg_n[64], eg_row[64][4], eg_npg=0; float eg_w[64][4];
+        int dev_nc0[COLI_CUDA_MAX_DEVICES], dev_off0[COLI_CUDA_MAX_DEVICES],
+            dev_total0[COLI_CUDA_MAX_DEVICES], dev_which0[COLI_CUDA_MAX_DEVICES][64];
+        memset(dev_nc0,0,sizeof(dev_nc0)); (void)eg_npg; (void)dev_total0; (void)dev_off0;
 #endif
 #ifdef COLI_METAL
         if(g_metal_enabled){
@@ -2545,8 +2550,81 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         #undef MB_BUILD
 #endif
+#ifdef COLI_CUDA
+        /* Inc.4 pass 1: collect the VRAM-resident experts' groups and ISSUE them async
+         * BEFORE the CPU loop below, so the GPU computes its share while the CPU works
+         * through the RAM-tier/miss rows — t_emm becomes max(cpu, gpu) instead of the
+         * sum. Only resident experts are collected (misses are never cuda_eligible), so
+         * no pipe_wait is needed here; the CPU loop keeps its own waits. Any issue
+         * failure drops the layer back to the collect-in-loop + sync-group path. */
+        int early_issued=0, done_j[64]={0};
+        {
+            static int g_group_async2=-1;
+            if(g_group_async2<0) g_group_async2=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
+            if(!metal_done && g_group_async2 && group_enabled && S<=4 && g_cuda_enabled &&
+               g_cuda_ndev>0 && !omp_in_parallel()){
+                ESlot *pg_e[64]; int pg_n[64], pg_j[64], npg=0;
+                int prow[64][4]; float pw[64][4];
+                for(int j=0;j<nb;j++){ ESlot *e=use[j]; int eid=uniq[base+j];
+                    if(!(e->g.cuda_eligible&&e->u.cuda_eligible&&e->d.cuda_eligible)) continue;
+                    int nr=0;
+                    for(int s=0;s<S && nr<4;s++) for(int kk=0;kk<keff[s];kk++)
+                        if(idxs[(int64_t)s*K+kk]==eid){ prow[npg][nr]=s; pw[npg][nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                    if(!nr) continue;
+                    pg_e[npg]=e; pg_n[npg]=nr; pg_j[npg]=j; npg++;
+                }
+                if(npg){
+                    /* pack per device exactly like the sync path below */
+                    ColiCudaTensor *pd_g[COLI_CUDA_MAX_DEVICES][64],*pd_u[COLI_CUDA_MAX_DEVICES][64],*pd_d[COLI_CUDA_MAX_DEVICES][64];
+                    int pd_rows[COLI_CUDA_MAX_DEVICES][64],pd_which[COLI_CUDA_MAX_DEVICES][64];
+                    int pd_nc[COLI_CUDA_MAX_DEVICES]={0},pd_total[COLI_CUDA_MAX_DEVICES]={0},pd_off[COLI_CUDA_MAX_DEVICES]={0};
+                    for(int di=0;di<g_cuda_ndev;di++) for(int q=0;q<npg;q++)
+                        if(pg_e[q]->g.cuda_device==g_cuda_devices[di]) pd_total[di]+=pg_n[q];
+                    for(int di=1;di<g_cuda_ndev;di++) pd_off[di]=pd_off[di-1]+pd_total[di-1];
+                    for(int di=0;di<g_cuda_ndev;di++){
+                        int cursor=0,device=g_cuda_devices[di];
+                        for(int q=0;q<npg;q++) if(pg_e[q]->g.cuda_device==device){
+                            int nc=pd_nc[di]++; ESlot *e=pg_e[q];
+                            pd_g[di][nc]=e->g.cuda; pd_u[di][nc]=e->u.cuda; pd_d[di][nc]=e->d.cuda;
+                            pd_rows[di][nc]=pg_n[q]; pd_which[di][nc]=q;
+                            for(int r=0;r<pg_n[q];r++) memcpy(group_x+(int64_t)(pd_off[di]+cursor+r)*D,
+                                x+(int64_t)prow[q][r]*D,D*sizeof(float));
+                            cursor+=pg_n[q];
+                        }
+                    }
+                    double tg0=now_s();
+                    int all=1, issued[COLI_CUDA_MAX_DEVICES]={0};
+                    for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di])
+                        all=issued[di]=coli_cuda_expert_group_issue(pd_g[di],pd_u[di],pd_d[di],
+                                pd_rows[di],pd_nc[di],group_x+(int64_t)pd_off[di]*D);
+                    if(all){
+                        static int announced2;
+                        if(!announced2){ announced2=1; fprintf(stderr,"[CUDA] expert group overlap active\n"); }
+                        early_issued=1;
+                        for(int q=0;q<npg;q++) done_j[pg_j[q]]=1;
+                        /* stash packing for the take phase */
+                        for(int di=0;di<g_cuda_ndev;di++){ dev_nc0[di]=pd_nc[di]; dev_off0[di]=pd_off[di]; dev_total0[di]=pd_total[di];
+                            for(int q=0;q<pd_nc[di];q++) dev_which0[di][q]=pd_which[di][q]; }
+                        for(int q=0;q<npg;q++){ eg_e[q]=pg_e[q]; eg_n[q]=pg_n[q];
+                            for(int r=0;r<pg_n[q];r++){ eg_row[q][r]=prow[q][r]; eg_w[q][r]=pw[q][r]; } }
+                        eg_npg=npg;
+                        m->t_emm+=now_s()-tg0;
+                        for(int q=0;q<npg;q++){                    /* bookkeeping normally done in the loop */
+                            m->gpu_expert_calls++;
+                        }
+                    } else {
+                        for(int di=0;di<g_cuda_ndev;di++)
+                            if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+                    }
+                }
+            }
+        }
+#endif
         if(!metal_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+#ifdef COLI_CUDA
+            if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
+#endif
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
              * dispatched slot must be waited before the end-of-block LRU swap can reuse
              * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant.
@@ -2593,6 +2671,35 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->cpu_expert_rows+=(uint64_t)nr;}
         }
 #ifdef COLI_CUDA
+        /* Inc.4 take phase: the CPU loop above ran while the GPU computed the issued
+         * groups — collect them now. A failed device recomputes its experts on the CPU
+         * (expert_host_ensure reloads slabs released by CUDA_RELEASE_HOST). */
+        if(early_issued){
+            double tg1=now_s();
+            for(int di=0;di<g_cuda_ndev;di++) if(dev_nc0[di]){
+                const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                int cur=0;
+                for(int q=0;q<dev_nc0[di];q++){
+                    int gi=dev_which0[di][q], nr=eg_n[gi];
+                    if(hy){
+                        for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
+                            const float *hr=hy+(int64_t)(cur+r)*D;
+                            for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    } else {
+                        ESlot *e=eg_e[gi];
+                        for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
+                        expert_host_ensure(m,layer,e);
+                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        matmul_qt(hh,gg,&e->d,nr);
+                        for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
+                            for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
+                    }
+                    cur+=nr;
+                }
+            }
+            m->t_emm+=now_s()-tg1;
+        }
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
         int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
@@ -2614,6 +2721,33 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
         }
         double tg=now_s();
+        /* Inc.4: at decode scale, issue every device's group WITHOUT syncing, then take
+         * them all — one stream sync per device per layer instead of a full staged
+         * round-trip per call (measured: ~70% of the sync call is host-side wait).
+         * Any issue failure drains what was issued and the whole layer falls back to
+         * the sync path below, which recomputes from group_x (idempotent). */
+        int async_done=0;
+        static int g_group_async=-1;
+        if(g_group_async<0) g_group_async=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
+        if(g_group_async && S<=4 && g_cuda_ndev>0){
+            int issued[COLI_CUDA_MAX_DEVICES]={0}, all=1;
+            for(int di=0;di<g_cuda_ndev && all;di++) if(dev_nc[di])
+                all=issued[di]=coli_cuda_expert_group_issue(dev_g[di],dev_u[di],dev_d[di],
+                        dev_rows[di],dev_nc[di],group_x+(int64_t)dev_off[di]*D);
+            if(all){
+                static int announced;
+                if(!announced){ announced=1; fprintf(stderr,"[CUDA] expert group async path active\n"); }
+                async_done=1;
+                for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
+                    const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                    if(hy){ dev_ok[di]=1;
+                        memcpy(group_y+(int64_t)dev_off[di]*D,hy,(size_t)dev_total[di]*D*sizeof(float)); }
+                    else dev_ok[di]=0;      /* per-device sync failure: CPU fallback below */
+                }
+            } else for(int di=0;di<g_cuda_ndev;di++)
+                if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+        }
+        if(!async_done)
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
         for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
             double td=g_prof?now_s():0;
