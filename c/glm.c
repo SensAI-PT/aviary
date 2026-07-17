@@ -37,6 +37,9 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
+#ifdef __linux__
+#include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
+#endif
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
@@ -5909,9 +5912,16 @@ int main(int argc, char **argv){
            m.has_mtp?"ACTIVE":"absent", g_draft);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
     fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", g_draft);
-    if(!strncmp(snap,"/mnt/",5))
-        fprintf(stderr,"WARNING: the model is on %s (slow 9p/Windows filesystem; fadvise is ineffective).\n"
-                       "         Keep it on ext4 (for example, /home/...) for memory efficiency and speed.\n", snap);
+#ifdef __linux__
+    {   /* Only warn for a GENUINE 9p mount (WSL Windows drives, magic 0x01021997), where
+         * fadvise is a no-op. The old check was `snap` starting with "/mnt/", which
+         * false-positives on native-Linux ZFS/ext4/xfs/NFS mounts that also live under /mnt. */
+        struct statfs sfb;
+        if(statfs(snap,&sfb)==0 && (unsigned long)sfb.f_type==0x01021997UL)
+            fprintf(stderr,"WARNING: the model is on %s (9p/Windows filesystem; fadvise is ineffective).\n"
+                           "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
+    }
+#endif
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
