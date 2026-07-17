@@ -45,6 +45,8 @@ static std::mutex g_group_stats_mu;
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     std::fprintf(stderr, "[CUDA] %s: %s\n", what, cudaGetErrorString(err));
+    (void)cudaGetLastError();   /* consume the sticky error: a failed call must
+                                   not poison the next launch's error check */
     return 0;
 }
 
@@ -453,14 +455,20 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
-    DeviceContext *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!tensor) return 0;
     if (*tensor) {
+        /* Cached device copy: usable even when the caller's host pointers are
+         * gone. CUDA_RELEASE_HOST slots null their host pointers after upload,
+         * and with the old order (!weights checked first) every later matmul
+         * on such a slot failed here — the GPU tier silently never computed
+         * for host-released slab experts. */
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
     }
+    DeviceContext *ctx = find_ctx(device);
+    if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
@@ -502,10 +510,21 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
         (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
+/* Test hook: COLI_GPU_FAIL_AFTER=N makes every GPU COMPUTE entry point report
+ * failure after N successful calls (N=0: every call fails), exercising the
+ * engine's CPU fallbacks and host-rematerialization end-to-end without real
+ * hardware faults. Uploads/queries are not gated. Unset: no effect. */
+static long g_gpu_calls;
+static int fault_injected(void) {
+    const char *fa = std::getenv("COLI_GPU_FAIL_AFTER");
+    return fa && g_gpu_calls++ >= std::atol(fa);
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device) {
+    if (fault_injected()) return 0;
     if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
@@ -524,6 +543,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {
+    if (fault_injected()) return 0;
     if (!gate || !up || !down || !x || !y || S < 1 ||
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||
@@ -552,6 +572,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
 
 extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *up,
         ColiCudaTensor *down,float *y,const float *x,int S){
+    if (fault_injected()) return 0;
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=2||up->fmt!=2||down->fmt!=2||
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
@@ -583,6 +604,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *downs,
                                         const int *rows, int count,
                                         float *y, const float *x) {
+    if (fault_injected()) return 0;
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
@@ -708,6 +730,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,
                                             int R,int V,int K,int T,float scale){
+    if (fault_injected()) return 0;
     if(!w||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -761,12 +784,14 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
 extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,const float *q,
         const float *latent,const float *rope,int S,int H,int Q,int R,int V,int K,int T,
         float scale){
+    if (fault_injected()) return 0;
     return attention_absorb_batch_run(w,nullptr,ctx,q,latent,rope,S,H,Q,R,V,K,T,scale);
 }
 
 extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTensor *proj,
         float *out,const float *q,const float *latent,const float *rope,int S,int H,int Q,
         int R,int V,int K,int T,float scale){
+    if (fault_injected()) return 0;
     return attention_absorb_batch_run(w,proj,out,q,latent,rope,S,H,Q,R,V,K,T,scale);
 }
 
@@ -870,6 +895,7 @@ extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size
 }
 extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                                       const float *w_dev,int S,int D,float eps){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device);
     if(S<1||D<1||!select_ctx(ctx)) return 0;
     pipe_rmsnorm_rows<<<S,256>>>(y_dev,x_dev,w_dev,D,eps,D,D);
@@ -878,6 +904,7 @@ extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev
 extern "C" int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev,
                                         const float *w_dev,int S,int D,float eps,
                                         int xstride,int ystride){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device);
     if(S<1||D<1||xstride<D||ystride<D||!select_ctx(ctx)) return 0;
     pipe_rmsnorm_rows<<<S,256>>>(y_dev,x_dev,w_dev,D,eps,xstride,ystride);
@@ -886,6 +913,7 @@ extern "C" int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_d
 extern "C" int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,
                                    int rows,int stride,int offset,int R,int heads,
                                    float theta){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device);
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
     pipe_rope_rows<<<rows,128>>>(v_dev,pos_dev,0,stride,offset,R,heads,theta);
@@ -893,6 +921,7 @@ extern "C" int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,
 }
 extern "C" int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                                         int stride,int offset,int R,int heads,float theta){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device);
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
     pipe_rope_rows<<<rows,128>>>(v_dev,NULL,pos_base,stride,offset,R,heads,theta);
@@ -910,6 +939,7 @@ extern "C" int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const floa
 extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaTensor *proj,
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if (fault_injected()) return 0;
     if(!w||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
@@ -931,17 +961,20 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
 }
 extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,
                                        size_t n){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(gate_dev,up_dev,n);
     return cuda_ok(cudaGetLastError(),"pipe silu mul");
 }
 extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
     pipe_add_n<<<(unsigned)((n+255)/256),256>>>(x_dev,t_dev,n);
     return cuda_ok(cudaGetLastError(),"pipe add");
 }
 extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
                                        const int *rows_dev,int nrows,int D){
+    if (fault_injected()) return 0;
     DeviceContext *ctx=find_ctx(device); if(nrows<1||D<1||!select_ctx(ctx)) return 0;
     pipe_rows_add<<<nrows,256>>>(x_dev,partial_dev,rows_dev,D);
     return cuda_ok(cudaGetLastError(),"pipe rows add");
@@ -950,6 +983,7 @@ extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *part
  * coli_cuda_matmul, zero host transfers. */
 extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,
                                    int S){
+    if (fault_injected()) return 0;
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
     dim3 grid((unsigned)t->O,(unsigned)S);
@@ -969,6 +1003,7 @@ extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
 extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiCudaTensor *proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if (fault_injected()) return 0;
     if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
@@ -990,6 +1025,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
 extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx_dev,
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if (fault_injected()) return 0;
     if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -1004,6 +1040,7 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
 extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,const float *q,
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale){
+    if (fault_injected()) return 0;
     if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
