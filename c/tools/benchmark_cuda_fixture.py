@@ -18,10 +18,11 @@ PROFILE_RE = re.compile(
 )
 PROFILE_KEYS = ("disk", "expert_matmul", "attention", "lm_head", "other")
 P0_RE = re.compile(
-    r"P0-EXEC: routed CPU ([0-9.]+)s \| routed GPU critical ([0-9.]+)s \| "
+    r"P0-EXEC: routed CPU ([0-9.]+)s / ([0-9.]+) GB/s \(([0-9]+) row\) \| routed GPU critical ([0-9.]+)s \| "
     r"router ([0-9.]+)s \| residual P2P ([0-9.]+)s / ([0-9]+) hop \| orchestration ([0-9.]+)s"
 )
-P0_KEYS = ("routed_cpu", "routed_gpu_critical", "router", "p2p", "p2p_hops", "orchestration")
+P0_KEYS = ("routed_cpu", "routed_cpu_gb_s", "routed_cpu_rows", "routed_gpu_critical",
+           "router", "p2p", "p2p_hops", "orchestration")
 
 
 def parse_output(stdout: str, stderr: str = "") -> tuple[float, list[float]]:

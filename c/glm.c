@@ -203,6 +203,7 @@ typedef struct {
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_ewait, t_emm, t_ecpu, t_egpu, t_route, t_p2p, t_attn, t_kvb, t_head;
     uint64_t n_p2p;                              /* P0 execution profile: tier split + residual hops */
+    uint64_t cpu_expert_rows; int64_t cpu_expert_bytes;
                                                  /* profiling: dove va il tempo (wall del
                                                   * thread di compute; il servizio disco
                                                   * overlappato vive in g_edisk_ns) */
@@ -310,7 +311,7 @@ static void prof_lat(double s){ g_prof_lat[g_prof_nlat++ % PROF_LAT_CAP]=s; }
 /* snapshot for windowed reports (serve mode: one report per turn) */
 typedef struct {
     double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head;
-    int64_t io; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p;
+    int64_t io,cpu_bytes; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p,cpu_rows;
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
@@ -319,6 +320,7 @@ static void prof_base(Model *m, ProfBase *b){
     b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
     b->hits=m->hits; b->miss=m->miss; b->ereq=m->ereq;
     b->n_fw=m->n_fw; b->n_emit=m->n_emit; b->nlat=g_prof_nlat; b->n_p2p=m->n_p2p;
+    b->cpu_bytes=m->cpu_expert_bytes;b->cpu_rows=m->cpu_expert_rows;
 }
 
 static float *falloc(int64_t n){
@@ -3277,7 +3279,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-            double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_ecpu+=dt;
+            double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
+                m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                m->cpu_expert_rows+=(uint64_t)nr;}
         }
 #ifdef COLI_CUDA
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
@@ -3320,6 +3324,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                         for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                         matmul_qt(hh,gg,&e->d,nr);
+                        if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                            m->cpu_expert_rows+=(uint64_t)nr;}
                     }
                     if(g_prof)m->t_ecpu+=now_s()-tc;
                 }
@@ -4574,8 +4580,9 @@ static void profile_print(Model *m, double elapsed){
         edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
-    if(g_prof)printf("P0-EXEC: routed CPU %.3fs | routed GPU critical %.3fs | router %.3fs | residual P2P %.3fs / %llu hop | orchestration %.3fs\n",
-        m->t_ecpu,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
+    if(g_prof)printf("P0-EXEC: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | router %.3fs | residual P2P %.3fs / %llu hop | orchestration %.3fs\n",
+        m->t_ecpu,m->t_ecpu>0?m->cpu_expert_bytes/1e9/m->t_ecpu:0.0,
+        (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
 #ifdef COLI_METAL
@@ -4592,6 +4599,7 @@ static void profile_print(Model *m, double elapsed){
 static void profile_reset(Model *m){
     m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_ecpu=m->t_egpu=m->t_route=m->t_p2p=0;m->n_p2p=0;
+    m->cpu_expert_bytes=0;m->cpu_expert_rows=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
@@ -4639,15 +4647,18 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
     double route=m->t_route-b->route,p2p=m->t_p2p-b->p2p;
     uint64_t np2p=m->n_p2p-b->n_p2p;
+    int64_t cpu_bytes=m->cpu_expert_bytes-b->cpu_bytes;
+    uint64_t cpu_rows=m->cpu_expert_rows-b->cpu_rows;
     double attn=m->t_attn-b->attn, head=m->t_head-b->head;
     double other=elapsed-io_w-emm-attn-head-route-p2p; if(other<0) other=0;
     double f_io=io_w/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
     fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | other %.0f%%\n",
         100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
     double slow=ecpu>egpu?ecpu:egpu,fast=ecpu<egpu?ecpu:egpu;
-    fprintf(f,"[PROF] P0 execution: routed CPU %.3fs | routed GPU critical %.3fs | tier straggler %.2fx | "
+    fprintf(f,"[PROF] P0 execution: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | tier straggler %.2fx | "
               "router %.3fs | residual P2P %.3fs (%llu hop, %.3f ms/hop) | orchestration %.3fs\n",
-        ecpu,egpu,fast>1e-9?slow/fast:0.0,route,p2p,(unsigned long long)np2p,
+        ecpu,ecpu>0?cpu_bytes/1e9/ecpu:0.0,(unsigned long long)cpu_rows,
+        egpu,fast>1e-9?slow/fast:0.0,route,p2p,(unsigned long long)np2p,
         np2p?p2p*1e3/np2p:0.0,other);
     if(f_io>=0.30){
         fprintf(f,"[PROF] verdict: I/O-bound — %.0f%% of the time waits on expert reads (hit %.0f%%).",100*f_io,hitp);
