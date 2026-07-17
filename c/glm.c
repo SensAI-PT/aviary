@@ -1644,7 +1644,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 c->index_topk, c->index_topk);
         }
     }
-    m->hlast=falloc(D); m->h_all=falloc((int64_t)64*D);
+    m->hlast=falloc(D); m->h_all=falloc((int64_t)512*D);
 
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
     int64_t rb=qt_bytes(&m->embed)+qt_bytes(&m->lm_head);
@@ -2640,7 +2640,23 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
-        if(cuda_absorb&&l->n_kv_b_shard>1){
+        if(kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+           !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+           qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
+            const float **rl=malloc((size_t)S*sizeof(*rl)),**rr=malloc((size_t)S*sizeof(*rr));
+            int *rn=malloc((size_t)S*sizeof(*rn)); int mt=0;
+            if(rl&&rr&&rn){
+                for(int s=0;s<S;s++){
+                    int pos=positions[s],st0=kvs[s]->kv_start[layer]; rn[s]=pos+1-st0;
+                    rl[s]=coli_kv_row(kvs[s]->Lc[layer],st0,kvl);
+                    rr[s]=coli_kv_row(kvs[s]->Rc[layer],st0,c->qk_rope);
+                    if(rn[s]>mt)mt=rn[s];
+                }
+                cuda_core=cuda_projected=coli_cuda_attention_project_ragged(l->kv_b.cuda,l->o.cuda,
+                    out,Q,rl,rr,rn,S,H,c->qk_nope,c->qk_rope,vh,kvl,mt,c->attn_scale);
+            }
+            free(rl);free(rr);free(rn);
+        } else if(cuda_absorb&&l->n_kv_b_shard>1){
             int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
             float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
             for(int d=0;d<n;d++)for(int s=0;s<S;s++)memcpy(
@@ -3975,7 +3991,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
-    if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=64) */
+    if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
@@ -3988,8 +4004,8 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
 static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
     Cfg *c=&m->c; int D=c->hidden;
     /* Ragged KV currently uses MLA absorption; the stack kernel is sized to 512. */
-    if(!rows || S<1 || S>64 || c->kv_lora>512) return NULL;
-    KVState *kvs[64]; int positions[64];
+    if(!rows || S<1 || S>512 || c->kv_lora>512) return NULL;
+    KVState *kvs[512]; int positions[512];
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++){
         if(!rows[s].kv || !rows[s].kv->Lc || !rows[s].kv->Rc || !rows[s].kv->kv_start ||

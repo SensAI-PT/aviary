@@ -338,6 +338,40 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* Independent KV sequence per row. latent/rope are packed as [S,T,*], while
+ * lengths selects the valid prefix for each row. */
+__global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
+        const float *latent,const float *rope,const int *lengths,
+        const void *weights,const float *wscale,int fmt,int S,int H,int Q,int R,
+        int V,int K,int T,float scale){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=lengths[s],rbase=h*(Q+V);
+    if(s>=S||nt<1||nt>T)return;
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    const float *ls=latent+(size_t)s*T*K,*rs=rope+(size_t)s*T*R;
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=ls+(size_t)t*K;
+        const float *rt=rs+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
+        for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[t]=a*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)a+=scores[t]*ls[(size_t)t*K+k];cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -768,6 +802,43 @@ extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTenso
         float *out,const float *q,const float *latent,const float *rope,int S,int H,int Q,
         int R,int V,int K,int T,float scale){
     return attention_absorb_batch_run(w,proj,out,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTensor *proj,
+        float *out,const float *q,const float *const *latent,const float *const *rope,
+        const int *lengths,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!proj||!out||!q||!latent||!rope||!lengths||S<1||S>512||T<1||T>512||
+       H<1||Q<1||R<1||V<1||K<1||K>512||w->I!=K||w->O!=H*(Q+V)||
+       proj->device!=w->device||proj->I!=H*V)return 0;
+    size_t ln=(size_t)S*T*K,rn=(size_t)S*T*R;
+    float *lh=(float*)std::calloc(ln,sizeof(float)),*rh=(float*)std::calloc(rn,sizeof(float));
+    if(!lh||!rh){std::free(lh);std::free(rh);return 0;}
+    for(int s=0;s<S;s++){
+        if(lengths[s]<1||lengths[s]>T){std::free(lh);std::free(rh);return 0;}
+        std::memcpy(lh+(size_t)s*T*K,latent[s],(size_t)lengths[s]*K*sizeof(float));
+        std::memcpy(rh+(size_t)s*T*R,rope[s],(size_t)lengths[s]*R*sizeof(float));
+    }
+    DeviceContext *dc=find_ctx(w->device);
+    if(!select_ctx(dc)){std::free(lh);std::free(rh);return 0;}
+    size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=ln*sizeof(float),rb=rn*sizeof(float);
+    size_t cb=(size_t)S*H*V*sizeof(float),ob=(size_t)S*proj->O*sizeof(float);
+    int ok=reserve(&dc->aq,&dc->aq_cap,qb)&&reserve(&dc->al,&dc->al_cap,lb)&&
+           reserve(&dc->ar,&dc->ar_cap,rb)&&reserve(&dc->ac,&dc->ac_cap,cb)&&
+           reserve(&dc->y,&dc->y_cap,ob)&&
+           reserve_bytes(&dc->group_desc,&dc->group_desc_cap,(size_t)S*sizeof(int));
+    if(ok)ok=cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"ragged q upload")&&
+             cuda_ok(cudaMemcpyAsync(dc->al,lh,lb,cudaMemcpyHostToDevice,dc->stream),"ragged latent upload")&&
+             cuda_ok(cudaMemcpyAsync(dc->ar,rh,rb,cudaMemcpyHostToDevice,dc->stream),"ragged rope upload")&&
+             cuda_ok(cudaMemcpyAsync(dc->group_desc,lengths,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged lengths upload");
+    std::free(lh);std::free(rh);if(!ok)return 0;
+    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    attention_absorb_ragged_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,dc->ar,
+        (const int*)dc->group_desc,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+    return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
+           cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"ragged output download")&&
+           cuda_ok(cudaStreamSynchronize(dc->stream),"ragged attention synchronize");
 }
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
