@@ -320,6 +320,11 @@ tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_u
 tests/test_topp$(EXE): tests/test_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
+# gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
+tests/bench_topp$(EXE): tests/bench_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
