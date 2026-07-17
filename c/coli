@@ -20,7 +20,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -484,9 +484,134 @@ def cmd_run(a):
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
+def server_probe(base, api_key=None, timeout=1.5):
+    """Is a coli serve alive at `base`? Returns its model_id, or None.
+    Probes /health then /v1/models — both cheap, neither touches the engine."""
+    import urllib.request, urllib.error
+    def get(path):
+        req=urllib.request.Request(base.rstrip("/")+path)
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace"))
+    try:
+        if get("/health").get("status")!="ok": return None
+        data=get("/v1/models").get("data") or []
+        return data[0]["id"] if data else None
+    except Exception:
+        return None
+
+def chat_attached(a, base, model_id):
+    """The chat REPL over HTTP against a running `coli serve`.
+
+    Why this exists (the cold-chat cost, measured): spawning a private engine
+    pays 34-136 s of resident load on EVERY start, and begins with an empty
+    expert cache — hit rate 4% cold vs 55% warm, a ~10x on early decode. A
+    resident server pays load once and keeps the LRU warm across sessions;
+    its KV slots reuse the conversation prefix, so a continued chat skips
+    re-prefill too. The engine byte-protocol stays untouched — this is plain
+    OpenAI SSE over localhost, stdlib only."""
+    import urllib.request
+    print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
+    msgs=[]
+    w=term_w()-4
+    while True:
+        if TTY:
+            print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+            try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            except EOFError: print(); break
+            print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+        else:
+            try: msg=input()
+            except EOFError: break
+        msg=msg.strip()
+        if msg in (":q",":quit","exit"): break
+        if not msg: continue
+        if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        msgs.append({"role":"user","content":msg})
+        body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
+                         "max_tokens":a.ngen}).encode()
+        req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
+                                   headers={"Content-Type":"application/json"})
+        if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
+        print(f"\n  {C.teal}◆ colibrì{C.r}")
+        sp=Spinner("thinking…"); sp.start()
+        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    data=line[6:]
+                    if data=="[DONE]": break
+                    try: ev=json.loads(data)
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        txt=d.get("content")
+                        if not txt: continue          # ping/ruolo/reasoning: non è testo
+                        if first: sp.stop(); first=False
+                        md.feed(txt); reply.append(txt)
+        except KeyboardInterrupt:
+            interrupted=True                          # il server annulla la richiesta alla disconnessione
+        except OSError as e:
+            sp.stop()
+            print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
+        sp.stop(); md.close()
+        if reply: msgs.append({"role":"assistant","content":"".join(reply)})
+        else: msgs.pop()                              # turno vuoto: non sporcare la history
+        el=time.time()-t0
+        note=" · ⏹ interrupted" if interrupted else ""
+        print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{note}{C.r}\n")
+    print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
+
+def kv_resume_notice(model_dir):
+    """SERVE mode silently resumes .coli_kv from disk (glm.c kv_disk_load): a chat
+    started today continues a conversation from days ago, with `first=0` so the
+    turn is appended WITHOUT the [gMASK]<sop> prefix. The engine does announce it
+    on stderr — but nothing here ever shows that: the drain thread's
+    p.stderr.read() blocks until EOF, so on a healthy start errlog is still empty
+    when the status lines are printed. The warning only appeared once the engine
+    DIED, which is exactly when it no longer mattered.
+
+    Measured cost of the silence: a chat inherited 670 tokens of an old Italian
+    session ("il mio numero preferito e 7, ricordalo!"). Every later reply came
+    back in Italian, and "explain fibonacci in short" was answered about the
+    number 7 — the model was being coherent with a context nobody could see, and
+    it read as a quantization bug for a day.
+
+    So say it here, in Python, from the file itself: no pipe, no thread, no
+    Windows deadlock risk (see the stderr comment below)."""
+    p=os.path.join(model_dir, ".coli_kv")
+    try:
+        with open(p,"rb") as f:
+            if f.read(8)!=b"COLIKV1\0": return
+            h=struct.unpack("<8i", f.read(32))
+        n=h[6]
+        if n<1: return
+        age=time.time()-os.path.getmtime(p)
+        when=f"{age/86400:.0f}d ago" if age>86400 else f"{age/3600:.0f}h ago" if age>3600 else "just now"
+        print(f"  {C.yel}↺ resuming a saved conversation: {n} tokens, last written {when}{C.r}")
+        print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
+              f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
+    except (OSError, struct.error): pass
+
 def cmd_chat(a):
+    # ATTACH: a running `coli serve` beats a private engine every time — the load
+    # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
+    # wins; otherwise probe localhost quietly and use it if it's there. --no-attach
+    # forces the old behaviour. The probe costs ~1 ms when nothing is listening.
+    if not getattr(a,"no_attach",False):
+        base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
+        mid=server_probe(base, getattr(a,"api_key",None))
+        if mid:
+            banner(f"chat · {mid} · attached")
+            chat_attached(a, base, mid); return
+        if getattr(a,"attach",None):
+            sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
+    kv_resume_notice(a.model)
     errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
@@ -719,7 +844,14 @@ def main():
     pd=sub.add_parser("doctor",parents=[common])
     pd.add_argument("--json",action="store_true",help="emit a versioned JSON report")
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
-    sub.add_parser("chat", parents=[common])
+    pc=sub.add_parser("chat", parents=[common])
+    pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
+                    help="chat against a running `coli serve` instead of spawning an engine "
+                         "(keeps the model loaded and the expert cache warm across chat sessions). "
+                         "Bare --attach probes localhost:8000.")
+    pc.add_argument("--no-attach", action="store_true",
+                    help="never auto-attach, always spawn a private engine")
+    pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
