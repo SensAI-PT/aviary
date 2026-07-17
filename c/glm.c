@@ -4151,7 +4151,11 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
 }
 
 static inline int argmax_v(const float *lo, int V){
-    int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+    /* skip NaN (x==x is false for NaN) so a poisoned logit can't pin the argmax
+     * to index 0 — pick the max finite/+Inf entry instead. */
+    int b=-1; float bv=-INFINITY;
+    for(int i=0;i<V;i++){ float x=lo[i]; if(x==x && x>bv){ bv=x; b=i; } }
+    return b<0?0:b;
 }
 
 /* ---- METODO F: draft grammaticale (#48) ----
@@ -4258,6 +4262,15 @@ static void dist_build(const float *lo, int V){
     float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
     for(int i=0;i<V;i++){ g_pbuf[i]=expf((lo[i]-mx)*invt); s+=g_pbuf[i]; }
+    /* A single NaN/+Inf logit (bad streamed expert tile, matmul overflow at an
+     * eviction boundary) makes s non-finite; the old code then divided every entry
+     * into NaN and dist_sample silently returned token 0 forever. Collapse to a
+     * one-hot over the max finite logit and warn once — degrade, don't corrupt. */
+    if(!(s==s) || s<=0.0 || s>1e300){
+        static int warned=0; if(!warned){ warned=1; fprintf(stderr,"[sample] non-finite logits; emitting argmax of finite entries\n"); }
+        int b=argmax_v(lo,V); for(int i=0;i<V;i++) g_pbuf[i]=(i==b)?1.f:0.f;
+        return;
+    }
     for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
