@@ -40,6 +40,9 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
+#ifdef __linux__
+#include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
+#endif
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
@@ -1207,7 +1210,9 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * 10x (#82) — hence per-region mbind here and nothing else. Raw syscall, no libnuma
  * dependency; MPOL_MF_MOVE migrates pages of reused heap chunks too. Linux-only,
  * silent no-op elsewhere or on single-node hosts. */
-static int g_numa_nodes=0;
+#ifdef __linux__
+static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
+#endif
 static void numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
     if(g_numa_nodes<2 || !p || !n) return;
@@ -1732,8 +1737,14 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     while(got<n){
         ssize_t r=pread(fd, p+got, (size_t)(n-got), off+got);
         if(r<0){ if(errno==EINTR) continue;
+#ifdef _WIN32
+            fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes, WinErr=%lu)\n",tag,strerror(errno),
+                    (long long)off,(long long)got,(long long)n,(unsigned long)compat_pread_lasterr);
+#else
             fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes)\n",tag,strerror(errno),
-                    (long long)off,(long long)got,(long long)n); return -1; }
+                    (long long)off,(long long)got,(long long)n);
+#endif
+            return -1; }
         if(r==0){ fprintf(stderr,"%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated shard?\n",
                     tag,(long long)off,(long long)got,(long long)n); return -1; }
         got+=r;
@@ -2304,6 +2315,43 @@ static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min
 static int cmp_fdesc(const void *a,const void *b){
     float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
 
+/* PARTIAL SELECT (quickselect, Hoare partition, DESCending). After this call the k
+ * LARGEST elements of a[0..n) are in a[0..k) in unspecified order; the (k+1)-th and
+ * beyond are untouched-or-smaller. O(n) average, O(n^2) pathological (mitigated by
+ * median-of-three below) — and unlike a full qsort it never orders more than needed.
+ *
+ * Why this exists (#356): the DSA top-keep in attention_rows previously full-qsorted
+ * all nk context scores (O(nk log nk)) per layer per token just to read ONE value --
+ * the keep-th largest (the threshold). quickselect finds that pivot in O(nk) average,
+ * and the position-order scans that build dst[] are unchanged, so the kept set is
+ * bit-identical. Mirrors the sampling-side fix in #335 (heap partial-select there).
+ *
+ * NOT a stable partition: callers must derive the threshold and then re-scan the
+ * ORIGINAL array (the DSA code does exactly this) rather than reading a[0..k). */
+static void partial_select_desc(float *a, int n, int k){
+    if(k<=0) return;
+    if(k>=n) return;                 /* nothing to partition: all kept */
+    int lo=0, hi=n-1;
+    while(lo<hi){
+        /* median-of-three pivot to dodge the O(n^2) path on sorted/reverse input */
+        int mid=lo+((hi-lo)>>1);
+        if(a[mid]>a[lo]){ float t=a[lo]; a[lo]=a[mid]; a[mid]=t; }
+        if(a[hi]>a[lo]){  float t=a[lo]; a[lo]=a[hi];  a[hi]=t;  }
+        if(a[mid]>a[hi]){ float t=a[hi]; a[hi]=a[mid]; a[mid]=t; }
+        float piv=a[hi];
+        int i=lo, j=hi;
+        for(;;){
+            while(a[i]>piv) i++;     /* desc: large values go left */
+            while(j>lo && a[j]<piv) j--;
+            if(i>=j) break;
+            float t=a[i]; a[i]=a[j]; a[j]=t; i++; if(i>j) break; j--;
+        }
+        /* partition point: a[lo..i) are all >= piv, a[i..hi] are all <= piv */
+        if(k<=i-1) hi=i-1;          /* the k-th largest is in the left partition */
+        else       lo=i;            /* it's in the right partition */
+    }
+}
+
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
@@ -2586,10 +2634,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     }
                     isc[t]=a*wsc;
                 }
-                /* top-keep: soglia via qsort desc, poi scan in ordine di posizione */
+                /* top-keep: threshold via PARTIAL SELECT (#356), poi scan in ordine di posizione.
+                 * Era un qsort completo su nk (O(nk log nk)); quickselect estrae solo il
+                 * keep-esimo valore piu' grande in O(nk) medio. La soglia (= min del blocco
+                 * dei keep maggiori) e' identica a tmp[keep-1] del vecchio qsort, quindi i
+                 * due scan qui sotto costruiscono dst[] bit-identical. */
                 float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
-                qsort(tmp,nk,sizeof(float),cmp_fdesc);
-                float thr=tmp[keep-1];
+                partial_select_desc(tmp,nk,keep);
+                float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
                 int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
@@ -4186,10 +4238,21 @@ static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
 static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
     return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
 static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
-static int cmp_pdesc(const void *a,const void *b){
-    float pa=g_pbuf[*(const int*)a], pb=g_pbuf[*(const int*)b];
-    return pa<pb ? 1 : pa>pb ? -1 : 0; }
-/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc */
+/* sift-down su max-heap in h[0..n), chiave = g_pbuf[h[i]] (#335: partial top-p select).
+ * Versione "a buco": porta il valore di radice e lo deposita solo alla fine, cosi'
+ * heapify e' O(V) e ogni pop e' O(log n) senza qsort sull'intero vocabolario. */
+static void topp_siftdown(int *h, int n, int i){
+    int iv=h[i]; float kv=g_pbuf[iv];
+    for(;;){ int l=2*i+1;
+        if(l>=n) break;                      /* foglia */
+        int b=l; if(l+1<n && g_pbuf[h[l+1]]>g_pbuf[h[l]]) b=l+1;  /* figlio maggiore */
+        if(g_pbuf[h[b]]<=kv) break;          /* nessun figlio supera la radice -> ferma */
+        h[i]=h[b]; i=b; }
+    h[i]=iv;
+}
+/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc.
+ * Invariante per dist_sample: g_pbuf resta INDICIZZATO per token-id (mai riordinato);
+ * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
     float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
@@ -4198,12 +4261,19 @@ static void dist_build(const float *lo, int V){
     for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
-        qsort(g_pidx,V,sizeof(int),cmp_pdesc);
-        double cum=0; int keep=V;
-        for(int i=0;i<V;i++){ cum+=g_pbuf[g_pidx[i]]; if(cum>=g_nuc){ keep=i+1; break; } }
-        double s2=0; for(int i=keep;i<V;i++) g_pbuf[g_pidx[i]]=0;
-        for(int i=0;i<keep;i++) s2+=g_pbuf[g_pidx[i]];
-        for(int i=0;i<keep;i++) g_pbuf[g_pidx[i]]/=(float)s2;
+        for(int i=V/2-1;i>=0;i--) topp_siftdown(g_pidx,V,i);   /* heapify O(V) */
+        /* pop verso la coda: i vincitori (testa top-p) cadono in g_pidx[out..V-1] in ordine
+         * DECRESCENTE, come il vecchio qsort, quindi s2 accumula nello stesso ordine ->
+         * head bit-identical sui casi senza pareggi (i pareggi erano gia' non specificati
+         * sotto il qsort instabile e restano tali). Il prefisso g_pidx[0..out-1) e' la coda. */
+        double s2=0, cum=0; int out=V;
+        do{ int root=g_pidx[0];                  /* massimo corrente */
+            g_pidx[0]=g_pidx[--out]; g_pidx[out]=root;          /* sposta il max in coda */
+            s2+=g_pbuf[root]; cum+=g_pbuf[root];
+            if(out>0) topp_siftdown(g_pidx,out,0);
+        } while(cum<g_nuc && out>0);
+        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;            /* azzera la coda (invariante) */
+        float s2f=(float)s2; for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=s2f;  /* rinormalizza */
     }
 }
 /* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
@@ -6000,6 +6070,14 @@ int main(int argc, char **argv){
        !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
+        /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
+         * read GOMP_*: with OMP_WAIT_POLICY=active it sets KMP_BLOCKTIME=infinite,
+         * so the idle team SPINS FOREVER once generation ends — a serve-mode engine
+         * parked on stdin burns ~100% x nthreads (#341, measured 3000% on FreeBSD).
+         * 200 ms of blocktime keeps the team hot across back-to-back expert matmuls
+         * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
+         * the user's own setting authoritative. */
+        setenv("KMP_BLOCKTIME","200",0);
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
@@ -6230,9 +6308,16 @@ int main(int argc, char **argv){
            m.has_mtp?"ACTIVE":"absent", g_draft);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
     fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", g_draft);
-    if(!strncmp(snap,"/mnt/",5))
-        fprintf(stderr,"WARNING: the model is on %s (slow 9p/Windows filesystem; fadvise is ineffective).\n"
-                       "         Keep it on ext4 (for example, /home/...) for memory efficiency and speed.\n", snap);
+#ifdef __linux__
+    {   /* Only warn for a GENUINE 9p mount (WSL Windows drives, magic 0x01021997), where
+         * fadvise is a no-op. The old check was `snap` starting with "/mnt/", which
+         * false-positives on native-Linux ZFS/ext4/xfs/NFS mounts that also live under /mnt. */
+        struct statfs sfb;
+        if(statfs(snap,&sfb)==0 && (unsigned long)sfb.f_type==0x01021997UL)
+            fprintf(stderr,"WARNING: the model is on %s (9p/Windows filesystem; fadvise is ineffective).\n"
+                           "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
+    }
+#endif
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
