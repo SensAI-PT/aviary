@@ -2,6 +2,10 @@
   <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
 
+<p align="center">
+  English · <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
 
 Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM, RAM,
