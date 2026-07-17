@@ -2315,6 +2315,43 @@ static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min
 static int cmp_fdesc(const void *a,const void *b){
     float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
 
+/* PARTIAL SELECT (quickselect, Hoare partition, DESCending). After this call the k
+ * LARGEST elements of a[0..n) are in a[0..k) in unspecified order; the (k+1)-th and
+ * beyond are untouched-or-smaller. O(n) average, O(n^2) pathological (mitigated by
+ * median-of-three below) — and unlike a full qsort it never orders more than needed.
+ *
+ * Why this exists (#356): the DSA top-keep in attention_rows previously full-qsorted
+ * all nk context scores (O(nk log nk)) per layer per token just to read ONE value --
+ * the keep-th largest (the threshold). quickselect finds that pivot in O(nk) average,
+ * and the position-order scans that build dst[] are unchanged, so the kept set is
+ * bit-identical. Mirrors the sampling-side fix in #335 (heap partial-select there).
+ *
+ * NOT a stable partition: callers must derive the threshold and then re-scan the
+ * ORIGINAL array (the DSA code does exactly this) rather than reading a[0..k). */
+static void partial_select_desc(float *a, int n, int k){
+    if(k<=0) return;
+    if(k>=n) return;                 /* nothing to partition: all kept */
+    int lo=0, hi=n-1;
+    while(lo<hi){
+        /* median-of-three pivot to dodge the O(n^2) path on sorted/reverse input */
+        int mid=lo+((hi-lo)>>1);
+        if(a[mid]>a[lo]){ float t=a[lo]; a[lo]=a[mid]; a[mid]=t; }
+        if(a[hi]>a[lo]){  float t=a[lo]; a[lo]=a[hi];  a[hi]=t;  }
+        if(a[mid]>a[hi]){ float t=a[hi]; a[hi]=a[mid]; a[mid]=t; }
+        float piv=a[hi];
+        int i=lo, j=hi;
+        for(;;){
+            while(a[i]>piv) i++;     /* desc: large values go left */
+            while(j>lo && a[j]<piv) j--;
+            if(i>=j) break;
+            float t=a[i]; a[i]=a[j]; a[j]=t; i++; if(i>j) break; j--;
+        }
+        /* partition point: a[lo..i) are all >= piv, a[i..hi] are all <= piv */
+        if(k<=i-1) hi=i-1;          /* the k-th largest is in the left partition */
+        else       lo=i;            /* it's in the right partition */
+    }
+}
+
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
@@ -2597,10 +2634,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     }
                     isc[t]=a*wsc;
                 }
-                /* top-keep: soglia via qsort desc, poi scan in ordine di posizione */
+                /* top-keep: threshold via PARTIAL SELECT (#356), poi scan in ordine di posizione.
+                 * Era un qsort completo su nk (O(nk log nk)); quickselect estrae solo il
+                 * keep-esimo valore piu' grande in O(nk) medio. La soglia (= min del blocco
+                 * dei keep maggiori) e' identica a tmp[keep-1] del vecchio qsort, quindi i
+                 * due scan qui sotto costruiscono dst[] bit-identical. */
                 float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
-                qsort(tmp,nk,sizeof(float),cmp_fdesc);
-                float thr=tmp[keep-1];
+                partial_select_desc(tmp,nk,keep);
+                float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
                 int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
