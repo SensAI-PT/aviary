@@ -212,24 +212,31 @@ def physical_cpu_count():
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     try:
-        # lscpu -p prepende SEMPRE la colonna CPU, quindi `-p=core,socket` emette
-        # in realta' "CPU,Core,Socket" (3 colonne). Dobbiamo leggere esplicitamente
-        # CPU/Core/Socket e deduplicare su (core, socket): contare le righe non
-        # deduplicate restituirebbe i thread logici (SMT) - l'errore originale.
-        # I campi vuoti ("-") marcano core/socket offline e non sono interi.
-        result = subprocess.run(["lscpu", "-p=CPU,Core,Socket"], text=True,
+        # Ask lscpu for exactly core,socket and dedupe on (core, socket).
+        # Counting un-deduplicated rows would return logical threads (SMT),
+        # which was the original over-subscription bug. Empty fields ("-")
+        # mark an offline core/socket and fail int() -> skipped.
+        #
+        # Column layout robustness: `lscpu -p=<list>` emits *exactly* the
+        # requested columns (no CPU prefix), while bare `lscpu -p` prepends
+        # CPU. We requested two columns, but take the LAST TWO fields so the
+        # parser stays correct whether or not a CPU column is present
+        # (JustVugg review: the previous fields[1]/fields[2] indexing assumed
+        #  a 3-column layout and regressed 2-column output to the logical
+        # count -- the opposite of the fix).
+        result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
         cores = set()
         for line in result.stdout.splitlines():
             if not line or line.startswith("#"):
                 continue
             fields = line.split(",")
-            if len(fields) < 3:
+            if len(fields) < 2:
                 continue
             try:
-                core, socket = int(fields[1]), int(fields[2])
+                core, socket = int(fields[-2]), int(fields[-1])
             except ValueError:
-                continue  # "-" per un core/socket offline
+                continue  # "-" for an offline core/socket
             cores.add((core, socket))
         if cores:
             return len(cores)

@@ -98,16 +98,31 @@ class ResourcePlanTest(unittest.TestCase):
             return subprocess.CompletedProcess(args=[], returncode=0,
                                                stdout=stdout, stderr="")
         # 1 socket, 12 cores, 2 SMT siblings -> 24 threads, 12 physical cores.
-        # lscpu prepends the CPU column, so output is CPU,Core,Socket.
-        rows = [f"{cpu},{core},0" for core in range(12) for cpu in range(2)]
-        blob = "# CPU,Core,Socket\n" + "\n".join(rows)
-        with mock.patch("resource_plan.subprocess.run", return_value=lscpu(blob)), \
-             mock.patch.object(sys, "platform", "linux"):
-            plan = build_plan(self.model, available_memory=16 * GB,
-                              available_disk=1, gpus=[])
-            env = environment_for_plan(plan)
-        self.assertEqual(plan["cpu"]["physical_cores"], 12)
-        self.assertEqual(env["OMP_NUM_THREADS"], "12")
+
+        # The parser must return 12 physical cores under BOTH lscpu layouts:
+        #  - 2-col: `lscpu -p=core,socket` emits exactly [core,socket] (this is
+        #           what the probe actually requests; the previous fields[1]/[2]
+        #           indexing skipped every line here and fell through to the
+        #           logical count -> the regression JustVugg caught).
+        #  - 3-col: bare `lscpu -p` prepends a CPU column -> [cpu,core,socket].
+        # Taking the last two fields is correct in both cases.
+        layouts = {
+            "2-col (-p=core,socket)": (
+                "# core,socket\n" +
+                "\n".join(f"{core},0" for core in range(12) for _ in range(2))),
+            "3-col (bare -p, CPU prefix)": (
+                "# CPU,Core,Socket\n" +
+                "\n".join(f"{cpu},{core},0" for core in range(12) for cpu in range(2))),
+        }
+        for label, blob in layouts.items():
+            with mock.patch("resource_plan.subprocess.run",
+                            return_value=lscpu(blob)), \
+                 mock.patch.object(sys, "platform", "linux"):
+                plan = build_plan(self.model, available_memory=16 * GB,
+                                  available_disk=1, gpus=[])
+                env = environment_for_plan(plan)
+            self.assertEqual(plan["cpu"]["physical_cores"], 12, label)
+            self.assertEqual(env["OMP_NUM_THREADS"], "12", label)
 
     def test_plan_does_not_set_omp_affinity_vars(self):
         # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
