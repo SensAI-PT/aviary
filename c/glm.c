@@ -6386,11 +6386,22 @@ int main(int argc, char **argv){
 #endif
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
+    /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
+     * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,
+     * altrimenti "MTP active (draft=8)" mentirebbe: il messaggio e' stampato
+     * prima della scelta del path (run_serve_mux, sotto), e con DRAFT=8 diceva
+     * "active" per poi disabilitarlo in silenzio (#358, LordMZTE). */
+    int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
+    int eff_draft = mux_will_disable_mtp ? 0 : g_draft;
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
-           m.has_mtp?"ACTIVE":"absent", g_draft);
+           m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
-    fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", g_draft);
+    if(mux_will_disable_mtp && m.has_mtp)
+        fprintf(stderr,"[MTP] disabled in multiplexed serve (SERVE_BATCH=1): speculation is not "
+                       "ragged-safe across KV slots. Single-client interactive use (`coli chat`) keeps MTP.\n");
+    else
+        fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", eff_draft);
 #ifdef __linux__
     {   /* Only warn for a GENUINE 9p mount (WSL Windows drives, magic 0x01021997), where
          * fadvise is a no-op. The old check was `snap` starting with "/mnt/", which
