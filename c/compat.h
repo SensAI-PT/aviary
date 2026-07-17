@@ -80,6 +80,7 @@ static inline int compat_open_direct(const char *path){
 #endif
 #include <windows.h>
 #include <io.h>
+#include <direct.h>   /* _mkdir (for the mkdtemp shim below) */
 #include <process.h>
 #include <malloc.h>
 #include <fcntl.h>
@@ -303,6 +304,19 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
     return SetEnvironmentVariableA(name, value) ? 0 : -1;
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
+
+/* --- mkdtemp -> _mktemp + _mkdir (POSIX mkdtemp assente su Windows) ---
+ * Test binaries (test_stops.c) create a scratch dir in the CWD via a
+ * "name_XXXXXX" template; POSIX mkdtemp fills the X's and mkdirs 0700. The
+ * Windows CRT has _mktemp (in-place, same XXXXXX contract) so we compose it.
+ * Returns the template pointer on success, NULL on failure — matching POSIX. */
+static inline char *compat_mkdtemp(char *tmpl){
+    if(!tmpl) return NULL;
+    if(!_mktemp(tmpl)) return NULL;       /* fills the trailing X's in place */
+    if(_mkdir(tmpl) != 0) return NULL;    /* EEXIST is impossible post-_mktemp */
+    return tmpl;
+}
+#define mkdtemp(tmpl) compat_mkdtemp(tmpl)
 
 #endif /* _WIN32 */
 
