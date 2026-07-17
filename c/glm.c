@@ -4296,9 +4296,28 @@ static void topp_siftdown(int *h, int n, int i){
  * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
-    float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
+    /* Un solo logit NaN/+Inf avvelenava tutto (#369): +Inf diventava mx, NaN/Inf-mx
+     * -> expf NaN -> s NaN -> ogni prob NaN -> dist_sample cade sul fallback
+     * `g_pbuf[i]>0` (NaN>0 e' falso ovunque) e ritorna 0 PER SEMPRE, in silenzio.
+     * Difesa: mx solo sui finiti; un logit non finito contribuisce prob 0;
+     * se la distribuzione degenera (tutti non finiti / somma non valida) si
+     * ripiega sull'argmax dei finiti e si avvisa UNA volta, mai in silenzio. */
+    int mxi=-1; float mx=0;
+    for(int i=0;i<V;i++) if(isfinite(lo[i]) && (mxi<0 || lo[i]>mx)){ mx=lo[i]; mxi=i; }
     double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
-    for(int i=0;i<V;i++){ g_pbuf[i]=expf((lo[i]-mx)*invt); s+=g_pbuf[i]; }
+    if(mxi>=0){
+        for(int i=0;i<V;i++){ g_pbuf[i]=isfinite(lo[i])?expf((lo[i]-mx)*invt):0.f; s+=g_pbuf[i]; }
+    }
+    if(mxi<0 || !isfinite(s) || s<=0.0){          /* distribuzione inutilizzabile */
+        static int warned=0;
+        if(!warned){ warned=1; fprintf(stderr,
+            "[SAMPLE] warning: non-finite logits (NaN/Inf) — falling back to argmax; "
+            "output may be degraded. This usually means a numerical blow-up upstream.\n"); }
+        int a=(mxi>=0)?mxi:0;                       /* mxi = argmax dei logit FINITI (robusto
+                                                     * anche se lo[0] e' NaN, dove argmax_v fallirebbe) */
+        for(int i=0;i<V;i++) g_pbuf[i]=0.f; g_pbuf[a]=1.f;
+        return;                                    /* delta su un token valido, niente top-p su NaN */
+    }
     for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
