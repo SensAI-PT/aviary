@@ -7560,6 +7560,98 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
 
+/* ---- #379: honest Metal-cache storage probe (S1) --------------------------
+ * Metal's per-buffer residency cost makes the engine's own expert LRU cache
+ * anti-productive on fast NVMe: the OS page cache already streams cold
+ * experts cheaper than Metal can re-pin them (maintainer-endorsed root cause,
+ * issue #379). "Fast" has to be MEASURED, not assumed -- buffered reads lie
+ * (page-cache hits read 23-97 GB/s on the reference box; the real F_NOCACHE
+ * number was 14 GB/s), so this probes the actual model volume the same way
+ * compat_open_direct()/iobench.c's __APPLE__ branch do: open + F_NOCACHE,
+ * random 16K-aligned pread, no readahead. Cheap and darwin-only: never touches
+ * non-Metal or non-darwin builds. Not called yet from main() in this commit --
+ * see the platform-default wiring that follows in the next one (S2/S3).
+ * Gated on __APPLE__ alone (not COLI_METAL) so these three functions build and
+ * are unit-testable on any macOS binary, Metal or not. */
+#ifdef __APPLE__
+#define COLI_SSD_PROBE_BLK   (4u*1024*1024)     /* 4 MB reads, 16K-aligned offsets */
+#define COLI_SSD_PROBE_MAXB  (300*1024*1024)    /* "a few hundred MB", capped on fast media */
+#define COLI_SSD_PROBE_SECS  0.35               /* wall-clock budget, well under the ~1s target */
+
+/* Path of the first *.safetensors shard in snap_dir into out, or out[0]=0 if
+ * none. readdir order, unsorted (unlike st_init): any shard is representative
+ * for a bandwidth probe, so sorting would buy nothing. */
+static void coli_ssd_probe_pick_shard(const char *snap_dir, char *out, size_t outsz){
+    out[0]=0;
+    DIR *d=opendir(snap_dir);
+    if(!d) return;
+    struct dirent *e;
+    while((e=readdir(d))){
+        const char *dot=strrchr(e->d_name,'.');
+        if(dot && !strcmp(dot,".safetensors")){ snprintf(out,outsz,"%s/%s",snap_dir,e->d_name); break; }
+    }
+    closedir(d);
+}
+
+/* F_NOCACHE random-read probe on one real shard. Returns measured GB/s, or -1
+ * if the probe could not run at all (no shard, open failure, file too small)
+ * -- callers must treat -1 as "not fast", never as an error to surface. */
+static double coli_ssd_probe_raw(const char *snap_dir){
+    char path[1280];
+    coli_ssd_probe_pick_shard(snap_dir,path,sizeof(path));
+    if(!path[0]) return -1;
+    int fd=open(path,O_RDONLY);
+    if(fd<0) return -1;
+    fcntl(fd,F_NOCACHE,1);
+    fcntl(fd,F_RDAHEAD,0);                       /* random access, not sequential streaming */
+    struct stat st;
+    if(fstat(fd,&st)!=0 || st.st_size<(off_t)(COLI_SSD_PROBE_BLK*2)){ close(fd); return -1; }
+    void *buf=NULL;
+    if(posix_memalign(&buf,16384,COLI_SSD_PROBE_BLK)!=0 || !buf){ close(fd); return -1; }
+    long long span=(long long)st.st_size-COLI_SSD_PROBE_BLK;
+    unsigned seed=0xC0117125u;
+    double t0=now_s(); long long total=0;
+    while(now_s()-t0<COLI_SSD_PROBE_SECS && total<COLI_SSD_PROBE_MAXB){
+        long long off=((long long)rand_r(&seed)*16384LL)%(span>0?span:1);
+        off&=~(long long)16383;
+        ssize_t got=pread(fd,buf,COLI_SSD_PROBE_BLK,off);
+        if(got<=0) break;
+        total+=got;
+    }
+    double dt=now_s()-t0;
+    free(buf); close(fd);
+    return (total>0 && dt>0) ? (double)total/1e9/dt : -1;
+}
+
+/* Cache the measurement in <snap>/.coli_ssd (plain-text GB/s) so every startup
+ * after the first reads a file instead of re-probing. A missing or unparsable
+ * cache re-probes -- never trust a corrupt number over a fresh read. */
+static double coli_ssd_probe_cached(const char *snap_dir){
+    char cpath[1280];
+    snprintf(cpath,sizeof(cpath),"%s/.coli_ssd",snap_dir);
+    FILE *f=fopen(cpath,"r");
+    if(f){
+        double cached=-1;
+        int ok=fscanf(f,"%lf",&cached)==1 && cached>=0;
+        fclose(f);
+        if(ok) return cached;
+    }
+    double gbs=coli_ssd_probe_raw(snap_dir);
+    if(gbs>=0){
+        /* tmp+rename, like stats_dump_q: the model dir is shared (a concurrent
+         * serve + run pair may both probe a virgin dir) and a torn write must
+         * never survive. Two racing probers both measure under mutual
+         * contention -- a LOW reading, which is the safe direction: the
+         * platform default just stays off. */
+        char tpath[1290];
+        snprintf(tpath,sizeof(tpath),"%s.tmp",cpath);
+        FILE *w=fopen(tpath,"w");
+        if(w){ fprintf(w,"%.3f\n",gbs); fclose(w); rename(tpath,cpath); }
+    }
+    return gbs;
+}
+#endif /* __APPLE__ */
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
