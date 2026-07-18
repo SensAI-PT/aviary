@@ -286,6 +286,17 @@ def main():
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
         a.ebits = 8 if (a.mtp or a.indexer) else 4
+    if a.mtp and a.ebits < 8 and a.group_size <= 0:
+        # Non solo lossy: eh_proj ha ~20-30x di asimmetria di scala fra le due meta' di
+        # colonna, quindi l'int4 per-riga (UNA scala per riga) arrotonda a ZERO l'intera
+        # meta' embedding -> il draft non vede il token -> acceptance ~0% (issue #8).
+        # EN: not merely lossy: eh_proj has ~20-30x column-scale asymmetry, so per-row
+        # EN: int4 rounds its ENTIRE embedding half to exact zeros -> the draft cannot
+        # EN: see the input token -> ~0% acceptance (issue #8). A container converted
+        # EN: this way is repairable in place with tools/repair_mtp_int8.py.
+        print(f"WARNING: --mtp with --ebits {a.ebits} and per-row scales ZEROES eh_proj's "
+              "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
+              "or add --group-size 128 for group-scaled int4.")
     if a.xbits is None: a.xbits = a.ebits
 
     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
