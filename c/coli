@@ -40,6 +40,8 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from version import __version__ as _version
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, openai_server.py) and
@@ -115,7 +117,7 @@ def sprite_lines():
 def banner(sub=""):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
+        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -890,6 +892,7 @@ def main():
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
+    ap.add_argument("--version", action="version", version=f"colibrì {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
