@@ -16,6 +16,7 @@ from resource_plan import (
     format_plan,
     memory_available,
     physical_cpu_count,
+    read_ssd_probe,
 )
 
 
@@ -71,6 +72,43 @@ class ResourcePlanTest(unittest.TestCase):
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
+
+    # #379: read_ssd_probe reads the cached F_NOCACHE measurement colibri.c writes to
+    # <model>/.coli_ssd on its first Metal+darwin startup. This is the read-only
+    # Python-side half of the probe contract (S4) -- never re-measures, never
+    # guesses, so every case here is pure file parsing.
+    def test_ssd_probe_missing_file_returns_none(self):
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_reads_cached_value(self):
+        (self.model / ".coli_ssd").write_text("14.322\n")
+        self.assertEqual(read_ssd_probe(self.model), 14.322)
+
+    def test_ssd_probe_unparsable_file_returns_none(self):
+        (self.model / ".coli_ssd").write_text("not-a-number\n")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_empty_file_returns_none(self):
+        (self.model / ".coli_ssd").write_text("")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_negative_value_returns_none(self):
+        # colibri.c never caches a negative number (a failed probe just doesn't
+        # write the file), but a hand-edited/corrupt file should still be
+        # rejected rather than surfaced as a bogus "fast" reading.
+        (self.model / ".coli_ssd").write_text("-1\n")
+        self.assertIsNone(read_ssd_probe(self.model))
+
+    def test_ssd_probe_surfaces_in_plan_and_format(self):
+        (self.model / ".coli_ssd").write_text("14.3\n")
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertEqual(plan["ssd_probe_gbs"], 14.3)
+        self.assertIn("14.3 GB/s", format_plan(plan))
+
+    def test_ssd_probe_absent_from_plan_and_format_when_not_cached(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertIsNone(plan["ssd_probe_gbs"])
+        self.assertNotIn("F_NOCACHE", format_plan(plan))
 
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,

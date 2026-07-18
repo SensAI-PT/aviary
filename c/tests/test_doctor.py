@@ -149,6 +149,18 @@ class DoctorTest(unittest.TestCase):
         )
         self.assertEqual(report["status"], "error")
 
+    # #379: doctor surfaces the cached F_NOCACHE probe read-only (S4) -- it
+    # never re-measures storage itself, only reflects what colibri.c already wrote.
+    def test_ssd_probe_check_skips_when_not_yet_cached(self):
+        checks = self.checks_by_id(self.report())
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
+
+    def test_ssd_probe_check_passes_and_reports_cached_value(self):
+        (self.model / ".coli_ssd").write_text("14.3\n")
+        checks = self.checks_by_id(self.report())
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "pass")
+        self.assertEqual(checks["storage.ssd_probe"]["details"]["gbs"], 14.3)
+
     def test_text_format_contains_checks_plan_and_result(self):
         output = format_doctor(self.report())
 

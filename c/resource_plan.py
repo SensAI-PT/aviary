@@ -143,6 +143,20 @@ def memory_available():
     return 0
 
 
+def read_ssd_probe(model_dir):
+    """Read the cached F_NOCACHE storage probe the C engine writes to
+    <model>/.coli_ssd on its first Metal+darwin startup (colibri.c coli_ssd_probe_cached,
+    issue #379). Read-only: never re-measures, never guesses -- mirrors S4's
+    "read-and-display only" contract for `coli doctor`/`coli plan`. Returns the
+    measured GB/s as a float, or None if the file is absent or unparsable."""
+    try:
+        text = (Path(model_dir) / ".coli_ssd").read_text(encoding="utf-8").strip()
+        value = float(text.split()[0])
+        return value if value >= 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def discover_gpus():
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
@@ -538,6 +552,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
         ],
         "warnings": warnings,
+        # #379: read-only surfacing of the cached Metal-cache storage probe, if
+        # the engine has already measured this model dir. None before the first
+        # Metal+darwin startup -- never re-measured or guessed here.
+        "ssd_probe_gbs": read_ssd_probe(info["path"]),
     }
 
 
@@ -608,6 +626,8 @@ def format_plan(plan):
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
+    if plan.get("ssd_probe_gbs") is not None:
+        lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
     lines.append(f"limit  {plan['expected_bottleneck']}")
     hit = plan.get("projected_hit_rate", 0)
     lines.append(f"hit    {hit:.0%} projected expert residency")

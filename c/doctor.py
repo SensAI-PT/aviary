@@ -511,11 +511,21 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
             checks.append(_check("placement.plan", "warn", "; ".join(plan["warnings"])))
         else:
             checks.append(_check("placement.plan", "pass", "tier placement has no warnings"))
+        # #379: read-and-display only -- the cached value colibri.c already measured
+        # (F_NOCACHE probe) on a Metal+darwin startup, never re-probed here.
+        ssd_gbs = plan.get("ssd_probe_gbs")
+        if ssd_gbs is not None:
+            checks.append(_check("storage.ssd_probe", "pass",
+                                 f"F_NOCACHE probe: {ssd_gbs:.1f} GB/s (cached, .coli_ssd)", gbs=ssd_gbs))
+        else:
+            checks.append(_check("storage.ssd_probe", "skip",
+                                 "no cached probe yet; measured on the first Metal+darwin engine start"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
         checks.append(_check("memory.ram", "skip", "RAM projection requires a valid model"))
         checks.append(_check("placement.plan", "skip", "placement requires a valid model"))
+        checks.append(_check("storage.ssd_probe", "skip", "probe surfacing requires a valid model"))
 
     if deep:
         try:
