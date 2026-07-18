@@ -88,6 +88,12 @@ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pr
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
+/* #379: set in main() when the F_NOCACHE storage probe (coli_ssd_probe_cached,
+ * defined below) measured the model volume as fast (Metal + darwin only).
+ * Stays 0 on every other platform/build, so every read of it below is a no-op
+ * there -- see coli_resolve_cap() and cap_for_ram()'s CAP_RAISE default. */
+static int g_ssd_fast;
+
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
@@ -7495,8 +7501,14 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
          * Senza questo, una macchina da 128 GB girava con la LRU di una da 16
          * (cap=8 di default in coli): hit 23-28% con decine di GB inutilizzati.
          * Tetto a n_experts: oltre, ogni layer avrebbe slot che non puo' riempire.
-         * CAP_RAISE=0 ripristina il comportamento fisso. */
-        int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):1;
+         * CAP_RAISE=0 ripristina il comportamento fisso.
+         * #379: on Metal + darwin + fast SSD, raising the cache back up is the
+         * same anti-pattern the platform cap default exists to avoid, so the
+         * default flips to off there. An explicit CAP_RAISE always wins either
+         * way -- this only changes what happens when nobody set it.
+         * CURRENT-STATE CALIBRATION (#379): same revisit trigger and
+         * measurement stamp as the cap-1 default in coli_resolve_cap(). */
+        int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):(g_ssd_fast?0:1);
         int newcap = capmax>c->n_experts ? c->n_experts : capmax;
         if(raise_on && newcap>m->ecap){
             for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
@@ -7569,10 +7581,10 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
  * number was 14 GB/s), so this probes the actual model volume the same way
  * compat_open_direct()/iobench.c's __APPLE__ branch do: open + F_NOCACHE,
  * random 16K-aligned pread, no readahead. Cheap and darwin-only: never touches
- * non-Metal or non-darwin builds. Not called yet from main() in this commit --
- * see the platform-default wiring that follows in the next one (S2/S3).
+ * non-Metal or non-darwin builds.
  * Gated on __APPLE__ alone (not COLI_METAL) so these three functions build and
- * are unit-testable on any macOS binary, Metal or not. */
+ * are unit-testable on any macOS binary, Metal or not; the call site in main()
+ * is the one that additionally requires g_metal_enabled, i.e. COLI_METAL. */
 #ifdef __APPLE__
 #define COLI_SSD_PROBE_BLK   (4u*1024*1024)     /* 4 MB reads, 16K-aligned offsets */
 #define COLI_SSD_PROBE_MAXB  (300*1024*1024)    /* "a few hundred MB", capped on fast media */
@@ -7651,6 +7663,30 @@ static double coli_ssd_probe_cached(const char *snap_dir){
     return gbs;
 }
 #endif /* __APPLE__ */
+
+/* Expert-cache-cap precedence (#379, S2): explicit CLI positional > explicit
+ * CAP env > platform default (Metal + darwin + fast SSD) > historic default.
+ * `cli_given` distinguishes a bare invocation (no positional at all -> the
+ * engine's historic 64, byte-identical to the old argc<=1 fallback) from the
+ * coli wrapper's "0 = auto" sentinel (-> historic 8, what coli always forced
+ * before). cap=0 as an explicit request for zero cache slots was undocumented
+ * and unused repo-wide, so repurposing it as the sentinel is safe. Pure
+ * function (no I/O, no globals) so precedence is unit-testable in isolation
+ * from the probe and from argv/getenv. */
+static int coli_resolve_cap(int cli_given, int cli, int env, int platform_fast, int *explicit_out){
+    int is_explicit = (cli_given && cli!=0) || (env!=0);
+    if(explicit_out) *explicit_out=is_explicit;
+    if(cli_given && cli) return cli;
+    if(env) return env;
+    /* CURRENT-STATE CALIBRATION (#379; measured 2026-07, macOS 26.5, M5 Max,
+     * engine base caa49f7): cap 1 encodes that stack's per-buffer residency
+     * cost. Revisit when residency handling changes (the heap/residency-set
+     * work in #379, or MTLTensor-based expert storage): with heap-backed
+     * slabs cap 16 already beats cap 1. The machinery above and below is
+     * durable; only this constant changes. */
+    if(platform_fast) return 1;
+    return cli_given ? 8 : 64;   /* sentinel 0 -> coli's historic 8; bare ./glm -> historic 64 */
+}
 
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
@@ -7877,7 +7913,11 @@ int main(int argc, char **argv){
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
-    int cap  = argc>1?atoi(argv[1]):64;
+    /* cap itself is resolved below, once g_metal_enabled and the SSD probe (both
+     * needed for the platform default) are known -- see coli_resolve_cap(). */
+    int cap_given = argc>1;
+    int cap_arg = cap_given?atoi(argv[1]):0;
+    int cap_env = getenv("CAP")?atoi(getenv("CAP")):0;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
     int kv_limit=(getenv("SERVE_BATCH")&&atoi(getenv("SERVE_BATCH")))?512:16;
@@ -7993,6 +8033,23 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+    /* #379 (S2/S3): probe the model volume once Metal's on/off state is known,
+     * cache the result in the model dir, and let it set the cap/CAP_RAISE
+     * defaults -- never an explicit --cap/CAP/CAP_RAISE, per coli_resolve_cap()
+     * above. Silent when the probe ran but storage was slow (defaults unchanged);
+     * one stderr line when the platform default actually engages. */
+    double coli_ssd_gbs = -1;
+#if defined(COLI_METAL) && defined(__APPLE__)
+    if(g_metal_enabled){
+        coli_ssd_gbs = coli_ssd_probe_cached(snap);
+        double ssd_fast_gbs = getenv("COLI_SSD_FAST_GBS")?atof(getenv("COLI_SSD_FAST_GBS")):4.0;
+        g_ssd_fast = (coli_ssd_gbs>=ssd_fast_gbs);
+    }
+#endif
+    int cap_explicit=0;
+    int cap = coli_resolve_cap(cap_given, cap_arg, cap_env, g_ssd_fast, &cap_explicit);
+    if(g_ssd_fast && !cap_explicit)
+        fprintf(stderr,"METAL: fast SSD (%.1f GB/s) — page cache favored, expert cache minimal (cap 1); override with --cap\n", coli_ssd_gbs);
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);

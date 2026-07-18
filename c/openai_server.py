@@ -1152,7 +1152,11 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 class Engine:
-    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
+    # cap=0 = "not explicitly set": the engine resolves it (8 historically, 1 on
+    # Metal+darwin+fast SSD -- colibri.c coli_resolve_cap, #379). Same sentinel as
+    # the --cap flags in coli and main() below, so programmatic callers that
+    # never pass cap get the same auto behavior as the CLI.
+    def __init__(self, executable, model, cap=0, max_tokens=1024, env=None, kv_slots=1):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
@@ -2290,7 +2294,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
+          cap=0, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
     if engine is None:
         engine = default_engine()
@@ -2349,7 +2353,9 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    parser.add_argument("--cap", type=int, default=8)
+    # 0 = not explicitly set: mirrors coli's --cap (0=auto; see colibri.c coli_resolve_cap
+    # and issue #379 -- Metal+darwin+fast SSD defaults to 1, everything else to 8).
+    parser.add_argument("--cap", type=int, default=0, help="cache slots/layer (0=auto)")
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,

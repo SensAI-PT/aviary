@@ -1050,7 +1050,11 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
-    common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
+    # 0 = not explicitly set: the engine picks (8 historically; 1 on Metal+darwin+fast
+    # SSD, #379 -- an honest F_NOCACHE probe measures "fast", cached in <model>/.coli_ssd).
+    # An explicit --cap always wins; see colibri.c's coli_resolve_cap().
+    common.add_argument("--cap", type=int, default=0, help="cache slots/layer (0=auto)")
+    common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
