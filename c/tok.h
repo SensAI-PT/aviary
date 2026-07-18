@@ -114,7 +114,9 @@ static void tok_load(Tok *T, const char *path){
      * mirror non fidato: un id NEGATIVO indicizzerebbe id2str[id] SOTTO l'allocazione
      * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
-    for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num;
+    for(int i=0;i<vocab->len;i++){
+        if(vocab->kids[i]->t!=J_NUM){ fprintf(stderr,"tokenizer.json: non-numeric vocab id at %d\n",i); exit(1); }
+        int id=(int)vocab->kids[i]->num;
         if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
         if(id>maxid)maxid=id; }
     if(added) for(int i=0;i<added->len;i++){
@@ -123,10 +125,13 @@ static void tok_load(Tok *T, const char *path){
         int id=(int)ji->num;
         if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
         if(id>maxid)maxid=id; }
+    /* an id near INT_MAX would overflow n_ids=maxid+1 (UB) and calloc multi-GB */
+    if(maxid > (1<<21)){ fprintf(stderr,"tokenizer.json: implausible max vocab id %d\n",maxid); exit(1); }
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
     T->id_special=calloc(T->n_ids,sizeof(int));
+    if(!T->id2str||!T->id_added||!T->id_special){ fprintf(stderr,"tokenizer.json: OOM sizing %d ids\n",T->n_ids); exit(1); }
 
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
@@ -141,6 +146,9 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
+        if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
+           pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
+            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
         const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
         int ll=(int)strlen(l), rl=(int)strlen(r);
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);

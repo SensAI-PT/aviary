@@ -700,6 +700,8 @@ class APIServer(ThreadingHTTPServer):
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
+                   # request line/body can't pin a worker thread (and a slot) forever
     server_version = "colibri"
 
     def log_message(self, fmt, *args):
