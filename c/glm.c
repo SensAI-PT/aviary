@@ -4211,7 +4211,11 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
 }
 
 static inline int argmax_v(const float *lo, int V){
-    int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+    /* skip NaN (x==x is false for NaN) so a poisoned logit can't pin the argmax
+     * to index 0 — pick the max finite/+Inf entry instead. */
+    int b=-1; float bv=-INFINITY;
+    for(int i=0;i<V;i++){ float x=lo[i]; if(x==x && x>bv){ bv=x; b=i; } }
+    return b<0?0:b;
 }
 
 /* ---- METODO F: draft grammaticale (#48) ----
