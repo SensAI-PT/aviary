@@ -286,7 +286,7 @@ static double g_t_resset_flush;   // sec committing pending adds in moe_submit (
 // can resolve() was added (and marked dirty) under g_resset_mtx strictly before that
 // moe_submit's resset_flush() acquired the same mutex: the flush covers it. The slab-table
 // ordering itself (register-before-resolve) is unchanged and stays under g_slab_mtx.
-// Cost lands in the caller's existing expert-load accounting (t_ewait window in glm.c);
+// Cost lands in the caller's existing expert-load accounting (t_ewait window in colibri.c);
 // no separate counter for the add/remove side.
 static void resset_add(id<MTLBuffer> b) {
   if (!g_resset_enabled) return;
@@ -318,7 +318,7 @@ static void resset_flush() {
 }
 // Harness visibility for the flush cost, which sits OUTSIDE the moe_times setup/gpu
 // breakdown (timed around resset_flush in moe_submit, before ts_start). Returns whether
-// the set is active so glm.c prints the METAL-RESSET line only when the gate is on --
+// the set is active so colibri.c prints the METAL-RESSET line only when the gate is on --
 // stock output stays byte-identical.
 extern "C" int coli_metal_resset_stats(double *flush_s) {
   if (flush_s) *flush_s = g_t_resset_flush;

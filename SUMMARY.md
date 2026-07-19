@@ -19,9 +19,9 @@ reduction survives without the load-path tax (malloc pages never change ownershi
 
 All mechanism code is confined to `c/backend_metal.mm` —
 `coli_metal_register`/`coli_metal_unregister`'s existing signatures and every call site in
-`glm.c` (expert_load, uring_load_add, qalloc, kv_alloc, map_of_fd) are untouched; the
+`colibri.c` (expert_load, uring_load_add, qalloc, kv_alloc, map_of_fd) are untouched; the
 residency-set bookkeeping lives entirely inside those two functions' existing bodies. The
-`glm.c`/`backend_metal.h` touches are two, both coordinator-sanctioned: the validator
+`colibri.c`/`backend_metal.h` touches are two, both coordinator-sanctioned: the validator
 round-1 instrumentation hook (`coli_metal_resset_stats` + the gate-on-only `METAL-RESSET:`
 stats line in `profile_print`) and the ported fslab-OOM unwind fix (see "Validator round 1
 fixes" item 4). Still a smaller diff shape than E4,
@@ -120,7 +120,7 @@ This is correct — not just fast — because of an existing invariant the codeb
 depends on for `resolve()` to work at all: a slab's `coli_metal_register` call always
 completes — including its trailing `resset_add`, which runs after `g_slab_mtx` is dropped
 but **before the function returns** — before any dispatch that references that slab's
-pointer can call `resolve()` for it (the caller in `glm.c` cannot pass a freshly-loaded
+pointer can call `resolve()` for it (the caller in `colibri.c` cannot pass a freshly-loaded
 expert's pointer to a dispatch before the load — which registers it — returns). After the
 validator round-1 mutex split, the flush's synchronization runs through `g_resset_mtx`
 alone: `resset_add`'s set mutation + dirty write and `resset_flush`'s dirty read + commit
@@ -133,7 +133,7 @@ registering unrelated slabs. The two mutexes are never held simultaneously anywh
 deadlock ordering exists to maintain.
 
 `resset_remove`, by contrast, commits synchronously and immediately, with no batching,
-because the caller (`glm.c`, in every one of the four slab-realloc call sites, and in
+because the caller (`colibri.c`, in every one of the four slab-realloc call sites, and in
 `kv_alloc`) frees the underlying host memory *right after* `coli_metal_unregister` returns.
 An uncommitted-but-still-set-member allocation pointing at memory the host has already freed
 is a potential use-after-free the GPU could act on — deferring that removal is not a
@@ -157,7 +157,7 @@ the `METAL:` line, mirroring E4's `METAL-HEAP:` convention, so the existing `MET
 the harness parses keeps its exact format** — printed **only when the gate is on** (the
 function returns 0 when off), so stock output stays byte-identical. The register-side
 `resset_add`/`resset_remove` costs have no dedicated counter: they run inside the engine's
-existing expert-load wait accounting (the `t_ewait` window in `glm.c`), noted in a comment
+existing expert-load wait accounting (the `t_ewait` window in `colibri.c`), noted in a comment
 at `resset_add`, so a load-path regression from set bookkeeping would already show in the
 existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stderr lines from
 `coli_metal_init` confirm which path a run took.
@@ -186,8 +186,8 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
    `coli_metal_resset_stats()` + the gate-on-only `METAL-RESSET:` line in `profile_print` —
    see "Instrumentation parity" above.
 4. **Pre-existing fslab OOM-unwind bug — now CARRIED ON THIS BRANCH** (follow-up commit,
-   coordinator-sanctioned second `glm.c` change): `expert_load`'s fslab OOM path
-   (`c/glm.c` ~1870 on this base) freed `s->slab` via `compat_aligned_free` **without**
+   coordinator-sanctioned second `colibri.c` change): `expert_load`'s fslab OOM path
+   (`c/colibri.c`, in `expert_load_impl`) freed `s->slab` via `compat_aligned_free` **without**
    `coli_metal_unregister` — on stock that leaves a stale `g_slabs` entry whose GPU
    exposure ends with the last command buffer that declared it; under E5 the buffer would
    additionally be a **permanent residency-set member** referencing freed host memory until
@@ -204,7 +204,7 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
 | Seam | E4 (`e4/metal-heap`) | E5 (this branch) |
 |---|---|---|
 | Allocation | New: `MTLHeap` sub-buffers via `coli_metal_heap_alloc` | Unchanged: same `posix_memalign` + `newBufferWithBytesNoCopy` |
-| `glm.c` / `backend_metal.h` | Touched (new alloc/free API, 4 call sites + `expert_host_release`) | **Untouched** |
+| Coordinator C source / `backend_metal.h` | `glm.c` touched (new alloc/free API, 4 call sites + `expert_host_release`) | `colibri.c` + header touched only for instrumentation and the OOM-unwind fix |
 | Residency scope | Declared once **per command buffer** (`useHeap:`, still inside `moe_submit`) | Declared once **for the process** (queue-attached set), refreshed incrementally at register/unregister |
 | Hazard tracking | Heap sub-buffers forced `MTLHazardTrackingModeUntracked` always (allocation-level) | Untouched at the resource level; `moe_submit` alone stops calling `useResource:` (encoder-level), independent of `COLI_METAL_UNTRACKED` |
 | Per-buffer vs per-set skip | `[b heap]` (Metal's own `MTLResource.heap` property) checked per buffer — heterogeneous mixes possible if a slab fell back to malloc | Blanket `if (!g_resset_enabled)` — homogeneous by construction, since every registered slab goes through the same `coli_metal_register` path when the gate is on |
@@ -236,7 +236,7 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
 `cd c && make glm METAL=1` and a separate explicit `-Wall -Wextra` compile of
 `backend_metal.mm` (the Makefile's `METALXX` line does not itself pass `-Wall -Wextra`, so
 "clean under `-Wall -Wextra`" was checked with those flags added explicitly), plus
-`cd c && make glm` (plain, non-Metal — the one `glm.c` touch, the `METAL-RESSET` stats line,
+`cd c && make glm` (plain, non-Metal — the one `colibri.c` instrumentation touch, the `METAL-RESSET` stats line,
 is inside the pre-existing `#ifdef COLI_METAL` arm of `profile_print`, so the plain build
 compiles none of it), and
 `make metal-test` (existing synthetic kernel-correctness unit test — no model, no
