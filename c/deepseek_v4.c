@@ -5198,13 +5198,13 @@ static void hot_fill_view(ColiTensorView *view,
                           const V4HotPolicy *policy,
                           const V4ExpertStoreState *state) {
     fill_tensor_view(view, record, slot, matrix);
-#ifdef __AVX512F__
+#ifdef COLI_FP4_ROWS16_KERNEL
     if (policy->packed[hot_slot_index(state, slot)]) view->block_rows = 16;
 #endif
 }
 
 static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
-#ifndef __AVX512F__
+#ifndef COLI_FP4_ROWS16_KERNEL
     (void)view; (void)scratch; return -1;
 #else
     unsigned char *packed_scales = scratch + view->data_bytes;
@@ -5220,7 +5220,7 @@ static int hot_pack_slot_locked(V4HotPolicy *policy,
                                 V4ExpertStoreState *state,
                                 const V4ExpertRecord *record,
                                 V4ExpertSlot *slot) {
-#ifndef __AVX512F__
+#ifndef COLI_FP4_ROWS16_KERNEL
     (void)policy; (void)state; (void)record; (void)slot; return -1;
 #else
     size_t slot_index = hot_slot_index(state, slot);
@@ -5548,7 +5548,7 @@ int coli_v4_shared_expert_forward_ref(float *output,
 int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit) {
-#ifndef __AVX512F__
+#ifndef COLI_FP4_ROWS16_KERNEL
     return coli_v4_expert_forward_v17_fallback(
         output, expert, input, route_weight, swiglu_limit);
 #else
