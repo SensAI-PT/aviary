@@ -90,8 +90,7 @@
             mainProgram = "glm";
           };
         };
-      in
-      rec {
+      in {
         packages = {
           default = colibri;
           inherit colibri;
