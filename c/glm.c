@@ -2931,6 +2931,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
                 ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
                 if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
+                /* #417: la scorciatoia GPU-prerouted deve far avanzare l'orologio di recency
+                 * come il percorso router completo (riga ~3055), altrimenti elast/eaccess_clock
+                 * si congelano a fine prefill e il tie-breaker LFRU di REPIN gira su punteggi
+                 * stantii durante il decode su Metal. */
+                m->elast[layer][idxs[(int64_t)s*K+kk]]=++m->eaccess_clock;
             }
             for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
         }
