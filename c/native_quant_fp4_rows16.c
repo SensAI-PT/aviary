@@ -1,6 +1,8 @@
 #include "native_quant_fp4_rows16.h"
 
+#ifdef __AVX512F__
 #include <immintrin.h>
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 

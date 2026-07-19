@@ -1,4 +1,6 @@
+#ifdef __AVX512F__
 #include <immintrin.h>
+#endif
 
 #define coli_fp8_matmul_batch_ref coli_fp8_matmul_batch_baseline_v6
 /* ---- begin inlined native_quant_batch_interleaved_v4.c ---- */

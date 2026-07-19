@@ -200,11 +200,18 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 
-# DeepSeek V4 is a separate x86-64 runtime. Portable infrastructure tests run
-# everywhere; the engine and token-exact fixture run only on Linux/Windows.
+# DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
+# tests run everywhere; the engine and token-exact fixture run on x86-64
+# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
+# inside the sources, so a plain armv8-a build stays correct.
 COLI_V4_SUPPORTED :=
 ifneq (,$(X86_64))
 ifneq (,$(IS_WIN)$(LINUX))
+COLI_V4_SUPPORTED := 1
+endif
+endif
+ifneq (,$(AARCH64))
+ifneq (,$(LINUX))
 COLI_V4_SUPPORTED := 1
 endif
 endif
@@ -303,11 +310,11 @@ deepseek-v4-oracle: deepseek-v4
 		--check-dspark
 else
 deepseek-v4 deepseek-v4-oracle:
-	@echo "$@ is supported only on x86-64 Linux and Windows/MSYS2" >&2; exit 1
+	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
 deepseek-v4-clean:
 	@:
 deepseek-v4-tiny-check:
-	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64 Linux or Windows/MSYS2"
+	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
 
 # phony targets — 'glm' kept for backward compatibility
