@@ -68,7 +68,8 @@
             cp c/glm             $out/lib/colibri/glm
             cp c/coli            $out/lib/colibri/coli
             chmod +x $out/lib/colibri/coli
-            cp c/openai_server.py c/resource_plan.py c/doctor.py $out/lib/colibri/
+            cp c/openai_server.py c/resource_plan.py c/doctor.py c/version.py \
+              $out/lib/colibri/
             cp -r c/tools/*      $out/lib/colibri/tools/
 
             # $out/bin holds the user-facing entry points.
