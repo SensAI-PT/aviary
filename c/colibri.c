@@ -1701,12 +1701,21 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 #endif
 
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
- * cosi' le letture sincrone successive trovano la page-cache calda. */
+ * cosi' le letture sincrone successive trovano la page-cache calda.
+ * Sotto g_direct i PESI vengono letti con O_DIRECT (bypassa la page-cache, vedi
+ * expert_load): il WILLNEED su di essi scalda pagine che la lettura di domanda non
+ * consuma -> readahead sprecato sul disco, la risorsa piu' scarsa nello streaming.
+ * Le scale .qs restano SEMPRE bufferizzate (pread sul fd normale), quindi il loro
+ * WILLNEED resta utile anche con DIRECT=1. fadvise e' solo consultivo: saltarlo non
+ * cambia mai l'output (bit-identico), riduce solo I/O sprecato.
+ * EN: under O_DIRECT the weights bypass the page cache, so their WILLNEED is wasted;
+ * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
 static void expert_prefetch(Model *m, int layer, int eid){
     char nm[300];
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch(&m->S,nm);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]);
+        if(!g_direct) st_prefetch(&m->S,nm);
         char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
     }
 }
