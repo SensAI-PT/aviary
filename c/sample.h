@@ -17,9 +17,9 @@ static inline double rndu(void){
 
 /* ---- argmax over a float vector ----------------------------------------- */
 static inline int argmax_v(const float *lo, int V){
-    int b = 0; float bv = lo[0];
-    for (int i = 1; i < V; i++) if (lo[i] > bv) { bv = lo[i]; b = i; }
-    return b;
+    int b=-1; float bv=-INFINITY;
+    for(int i=0;i<V;i++){ float x=lo[i]; if(x==x && x>bv){ bv=x; b=i; } }
+    return b<0?0:b;
 }
 
 /* ---- distribution buffers (reused, single-threaded decode) --------------- */

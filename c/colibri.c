@@ -3481,11 +3481,6 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
 
-static inline int argmax_v(const float *lo, int V){
-    int b=-1; float bv=-INFINITY;
-    for(int i=0;i<V;i++){ float x=lo[i]; if(x==x && x>bv){ bv=x; b=i; } }
-    return b<0?0:b;
-}
 
 static void repin_pass_limit(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
