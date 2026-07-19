@@ -99,7 +99,7 @@
             homepage = "https://github.com/JustVugg/colibri";
             license = licenses.asl20;
             platforms = with platforms; linux ++ darwin;
-            mainProgram = "glm";
+            mainProgram = "coli";
           };
         };
       in {
@@ -113,9 +113,9 @@
             type = "app";
             program = pkgs.lib.getExe colibri;
           };
-          coli = {
+          glm = {
             type = "app";
-            program = pkgs.lib.getExe' colibri "coli";
+            program = "${colibri}/share/colibri/glm";
           };
         };
 
