@@ -45,7 +45,10 @@
           checkInputs = [pythonEnv];
 
           # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
-          ARCH = "x86-64-v3";
+          ARCH =
+            if pkgs.stdenv.hostPlatform.isx86_64
+            then "x86-64-v3"
+            else "native";
 
           buildPhase = ''
             runHook preBuild
@@ -95,7 +98,7 @@
             description = "Run GLM-5.2 (744B MoE) on a consumer machine with ~25 GB RAM";
             homepage = "https://github.com/JustVugg/colibri";
             license = licenses.asl20;
-            platforms = platforms.linux;
+            platforms = with platforms; linux ++ darwin;
             mainProgram = "glm";
           };
         };
