@@ -151,6 +151,10 @@ scale-granularity/rotation ablations live in
 
 ## Get started
 
+> **New here?** The [Quick Start guide](docs/quickstart.md) walks through
+> install → build → model → first chat step by step for Linux, Windows, and
+> macOS, with copy-paste commands and no assumed background.
+
 ### 1. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
