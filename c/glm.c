@@ -4924,7 +4924,68 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     }
     return nb;
 }
+/* ---- RSS GUARD (#403) -----------------------------------------------------
+ * La proiezione di cap_for_ram e' una STIMA: sul GB10 (#403) le generazioni
+ * lunghe l'hanno sforata di ~40 GB (proiettato 74.4, reale 115.6 -> 3 kill del
+ * kernel). La run D dell'issue prova che un cap piu' basso CONTIENE la crescita:
+ * questa guardia lo fa da sola, sull'RSS MISURATO invece che sul proiettato.
+ * Al safe point (stessa sede di repin: nessun moe in volo), ogni ~16 token
+ * emessi: se l'RSS supera il budget, svuota gli slot LRU meno usati e abbassa
+ * ecap perche' non ricrescano. Gli slab sono >128KB (mmap'd da glibc): la free
+ * restituisce le pagine al kernel subito, quindi l'RSS scende davvero.
+ * Lo slot NON viene compattato via: resta al suo posto con eid=-1/used=0 (primo
+ * candidato al riuso), perche' con PILOT_REAL il worker tiene puntatori dentro
+ * ecache[] durante i suoi pread e uno spostamento li invaliderebbe; per lo
+ * stesso motivo gli slot eid<0 (riservati/in caricamento) non si toccano e la
+ * selezione avviene sotto g_pilot_mx. resident_bytes resta invariato: gli slot
+ * LRU non sono mai contati li' (solo pin e densa).
+ * EN: evict = free the slab in place (eid=-1, used=0, never compact: PILOT_REAL
+ * EN: holds pointers into ecache[] across its preads), skip eid<0 reservations,
+ * EN: select under g_pilot_mx. RSS_GUARD_GB=<gb> forces an explicit ceiling. */
+static double g_ram_budget_gb=0;              /* budget risolto, scritto da cap_for_ram */
+static uint64_t g_rssg_last=0;
+static void rss_guard(Model *m){
+    double lim = getenv("RSS_GUARD_GB") ? atof(getenv("RSS_GUARD_GB")) : g_ram_budget_gb;
+    if(lim<=0) return;
+    if(m->n_emit - g_rssg_last < 16) return;
+    g_rssg_last = m->n_emit;
+    double rss=rss_gb();
+    if(rss <= lim*1.02+0.3) return;                       /* tolleranza: 2% + 300MB */
+    Cfg *c=&m->c;
+    int64_t need=(int64_t)((rss-lim)*1e9), freed=0; int dropped=0;
+    for(int pass=0; pass<8 && freed<need; pass++){
+        for(int l=0; l<=c->n_layers && freed<need; l++){
+            if(!m->ecache || !m->ecache[l]) continue;
+            pthread_mutex_lock(&g_pilot_mx);
+            int nn=m->ecn[l], lru=-1;
+            for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
+                ESlot *cand=&m->ecache[l][z];
+                if(cand->eid<0 || !cand->slab) continue;
+                if(lru<0 || cand->used<m->ecache[l][lru].used) lru=z;
+            }
+            if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+            ESlot *s=&m->ecache[l][lru];
+            s->eid=-1;                                    /* nascosto: nessun hit/evict altrui */
+            pthread_mutex_unlock(&g_pilot_mx);
+            int64_t sb=s->slab_cap + s->fslab_cap*4;
+#ifdef COLI_METAL
+            if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
+#endif
+            compat_aligned_free(s->slab); free(s->fslab);
+            s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+            QT *q[3]={&s->g,&s->u,&s->d};
+            for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+            s->used=0;                                    /* primo candidato al riuso */
+            freed += sb; dropped++;
+        }
+        if(m->ecap>2) m->ecap--;                           /* il tetto scende: niente ricrescita */
+    }
+    if(dropped)
+        fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
+                       "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
+}
 static void repin_pass_limit(Model *m,int limit){
+    rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
@@ -6024,6 +6085,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
         if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); ram_gb=8; } }
+    g_ram_budget_gb = ram_gb;                    /* #403: la RSS-guard usa il budget RISOLTO */
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
      *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
