@@ -168,6 +168,28 @@ typedef struct {
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
     uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
+    /* DISK-CLASS: PRIVATE recency state, read only by expert_classify(). Private --
+     * not the real elast/eaccess_clock -- kept fully separate so DISK-CLASS's bookkeeping
+     * can never read from or write into stock eviction state: every DISK-CLASS write lives
+     * inside its own need_classify/dc_on gate, so "byte-identical with PROF=0" is provable
+     * by construction instead of by argument. (Historical note: when this was first written,
+     * the Metal pre-routed FASE A path (g_pre_idx) never bumped the real elast/eaccess_clock
+     * -- on Metal decode the real clock froze at end of prefill, so REPIN's LRU tie-breaker
+     * ran on stale recency for the rest of the run. That was an upstream defect; it has since
+     * been reported and fixed (#417, cfcc742) -- FASE A now bumps the real clock too. The
+     * private clock is retained anyway: separation from stock state is the stronger property,
+     * independent of whether the real clock is correct.) elast_dc/eaccess_clock_dc tick in
+     * BOTH FASE A paths, under the same need_classify gate, at the same rate the real clock
+     * ticks on the CPU path (one per selected (position,expert)) -- so the
+     * COLI_DISKCLASS_WINDOW window keeps its meaning in every mode. elast_pre snapshots
+     * elast_dc just BEFORE this call's own bump (see the touched[] guard in FASE A) --
+     * classifying against the live array would read the bump routing just made a few lines
+     * above the load that needed it, so a giant cold prefill burst would score every expert
+     * "just accessed" and get called warm. Recency alone (not eheat's access COUNT): a count
+     * never decays, so an expert hot early in a long session would keep reading "warm" long
+     * after it dropped out of the working set. Same shape/allocation as elast; NULL for dense
+     * layers. */
+    uint32_t **elast_dc, **elast_pre, eaccess_clock_dc;
     /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
@@ -298,6 +320,65 @@ static _Atomic int64_t g_prof_io;                /* bytes pread()/faulted from e
  * wait ~ service means the loads block the compute thread. */
 static _Atomic int64_t g_edisk_ns;
 static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_order_relaxed)*1e-9; }
+/* DISK-CLASS (PROF=1): per-load cold/warm classification against the engine's own
+ * recency state. Instrumentation only -- it never changes which fd serves a read (see
+ * expert_classify() and its call site in expert_load_impl; the fd choice expression is
+ * untouched by this feature). COLI_DISKCLASS_WINDOW is the recency window in ticks of the
+ * PRIVATE clock (m->eaccess_clock_dc -- NOT the real eaccess_clock; see elast_dc in Model
+ * for why DISK-CLASS keeps its own clock instead of reading the real one): one tick per
+ * selected (position,expert) in FASE A while classification is active, the same per-token
+ * rate the real clock has on the CPU path, so the window's meaning is unchanged. At or
+ * under the window = warm; 0 (default, unset) derives it from topk*n_layers*8 once the
+ * model config is known (main(), right after model_init) -- roughly "seen in the last ~8
+ * tokens", generous on purpose (conservative-toward-warm: a load the page cache could have
+ * served that gets labeled cold overstates the cold class, the bucket this line exists to
+ * size). */
+static uint32_t g_direct_heat_ticks=0;
+static int g_direct_heat_explicit=0;    /* 1 if COLI_DISKCLASS_WINDOW was set (skip the auto-derive) */
+#define DC_COLD 0
+#define DC_WARM 1
+static _Atomic uint64_t g_dc_n[2];              /* [DC_COLD]/[DC_WARM]: loads classified */
+static _Atomic int64_t  g_dc_bytes[2];          /* bytes read (weights + scales, matches g_prof_io) */
+static _Atomic int64_t  g_dc_ns[2];             /* wall ns spent reading (thread-seconds, like g_edisk_ns) */
+static _Atomic uint64_t g_dc_direct_n[2];       /* subset of the above ACTUALLY served by the uncached fd */
+/* Busy-wall per class + combined: how much WALL time had >=1 classified load of the
+ * class in flight (thread-seconds / busy-wall = average concurrency; bytes / busy-wall
+ * = aggregate GB/s the disk actually delivered for that class -- the quantity the
+ * thread-second numbers alone can't answer: N slow overlapped reads can beat N fast
+ * serial ones in aggregate, and only wall-denominated rates see it). Transition scheme:
+ * 0->1 records a start, 1->0 accumulates (now - start). One dedicated mutex serializes
+ * the transition bookkeeping -- two short lock/unlock pairs per load against ms-scale
+ * reads; a CAS scheme would save nothing measurable and be harder to audit
+ * (correctness over cleverness). Only COMPLETED intervals are in the accumulators: an
+ * interval still open at report time is not counted (bounded by one read's duration --
+ * noise at report granularity). */
+static pthread_mutex_t g_dc_wall_mx=PTHREAD_MUTEX_INITIALIZER;
+static int g_dc_inflight[2], g_dc_inflight_all;              /* guarded by g_dc_wall_mx */
+static double g_dc_wall_open[2], g_dc_wall_open_all;         /* start of the open interval */
+static int64_t g_dc_wall_ns[2], g_dc_wall_all_ns;            /* completed busy-wall ns */
+static void dc_wall_enter(int cls, double now){
+    pthread_mutex_lock(&g_dc_wall_mx);
+    if(g_dc_inflight[cls]++==0) g_dc_wall_open[cls]=now;
+    if(g_dc_inflight_all++==0)  g_dc_wall_open_all=now;
+    pthread_mutex_unlock(&g_dc_wall_mx);
+}
+static void dc_wall_exit(int cls, double now){
+    pthread_mutex_lock(&g_dc_wall_mx);
+    if(--g_dc_inflight[cls]==0) g_dc_wall_ns[cls]+=(int64_t)((now-g_dc_wall_open[cls])*1e9);
+    if(--g_dc_inflight_all==0)  g_dc_wall_all_ns +=(int64_t)((now-g_dc_wall_open_all)*1e9);
+    pthread_mutex_unlock(&g_dc_wall_mx);
+}
+static int dc_needed(void);                                  /* fwd: defined with the classifier (needs g_prof) */
+static void dc_wall_read(int64_t out[2], int64_t *all){      /* mutex-consistent snapshot for the report */
+    if(!dc_needed()){ out[0]=out[1]=0; *all=0; return; }     /* off for the whole process => accumulators are
+                                                              * provably zero (only dc_wall_exit writes them,
+                                                              * only under dc_on): skip the lock, zero work.
+                                                              * Needed because prof_base runs unconditionally
+                                                              * at some call sites ("cheap enough to always"). */
+    pthread_mutex_lock(&g_dc_wall_mx);
+    out[0]=g_dc_wall_ns[0]; out[1]=g_dc_wall_ns[1]; *all=g_dc_wall_all_ns;
+    pthread_mutex_unlock(&g_dc_wall_mx);
+}
 #define PROF_LAT_CAP 32768
 static double g_prof_lat[PROF_LAT_CAP];          /* per-forward decode wall clock (ring) */
 static uint64_t g_prof_nlat;                     /* forwards recorded (monotonic) */
@@ -307,6 +388,8 @@ typedef struct {
     double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head;
     int64_t io,cpu_bytes; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p,cpu_rows;
     uint64_t hit_pin,hit_ecache;
+    uint64_t dc_n[2], dc_direct_n[2]; int64_t dc_bytes[2], dc_ns[2]; /* DISK-CLASS */
+    int64_t dc_wall_ns[2], dc_wall_all_ns;       /* busy-wall (per class + combined) */
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
@@ -317,6 +400,13 @@ static void prof_base(Model *m, ProfBase *b){
     b->hit_pin=m->hit_pin; b->hit_ecache=m->hit_ecache;
     b->n_fw=m->n_fw; b->n_emit=m->n_emit; b->nlat=g_prof_nlat; b->n_p2p=m->n_p2p;
     b->cpu_bytes=m->cpu_expert_bytes;b->cpu_rows=m->cpu_expert_rows;
+    for(int i=0;i<2;i++){
+        b->dc_n[i]=atomic_load_explicit(&g_dc_n[i],memory_order_relaxed);
+        b->dc_bytes[i]=atomic_load_explicit(&g_dc_bytes[i],memory_order_relaxed);
+        b->dc_ns[i]=atomic_load_explicit(&g_dc_ns[i],memory_order_relaxed);
+        b->dc_direct_n[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed);
+    }
+    dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
 }
 
 static float *falloc(int64_t n){
@@ -804,6 +894,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
+    m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -848,6 +939,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
@@ -894,6 +987,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
             #undef PM
         }
@@ -1028,7 +1123,35 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     }
     return 0;
 }
-static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
+/* DISK-CLASS: is classification active right now? Single point of truth shared by
+ * moe()'s pre-bump snapshot (FASE A, below) and expert_load_impl's classify-and-read --
+ * they must agree, or expert_load_impl reads a snapshot moe() never bothered to write.
+ * PROF=1 is the only trigger: this feature is measurement-only, the verdict never picks
+ * an fd (kept as one function anyway so a future policy consumer cannot drift out of
+ * sync with the snapshot writer by construction). */
+static int dc_needed(void){ return g_prof; }
+/* DISK-CLASS: cold/warm verdict for ONE demand load, read from the pre-bump snapshot
+ * (Model's elast_pre) so routing's OWN bump for THIS call can't contaminate the read --
+ * prefill is one giant moe() call where every newly-seen expert gets its `last` bumped
+ * a few lines above the load that made it "new"; classifying off the live, post-bump
+ * array would call the whole cold burst warm. Ages against the PRIVATE clock
+ * (eaccess_clock_dc, see its declaration in Model), NEVER the real eaccess_clock: kept
+ * separate by design (see elast_dc in Model for why DISK-CLASS keeps its own clock
+ * instead of reading the real one -- before #417/cfcc742 the real one also froze on the
+ * Metal pre-routed decode path, which would have made every prefill-touched expert warm
+ * forever and everything else cold forever; that's fixed upstream now, but DISK-CLASS
+ * still doesn't read the real clock, for the isolation property, not the freeze).
+ * Conservative-toward-warm on the one genuinely ambiguous input (missing snapshot --
+ * defensive only, elast_pre is allocated everywhere elast is); a demonstrable first-ever
+ * access (last_pre==0) is not a judgment call, it stays cold regardless of that bias. */
+static int expert_classify(Model *m, int layer, int eid){
+    if(!m->elast_pre || !m->elast_pre[layer]) return DC_WARM;  /* no snapshot: label as the safe class */
+    uint32_t last_pre=m->elast_pre[layer][eid];
+    if(last_pre==0) return DC_COLD;                             /* never touched before this call: certain cold */
+    uint32_t age=m->eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
+    return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
+}
+static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
@@ -1155,12 +1278,22 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         numa_slab_bind(s->fslab,(size_t)ftot*sizeof(float));
 #endif
     }
+    /* DISK-CLASS: classify before the reads; computed unconditionally at dc_on sites so
+     * the timer (dc_t0) brackets exactly the read work, matching what the GB/s in the
+     * DISK-CLASS line describes. dc_on gates ALL of it off demand=0 call sites
+     * (pilot/repin/pin -- never classified, see the call sites) and off PROF=0 runs
+     * (dc_needed()) -- zero cost, zero behavior change there. The fd choice below is
+     * NOT influenced by the verdict: this is measurement only. */
+    int dc_on = demand && dc_needed();
+    int dc_cls = dc_on ? expert_classify(m,layer,eid) : DC_WARM;
+    double dc_t0 = dc_on ? now_s() : 0;
+    if(dc_on) dc_wall_enter(dc_cls,dc_t0);        /* busy-wall open; EVERY exit path below must pair it */
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
               && tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
               && tw[ord[1]]->off+tw[ord[1]]->nbytes==tw[ord[2]]->off;
-    int64_t pos[3]; int done=0;
+    int64_t pos[3]; int done=0, dc_direct=0;
     if(contig){
         int64_t off0=tw[ord[0]]->off;
         int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;
@@ -1170,25 +1303,41 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
             ssize_t r=pread(dfd, s->slab, len, base);
             if(r>=need){
                 pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
-                pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1;
+                pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1; dc_direct=1;
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1);
+                if(dc_on) dc_wall_exit(dc_cls,now_s());   /* pair the enter on the non-fatal unwind */
+                return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
+            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1);
+                if(dc_on) dc_wall_exit(dc_cls,now_s());   /* pair the enter on the non-fatal unwind */
+                return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
+        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1);
+            if(dc_on) dc_wall_exit(dc_cls,now_s());       /* pair the enter on the non-fatal unwind */
+            return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
+    if(dc_on){                                    /* DISK-CLASS accounting, see dc_needed() */
+        double dc_t1=now_s();                     /* one clock read for thread-ns AND the wall exit */
+        int64_t bytes=wtot+fo*4;
+        atomic_fetch_add_explicit(&g_dc_n[dc_cls],1,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_dc_bytes[dc_cls],bytes,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_dc_ns[dc_cls],(int64_t)((dc_t1-dc_t0)*1e9),memory_order_relaxed);
+        dc_wall_exit(dc_cls,dc_t1);
+        if(dc_direct)                             /* which fd ACTUALLY served this class */
+            atomic_fetch_add_explicit(&g_dc_direct_n[dc_cls],1,memory_order_relaxed);
+    }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */
         posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
@@ -1206,9 +1355,15 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 }
 /* Every expert read goes through here: time the whole load (pread/fault +
  * bookkeeping) on the thread that runs it, into the disk-service counter. */
-static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+    /* `demand` marks a routing-driven demand-load (moe()'s PIPE/OMP miss path, where the
+     * pre-bump elast_pre snapshot moe() just wrote is valid) -- pass 0 from anywhere else
+     * (pilot speculative loads, repin, startup PIN loading): those never run through THIS
+     * call's own FASE A, so the snapshot either doesn't apply or was never written for
+     * them, and DISK-CLASS deliberately leaves them unclassified -- see expert_classify()'s
+     * call site. */
     double t0=now_s();
-    int rc=expert_load_impl(m,layer,eid,s,fatal);
+    int rc=expert_load_impl(m,layer,eid,s,fatal,demand);
     atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
     return rc;
 }
@@ -1458,7 +1613,7 @@ static void *pipe_worker(void *arg){
                     memory_order_acq_rel,memory_order_relaxed)){
                 int L  =atomic_load_explicit(&p->layer,memory_order_relaxed);
                 int eid=atomic_load_explicit(&p->eids[i],memory_order_relaxed); /* AFTER winning CAS */
-                expert_load(p->m,L,eid,&p->m->ws[i],1);  /* needed-now load: fatal on I/O error (matches serial path) */
+                expert_load(p->m,L,eid,&p->m->ws[i],1,1);  /* needed-now load: fatal on I/O error (matches serial path); demand=1: this IS moe()'s own miss path */
                 atomic_store_explicit(&p->ready[i],1,memory_order_release);
             }
             /* CAS failed → another worker advanced index (or gen advanced): re-loop */
@@ -1536,7 +1691,7 @@ static void expert_host_release(Model *m, ESlot *s){
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
-    if(!s->slab) expert_load(m,layer,s->eid,s,1);
+    if(!s->slab) expert_load(m,layer,s->eid,s,1,0);   /* re-materializing a GPU-resident expert's host copy, not a routing miss: demand=0 */
 }
 #endif
 
@@ -2144,6 +2299,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         pthread_mutex_unlock(&g_pilot_mx);
     }
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
+    /* DISK-CLASS: does THIS call need the pre-bump recency snapshot? Must agree with
+     * dc_needed() in expert_load_impl -- that's what reads what this writes. touched[]
+     * makes the write once-per-call: an expert routed by more than one position in a big
+     * batch (prefill's S) must snapshot the state from BEFORE this call started, not from
+     * an earlier position's bump within the SAME call (which would reintroduce the
+     * same-call contamination one position later). Unconditional VLA like the FASE B
+     * `seen[E]` below -- E is small, cost is noise. */
+    int need_classify = dc_needed();
+    unsigned char touched[E]; if(need_classify) memset(touched,0,(size_t)E);
     float *choice=falloc(E);
     int sI=c->moe_inter*c->n_shared;
     /* Rank buffer for CACHE_ROUTE max-rank selection (up to all E experts). */
@@ -2173,6 +2337,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int kk=0;kk<keff[s];kk++){
                 m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
                 ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
+                if(need_classify){                /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
+                                                   * then tick. This path also bumps the REAL elast/eaccess_clock a few
+                                                   * lines below (#417/cfcc742 fixed the once-missing bump on Metal
+                                                   * decode) -- DISK-CLASS's own clock stays independent regardless of
+                                                   * that fix, see elast_dc in Model. */
+                    int e=idxs[(int64_t)s*K+kk];
+                    if(!touched[e]){ m->elast_pre[layer][e]=m->elast_dc[layer][e]; touched[e]=1; }
+                    m->elast_dc[layer][e]=++m->eaccess_clock_dc;
+                }
                 if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
                 /* #417: la scorciatoia GPU-prerouted deve far avanzare l'orologio di recency
                  * come il percorso router completo (riga ~3055), altrimenti elast/eaccess_clock
@@ -2299,6 +2472,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int kk=0;kk<Ke;kk++){
             m->eusage[layer][idx[kk]]++;
             ehit_mark(m,layer,idx[kk]);
+            if(need_classify){                    /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
+                                                   * then tick (same rate as the real clock below: one per (s,kk)) */
+                if(!touched[idx[kk]]){ m->elast_pre[layer][idx[kk]]=m->elast_dc[layer][idx[kk]]; touched[idx[kk]]=1; }
+                m->elast_dc[layer][idx[kk]]=++m->eaccess_clock_dc;
+            }
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
             m->elast[layer][idx[kk]]=++m->eaccess_clock;
         }
@@ -2499,7 +2677,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                                                      * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
+                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1,1);   /* demand=1: this IS the miss path */
                 m->t_ewait += now_s()-t0; }         /* compute thread blocked for the whole load */
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
@@ -2805,7 +2983,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0);              /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server */
+    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server; demand=0: speculative, never classified */
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
@@ -3852,6 +4030,42 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
         hitp,(unsigned long long)dhp,(unsigned long long)dhe,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
         io_svc,io_w);
+    /* DISK-CLASS: per-load cold/warm classification vs. which fd ACTUALLY served it.
+     * Three per-class rates, labeled to keep the units unambiguous (ambiguous units
+     * mislead -- measured lesson): GB/s-thread = bytes / thread-seconds (per-read
+     * service rate, same convention as the read-service line above); GB/s-wall =
+     * bytes / busy-wall (aggregate rate the disk actually delivered while >=1 load of
+     * the class was in flight); avg-conc = thread-seconds / busy-wall (mean overlap
+     * depth). disk-busy = combined busy-wall (either class in flight) as a share of
+     * the profile window. */
+    {
+        uint64_t dcn[2], dcdn[2]; int64_t dcbytes[2], dcns[2], dcwall[2], wnow[2], dcwall_all, wall_now;
+        dc_wall_read(wnow,&wall_now);
+        for(int i=0;i<2;i++){
+            dcn[i]=atomic_load_explicit(&g_dc_n[i],memory_order_relaxed)-b->dc_n[i];
+            dcbytes[i]=atomic_load_explicit(&g_dc_bytes[i],memory_order_relaxed)-b->dc_bytes[i];
+            dcns[i]=atomic_load_explicit(&g_dc_ns[i],memory_order_relaxed)-b->dc_ns[i];
+            dcdn[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed)-b->dc_direct_n[i];
+            dcwall[i]=wnow[i]-b->dc_wall_ns[i];
+        }
+        dcwall_all=wall_now-b->dc_wall_all_ns;
+        if(dcn[DC_COLD]+dcn[DC_WARM]){
+            double ct=dcns[DC_COLD]>0?(double)dcbytes[DC_COLD]/dcns[DC_COLD]:0.0;      /* bytes/ns = GB/s */
+            double wt=dcns[DC_WARM]>0?(double)dcbytes[DC_WARM]/dcns[DC_WARM]:0.0;
+            double cw=dcwall[DC_COLD]>0?(double)dcbytes[DC_COLD]/dcwall[DC_COLD]:0.0;
+            double ww=dcwall[DC_WARM]>0?(double)dcbytes[DC_WARM]/dcwall[DC_WARM]:0.0;
+            double cc=dcwall[DC_COLD]>0?(double)dcns[DC_COLD]/dcwall[DC_COLD]:0.0;
+            double wc=dcwall[DC_WARM]>0?(double)dcns[DC_WARM]/dcwall[DC_WARM]:0.0;
+            fprintf(f,"[PROF] DISK-CLASS (recency split): cold %llu x %.2f GB @ %.2f GB/s-thread, wall %.1fs @ %.2f GB/s-wall, avg-conc %.1f (direct %llu/%llu) | "
+                      "warm %llu x %.2f GB @ %.2f GB/s-thread, wall %.1fs @ %.2f GB/s-wall, avg-conc %.1f (direct %llu/%llu) | "
+                      "disk-busy %.1fs (%.0f%% of window)\n",
+                (unsigned long long)dcn[DC_COLD],dcbytes[DC_COLD]/1e9,ct,dcwall[DC_COLD]/1e9,cw,cc,
+                (unsigned long long)dcdn[DC_COLD],(unsigned long long)dcn[DC_COLD],
+                (unsigned long long)dcn[DC_WARM],dcbytes[DC_WARM]/1e9,wt,dcwall[DC_WARM]/1e9,ww,wc,
+                (unsigned long long)dcdn[DC_WARM],(unsigned long long)dcn[DC_WARM],
+                dcwall_all/1e9,100.0*(dcwall_all/1e9)/elapsed);
+        }
+    }
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
         pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
@@ -4189,7 +4403,7 @@ static void repin_pass_limit(Model *m,int limit){
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
 #endif
         double t0=now_s();
-        expert_load(m,cd[b].l,cd[b].eid,s,1);       /* disk -> RAM, same resident slot */
+        expert_load(m,cd[b].l,cd[b].eid,s,1,0);     /* disk -> RAM, same resident slot; demand=0: repin, never classified */
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
@@ -4803,7 +5017,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
      * released before the disjoint RAM-ranked suffix is allocated. */
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
+        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
     m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
@@ -4847,7 +5061,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(gpu_prefix>0&&gpu_prefix<npin){
         #pragma omp parallel for schedule(dynamic,1)
         for(int a=gpu_prefix;a<npin;a++)
-            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1);
+            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
@@ -5186,6 +5400,8 @@ int main(int argc, char **argv){
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    { const char *dh=getenv("COLI_DISKCLASS_WINDOW");        /* DISK-CLASS recency window, see its declaration */
+      if(dh){ g_direct_heat_ticks=(uint32_t)strtoul(dh,NULL,10); g_direct_heat_explicit=1; } }
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
     if(g_uring){
 #ifdef __linux__
@@ -5284,6 +5500,19 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    if(!g_direct_heat_explicit){                     /* COLI_DISKCLASS_WINDOW default, needs m.c (topk/n_layers) */
+        /* CURRENT-STATE CALIBRATION: the "8" multiplier (recency window ~= the last 8
+         * tokens' worth of routing) is a measured-config constant, not a derived truth.
+         * Coordinates: measured 2026-07, macOS 26.5, M5 Max 128 GB, base caa49f7,
+         * GLM-5.2 int4 (topk=8, n_layers=78). On that setup it splits the classes
+         * cleanly (decode cold share ~71% of classified bytes, 1061.85/1491.49 GB);
+         * other models, page-cache pressures, or disks may want a different window --
+         * COLI_DISKCLASS_WINDOW overrides, and the DISK-CLASS line itself is the
+         * tuning instrument. */
+        uint32_t nl=(uint32_t)(m.c.n_layers>0?m.c.n_layers:1), k=(uint32_t)(m.c.topk>0?m.c.topk:1);
+        g_direct_heat_ticks = k*nl*8u;               /* ~last 8 tokens' worth of routing, see the declaration */
+        if(!g_direct_heat_ticks) g_direct_heat_ticks=1;
+    }
     if(g_draft<0){
 #ifdef COLI_CUDA
         /* MTP is disabled under CUDA by default: cold (streaming) experts still
