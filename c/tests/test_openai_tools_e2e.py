@@ -68,6 +68,10 @@ TOOLS = [{"type": "function", "function": {
                    "required": ["city"]}}}]
 
 
+@unittest.skipUnless(os.name == "posix",
+                     "the mock engine is a shebang script the gateway execs directly; "
+                     "Windows CreateProcess cannot run it. The gateway logic under test "
+                     "is platform-independent and covered by the POSIX CI jobs.")
 class ToolCallingE2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
