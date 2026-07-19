@@ -4774,6 +4774,29 @@ static void pin_load(Model *m, const char *statspath, double gb){
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
         npin=avail>0?(int)(avail/eb):0;
     } else npin=(int)(gb*1e9/eb);
+#ifdef COLI_CUDA
+    /* The VRAM budget must be known BEFORE npin is finalized: with
+     * CUDA_RELEASE_HOST the VRAM-ranked prefix's host slabs are freed right
+     * after upload, so those slots must NOT consume the RAM pin budget.
+     * Before this, a 6-GPU host lost its top ~9k ranked experts from the RAM
+     * count and pinned only the leftovers (measured: 9,280 VRAM + 1,721 RAM
+     * on a box whose RAM fits ~11k — the cold tail then paid disk forever). */
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0, prefix_est=0;
+    double budget=g_cuda_expert_gb*1e9, safe_total=0;
+    if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
+        size_t free_b=0,total_b=0;
+        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+            if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
+        }
+    }
+    if(g_cuda_expert_auto||budget>safe_total) budget=safe_total;
+    if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
+        prefix_est=(int)(budget/eb)+g_cuda_ndev;
+        npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
+    }
+#endif
     if(npin>n) npin=n;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
@@ -4784,18 +4807,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
     double t0=now_s();
 #ifdef COLI_CUDA
-    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
-    int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
-    double budget=g_cuda_expert_gb*1e9, safe_total=0;
-    if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
-        size_t free_b=0,total_b=0;
-        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-            if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
-        }
-    }
-    if(g_cuda_expert_auto||budget>safe_total) budget=safe_total;
-    if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
+    if(prefix_est>0){ gpu_prefix=prefix_est; if(gpu_prefix>npin) gpu_prefix=npin; }
 #else
     int gpu_prefix=0;
 #endif
