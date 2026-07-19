@@ -33,16 +33,16 @@
           version = "1.0";
           src = ./.;
 
-          # python3 is needed by checkPhase: `make test-c` shells out to
-          # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
-          nativeBuildInputs = with pkgs; [makeWrapper python3];
+          nativeBuildInputs = with pkgs; [makeWrapper];
 
           buildInputs = with pkgs; [
             gcc
             gmp
           ];
 
-          checkInputs = [pythonEnv];
+          # python3 is needed by checkPhase: `make test-c` shells out to
+          # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
+          nativeCheckInputs = with pkgs; [python3];
 
           # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
           ARCH =
