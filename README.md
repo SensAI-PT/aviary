@@ -183,6 +183,10 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
+Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
+registers it (the engine itself still lives in `c/` — this is an editable
+install from the clone, not a standalone wheel).
+
 ### 3. Go deeper
 
 | topic | doc |
