@@ -482,8 +482,11 @@ def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
+    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
+    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
+    # <think> open so the engine emits its reasoning block; the default stays nothink.
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
