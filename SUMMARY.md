@@ -235,7 +235,8 @@ existing disk/wait numbers. `[METAL] residency-set: on` / the two fallback stder
 
 `cd c && make glm METAL=1` and a separate explicit `-Wall -Wextra` compile of
 `backend_metal.mm` (the Makefile's `METALXX` line does not itself pass `-Wall -Wextra`, so
-"clean under `-Wall -Wextra`" was checked with those flags added explicitly), plus
+the warning surface was checked with those flags added explicitly; current `dev` contributes
+one pre-existing `unused variable 'TG'` warning), plus
 `cd c && make glm` (plain, non-Metal — the one `colibri.c` instrumentation touch, the `METAL-RESSET` stats line,
 is inside the pre-existing `#ifdef COLI_METAL` arm of `profile_print`, so the plain build
 compiles none of it), and
