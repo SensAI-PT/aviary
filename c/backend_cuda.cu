@@ -689,7 +689,15 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
     }else if(all_s4&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
-             atoi(getenv("COLI_CUDA_TC_W4A16"))){
+             atoi(getenv("COLI_CUDA_TC_W4A16"))&&
+             [&]{ int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
+                  for(int c=0;c<count;c++) if(rows[c]>=tc16_min) return 1;
+                  return 0; }()){
+        /* At least one expert has enough rows for a Tensor Core tile. Groups
+         * where EVERY expert is below the threshold (decode: r=1) fall through
+         * to the grouped-W4 path below — 3 launches for the whole group instead
+         * of 4 per expert (#431: the launch flood measured at ~981 micro-kernels
+         * per token came from decode riding this branch's per-expert fallback). */
         /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
          * contrario del path W4A4), un lancio per expert dentro lo stream —
          * l'overhead di lancio e' trascurabile rispetto ai GEMM. */
