@@ -83,6 +83,29 @@ def quant_int4_grouped(w, bits, gs=128):
     s_flat = s[:, :, 0].astype(np.float32).reshape(-1)
     return out.reshape(-1), s_flat
 
+def quant_int3_g64(w, bits=3, group=64):        # -> (qbytes U8 [O*ceil(I/64)*24], scales f32 [O*ceil(I/64)])
+    """int3 with PER-GROUP scales (fmt=5 in colibri.c): per 64-input group, symmetric absmax
+    (qmax=3, clamp [-4,3], stored v+4), packed as 16B low plane (2 bits/val, int2 layout)
+    + 8B high plane (1 bit/val). Same math as quant_ablation._quant_last_dim(bits=3,
+    group=64) (#132), here with real packing. 3.5 bits/weight effective."""
+    O, I = w.shape
+    ng = (I + group - 1) // group
+    pad = ng * group - I
+    wp = np.pad(w, ((0, 0), (0, pad))) if pad else w
+    g = wp.reshape(O, ng, group)
+    amax = np.abs(g).max(axis=2, keepdims=True)
+    s = np.maximum(amax / 3.0, 1e-8)
+    q = (np.clip(np.rint(g / s), -4, 3).astype(np.int32) + 4).astype(np.uint8)  # 0..7
+    if pad: q[:, -1, group - pad:] = 4                                          # pad packs as 0 after -4
+    lo = np.zeros((O, ng, 16), np.uint8)
+    for k in range(4):
+        lo |= ((q[:, :, k::4] & 3) << (k * 2)).astype(np.uint8)
+    hi = np.zeros((O, ng, 8), np.uint8)
+    for b in range(8):
+        hi |= (((q[:, :, b::8] >> 2) & 1) << b).astype(np.uint8)
+    out = np.concatenate([lo, hi], axis=2)                                      # [O, ng, 24]
+    return out.reshape(-1), s[:, :, 0].astype(np.float32).reshape(-1)
+
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
     qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
@@ -214,6 +237,14 @@ def dequant(f, name, keys):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
+# Per-projection bit overrides for ROUTED experts (gate_proj/up_proj/down_proj), set from
+# --up-bits/--gate-bits/--down-bits in main(). Empty = uniform xbits. Motivated by the
+# measured result that up_proj tolerates int3-g64 at ~zero quality cost while int2 craters
+# (OLMoE ablation, PR #168 comment): up-only int3 drops ~8% of expert bytes for free.
+# NB: the resume manifests (check_or_record_params and the --indir progress file) already
+# record dict(PROJ_BITS) — this global is the definition those sites depend on.
+PROJ_BITS = {}
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
@@ -235,9 +266,16 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # Any unknown kind that fell through classify as "q"
                 if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
                     bits = ebits
+                # Per-projection override for routed experts, applied on top of the type-level bits.
+                if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
+                    for proj, pb in PROJ_BITS.items():
+                        if f".{proj}.weight" in name: bits = pb; break
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
                     out_dict[name] = w.astype(np.float32); continue
-                if group_size > 0 and bits <= 4:
+                if bits == 3:
+                    # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
+                    q, s = quant_int3_g64(w)
+                elif group_size > 0 and bits <= 4:
                     q, s = quant_int4_grouped(w, bits, group_size)
                 else:
                     q, s = (quant_int2(w, bits) if bits <= 2 else
@@ -295,6 +333,13 @@ def main():
         help="bits for dense MLP (first 3 layers). Default=ebits")
     ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
         help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
+    # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
+    ap.add_argument("--up-bits", type=int, default=None,
+        help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
+    ap.add_argument("--gate-bits", type=int, default=None,
+        help="bits for gate_proj in routed experts. Default=xbits")
+    ap.add_argument("--down-bits", type=int, default=None,
+        help="bits for down_proj in routed experts. Default=xbits")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
@@ -324,6 +369,10 @@ def main():
               "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
               "or add --group-size 128 for group-scaled int4.")
     if a.xbits is None: a.xbits = a.ebits
+    for proj, val in (("gate_proj", a.gate_bits), ("up_proj", a.up_bits), ("down_proj", a.down_bits)):
+        if val is not None: PROJ_BITS[proj] = val
+    if PROJ_BITS:
+        print(f"[per-projection expert bits] {PROJ_BITS} (others -> xbits={a.xbits})")
 
     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
     # converter falls back to ebits for that type.
