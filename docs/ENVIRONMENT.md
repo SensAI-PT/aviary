@@ -103,7 +103,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
 | `COLI_CUDA_PIPE_SHARD` | off | `=1` runs the multi-device P2P head-shard attention path (opt-in for NVLink topologies; serializes ~95 MB/layer over a star PCIe topology). |
 | `COLI_CUDA_PIPE_S_MIN` | `1` single-GPU, `8` multi-GPU | Minimum prefill batch S to engage the pipe2 CUDA path. |
-| `COLI_CUDA_MTP` | `0` (off) | `=1` opts into MTP speculation under CUDA (off by default: cold streaming experts run on CPU where the fused-pair/IDOT kernels diverge in FP order, collapsing draft acceptance, #163/#292). |
+| `COLI_CUDA_MTP` | `0` (off) | `=1` opts into MTP speculation under CUDA (off by default: cold streaming experts run on CPU where the fused-pair/IDOT kernels diverge in FP order, collapsing draft acceptance, #163/#292 — though #467 measured acceptance holding at 49% on sm_120). When set explicitly, the resource planner skips its `DRAFT=0` export so the engine's auto path can engage draft=3 — no need to also set `DRAFT`. Note the measured trade-off (#467): at ~85% hit the widened S=4 expert union costs more than speculation saves (−32%); the opt-in pays only near-full residency (~99% hit). |
 | `COLI_CUDA_ASYNC` | on | `=0` forces synchronous `cudaMemcpy` instead of async + pinned host staging. |
 | `COLI_CUDA_DUAL_PROJ` | on | `=0` issues gate+up as two separate launches instead of one fused `grouped_hidden_w4_dual`. |
 | `COLI_CUDA_W4_PACKED` | on | `=0` disables the grouped packed-int4 path. |
