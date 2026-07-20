@@ -1122,7 +1122,7 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
     attention_absorb_ragged_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,ddl,ddr,
         dn,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->gs,proj->ng);
     return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
            cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"ragged output download")&&
            cuda_ok(cudaStreamSynchronize(dc->stream),"ragged attention synchronize");
