@@ -151,6 +151,15 @@ scale-granularity/rotation ablations live in
 
 ## Get started
 
+> **New here, or on Windows?** The [Quick Start guide](docs/quickstart.md) walks
+> through install → build → model → first chat step by step for Linux, Windows,
+> and macOS. On **Windows** you don't even need to build: download the
+> `colibri-<version>-windows-x86_64.zip` from
+> [Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
+> `colibri-*-windows-x86_64.exe` → `glm.exe`, install
+> [Python 3](https://www.python.org/downloads/), and run `coli chat` — full
+> details in the [Windows section](docs/quickstart.md#windows).
+
 ### 1. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
