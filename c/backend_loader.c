@@ -446,13 +446,13 @@ int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev, const flo
     return g_cuda.pipe_rmsnorm(device, y_dev, x_dev, w_dev, S, D, eps);
 }
 
-int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,const float *weights,int count,int home_device,const float *x_src_dev,float *partial_slot_dev){
-    if(!g_cuda.available || !g_cuda.expert_group_issue){ return 0; }
+int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,const float *weights,int count,int home_device,const float *x_src_dev,float *partial_slot_dev){
+    if(!g_cuda.available || !g_cuda.expert_group_resident_issue){ return 0; }
     return g_cuda.expert_group_resident_issue(gates, ups, downs, weights, count, home_device, x_src_dev, partial_slot_dev);
 }
 
 int coli_cuda_expert_group_resident_take(int home_device,const int *devices,int n_issued,float *slots_dev,float *acc_dev,int D){
-    if(!g_cuda.available || !g_cuda.expert_group_take){ return 0; }
+    if(!g_cuda.available || !g_cuda.expert_group_resident_take){ return 0; }
     return g_cuda.expert_group_resident_take(home_device, devices, n_issued, slots_dev, acc_dev, D);
 }
 
