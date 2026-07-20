@@ -1103,6 +1103,23 @@ static inline void e8_expand_sub(const uint8_t *blk, int ib, float d, float *out
     }
 }
 
+/* Fast Walsh-Hadamard transform with the per-tensor sign flip: y = Q^T x for
+ * Q = D*H/sqrt(n). fmt=6 stores W@Q, so activations must be transformed before
+ * the matmul (#452). Placement is the engine's job and it matters: all routed
+ * experts of a layer share one input row, so ONE transform per (layer,
+ * projection group) costs ~1.4 ms/token on GLM dims, while doing it per expert
+ * costs ~11 ms. n must be a power of two >= the real dim; the tail is zero-pad.
+ * Self-inverse up to the sign flip, so the same routine serves both directions. */
+static inline void e8_fwht(float *a, int n, const uint8_t *signbits){
+    if(signbits) for(int i=0;i<n;i++) if(signbits[i>>3]>>(i&7)&1) a[i]=-a[i];
+    for(int len=1;len<n;len<<=1)
+        for(int i=0;i<n;i+=len<<1)
+            for(int j=i;j<i+len;j++){ float u=a[j],v=a[j+len]; a[j]=u+v; a[j+len]=u-v; }
+    float s=1.0f/sqrtf((float)n);
+    for(int i=0;i<n;i++) a[i]*=s;
+}
+static inline int e8_pow2_ceil(int n){ int p=1; while(p<n) p<<=1; return p; }
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
