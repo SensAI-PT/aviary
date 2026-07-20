@@ -2,6 +2,10 @@
   <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
 
+<p align="center">
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
+</p>
+
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
 
 Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM, RAM,
@@ -147,6 +151,10 @@ scale-granularity/rotation ablations live in
 
 ## Get started
 
+> **New here?** The [Quick Start guide](docs/quickstart.md) walks through
+> install → build → model → first chat step by step for Linux, Windows, and
+> macOS, with copy-paste commands and no assumed background.
+
 ### 1. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
@@ -178,6 +186,17 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
+
+**On Windows?** You don't need to build. Download the
+`colibri-<version>-windows-x86_64.zip` from
+[Releases](https://github.com/JustVugg/colibri/releases), unzip it, rename
+`colibri-*-windows-x86_64.exe` → `glm.exe` (so the `coli` launcher finds the
+engine), install [Python 3](https://www.python.org/downloads/), then run
+`coli chat`. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
+
+Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
+registers it (the engine itself still lives in `c/` — this is an editable
+install from the clone, not a standalone wheel).
 
 ### 3. Go deeper
 
