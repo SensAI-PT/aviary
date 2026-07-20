@@ -1312,6 +1312,11 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
            posix_memalign((void**)&s->fslab,16384,fb)){
             fprintf(stderr,"OOM fslab\n"); if(fatal) exit(1);
+            /* unregister BEFORE freeing -- a stale g_slabs entry would let resolve() hand
+             * the GPU a pointer into freed memory (and under COLI_METAL_RESSET=1, leave the
+             * buffer a permanent residency-set member over it). Ported from e4/metal-heap
+             * validator fix 6753225; pre-existing gap on main/dev. */
+            if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
             compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;  /* clean, hidden slot (eid stays -1) */
             s->fslab=NULL; s->fslab_cap=0; return -1;
         }
@@ -4261,7 +4266,9 @@ static void profile_print(Model *m, double elapsed){
           if(aok){ double ks=0,gs=0; coli_metal_attn_lat(&ks,&gs);
           printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs | cpu-sched %.2fs gpu-sched %.2fs)\n",(unsigned long long)aok,aw,ak,ks,gs); } }
         printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
-               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc); }
+               (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc);
+        { double rsf=0; if(coli_metal_resset_stats(&rsf))   /* E5: printed only when the gate is on */
+            printf("METAL-RESSET: flush %.2fs (residency-set commit in moe_submit, outside setup/gpu-wall)\n",rsf); } }
 #endif
 }
 
