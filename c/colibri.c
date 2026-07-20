@@ -1039,7 +1039,14 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
-            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            /* METAL: t->s must be page-aligned + coli_metal_register'd like every other
+             * fmt's scale buffer (qsalloc, used by fmt 1/2/3 just below/above), or
+             * bind_gemv/coli_metal_gemm's resolve(t->s,...) can never find it and the
+             * whole GPU dispatch silently CPU-falls-back (safe, but defeats the point of
+             * wiring fmt=4 into the shader at all). falloc() here was a plain malloc --
+             * O*ng floats never registered -- found while tracing the per-row-scale path
+             * this stage extends to per-group; fixed alongside it. */
+            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
