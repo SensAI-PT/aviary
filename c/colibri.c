@@ -596,12 +596,6 @@ static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward v
  * parte (#8). MAI un vincolo sul sampling: solo proposte, la verifica batch-union
  * decide — grammatica sbagliata = draft rifiutati, output identico.
  * GRAMMAR_DRAFT=n (default 24) limita i token forzati per forward. */
-static Grammar g_gram; static GrState g_gst;
-static Tok *g_gr_T=NULL;
-static int g_gr_on=0;     /* grammatica caricata e walker vivo */
-static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
-static int g_gr_max=24;
-static uint64_t g_gr_prop=0, g_gr_acc=0;
 static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
                                * per layer — offline co-activation / coupling analysis. Zero
                                * effect on computation; measurement only. */
@@ -621,6 +615,19 @@ static int g_couple=0, g_couple_k=8, g_couple_d=1;
 static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
 static float   *cp_cnt=NULL;
 static long g_cp_enq=0;
+/* All grammar-forced-draft state in one struct so it can become per-request
+ * in the multiplexed server. Fields (same semantics as the former globals):
+ * on = grammar loaded and walker alive; armed = lazy start from the first byte
+ * accepted at the root (skips preambles); max = forced-span cap per forward;
+ * prop/acc = proposed/accepted forced-draft counters. */
+typedef struct {
+    Grammar gram;
+    GrState st;
+    Tok *T;
+    int on, armed, max;
+    uint64_t prop, acc;
+} GrDraft;
+static GrDraft g_grd={.max=24};   /* process-level instance: PROMPT mode + run_serve keep using this */
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke);
 static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
                           * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
@@ -4092,10 +4099,36 @@ static void repin_pass(Model *m){ repin_pass_limit(m,16); }
  * grammar_draft propone lo span FORZATO successivo (un solo byte legale per posizione)
  * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
  * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
-static void grammar_setup(Tok *T){
+/* Compile grammar TEXT into g: raw GBNF, or — if the first non-space byte is '{'
+ * — a JSON-Schema compiled via schema_gbnf.h. Takes ownership of txt (always
+ * freed). Fail-soft: returns -1 with g->on=0, engine runs without a grammar. */
+static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
+    const char *p=txt; while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+    if(*p=='{'){
+        char serr[160];
+        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
+        free(txt);
+        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",label,serr); return -1; }
+        txt=gbnf;
+    }
+    if(gr_parse(&g->gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",label,g->gram.err); free(txt); return -1; }
+    free(txt);
+    gr_state_init(&g->st,&g->gram);
+    if(!g->st.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",label); return -1; }
+    if(g->max<1) g->max=24;
+    if(g->max>48) g->max=48;
+    g->T=T; g->on=1; g->armed=0;
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",label,g->gram.n,g->max);
+    return 0;
+}
+/* Release a per-request grammar so the slot can host the next request (keeps max). */
+static void grammar_teardown(GrDraft *g){
+    if(g->gram.n) gr_free(&g->gram);
+    int max=g->max; memset(g,0,sizeof(*g)); g->max=max;
+}
+static void grammar_setup(GrDraft *g, Tok *T){
     /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
-     * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
-     * runs without a grammar and output is unchanged. */
+     * to GBNF. Both fail soft: the engine runs without a grammar, output unchanged. */
     const char *gf=getenv("GRAMMAR");
     const char *sf=(gf&&*gf)?NULL:getenv("SCHEMA");
     if((!gf||!*gf)&&(!sf||!*sf)) return;
@@ -4107,59 +4140,45 @@ static void grammar_setup(Tok *T){
     if(!txt || fread(txt,1,(size_t)n,f)!=(size_t)n){
         fprintf(stderr,"[GRAMMAR] failed to read %s\n",path); fclose(f); free(txt); return; }
     fclose(f); txt[n]=0;
-    if(sf){ /* schema -> GBNF, then the same gr_parse as the GRAMMAR path */
-        char serr[160];
-        char *gbnf=schema_to_gbnf(txt,serr,sizeof serr);
-        free(txt);
-        if(!gbnf){ fprintf(stderr,"[SCHEMA] %s: %s (running without grammar)\n",sf,serr); return; }
-        txt=gbnf;
-    }
-    if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",path,g_gram.err); free(txt); return; }
-    free(txt);
-    gr_state_init(&g_gst,&g_gram);
-    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar cannot be evaluated (left recursion?)\n",path); return; }
-    if(getenv("GRAMMAR_DRAFT")) g_gr_max=atoi(getenv("GRAMMAR_DRAFT"));
-    if(g_gr_max<1) g_gr_max=1;
-    if(g_gr_max>48) g_gr_max=48;
-    g_gr_T=T; g_gr_on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g_gram.n,g_gr_max);
+    if(getenv("GRAMMAR_DRAFT")) g->max=atoi(getenv("GRAMMAR_DRAFT"));
+    grammar_setup_text(g,T,txt,path);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
-static void grammar_reset(void){
-    if(!g_gr_on) return;
-    gr_state_init(&g_gst,&g_gram); g_gr_armed=0;
-    if(!g_gst.alive) g_gr_on=0;
+static void grammar_reset(GrDraft *g){
+    if(!g->on) return;
+    gr_state_init(&g->st,&g->gram); g->armed=0;
+    if(!g->st.alive) g->on=0;
 }
 /* consuma i byte di un token emesso. Preambolo (prima dell'arming): ignorato.
  * Desync dopo l'arming: si riarma in attesa del prossimo inizio valido — al peggio
  * i draft vengono rifiutati dalla verifica, l'output non cambia MAI. */
-static void gr_feed(int t){
-    if(!g_gr_on||!g_gr_T) return;
-    char b[64]; int n=tok_decode(g_gr_T,&t,1,b,63);
+static void gr_feed(GrDraft *g, int t){
+    if(!g->on||!g->T) return;
+    char b[64]; int n=tok_decode(g->T,&t,1,b,63);
     for(int i=0;i<n;i++){
-        int r=gr_accept(&g_gst,(unsigned char)b[i]);
-        if(r==1){ g_gr_armed=1; continue; }
-        if(r<0){ g_gr_on=0; return; }                 /* walker spento: fine dei draft */
-        if(!g_gr_armed) continue;                     /* preambolo: aspetta l'inizio */
-        gr_state_init(&g_gst,&g_gram); g_gr_armed=0;  /* desync: riparti dalla radice */
-        if(!g_gst.alive){ g_gr_on=0; return; }
-        if(gr_accept(&g_gst,(unsigned char)b[i])==1) g_gr_armed=1;
+        int r=gr_accept(&g->st,(unsigned char)b[i]);
+        if(r==1){ g->armed=1; continue; }
+        if(r<0){ g->on=0; return; }                   /* walker spento: fine dei draft */
+        if(!g->armed) continue;                       /* preambolo: aspetta l'inizio */
+        gr_state_init(&g->st,&g->gram); g->armed=0;   /* desync: riparti dalla radice */
+        if(!g->st.alive){ g->on=0; return; }
+        if(gr_accept(&g->st,(unsigned char)b[i])==1) g->armed=1;
     }
 }
 /* propone lo span forzato come token (max cap); 0 se la grammatica dirama qui */
-static int grammar_draft(int *draft, int cap){
-    if(!g_gr_on||!g_gr_armed||!g_gr_T||cap<1) return 0;
-    if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* guardia adattiva, come per MTP:
+static int grammar_draft(GrDraft *g, int *draft, int cap){
+    if(!g->on||!g->armed||!g->T||cap<1) return 0;
+    if(g->prop>=32 && g->acc*2<g->prop){              /* guardia adattiva, come per MTP:
         acceptance sotto il 50% = tokenizzazione fuori asse, meglio spegnersi */
-        g_gr_on=0;
+        g->on=0;
         fprintf(stderr,"[GRAMMAR] %.0f%% acceptance after %llu proposals: grammar drafts disabled\n",
-            100.0*g_gr_acc/g_gr_prop,(unsigned long long)g_gr_prop);
+            100.0*g->acc/g->prop,(unsigned long long)g->prop);
         return 0;
     }
-    char fb[512]; int nb=gr_forced(&g_gst,fb,(int)sizeof fb-1);
+    char fb[512]; int nb=gr_forced(&g->st,fb,(int)sizeof fb-1);
     if(nb<=0) return 0;
-    int g=tok_encode(g_gr_T,fb,nb,draft,cap);
-    return g>0?g:0;
+    int nt=tok_encode(g->T,fb,nb,draft,cap);          /* renamed local: 'g' is now the state param */
+    return nt>0?nt:0;
 }
 
 /* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
@@ -4217,12 +4236,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
-        gr_feed(next);                                  /* il walker segue l'output emesso */
+        gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
-        if(g_gr_on){                                    /* metodo F: prima la grammatica — dove
+        if(g_grd.on){                                   /* metodo F: prima la grammatica — dove
                                                          * forza, l'acceptance e' ~1 (#48) */
-            g=grammar_draft(draft,g_gr_max);
+            g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
         }
         if(!g && g_draft>0 && m->has_mtp){
@@ -4244,7 +4263,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g>n_new-emitted) g=n_new-emitted;
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
-        if(gsrc==1) g_gr_prop+=(uint64_t)g;
+        if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
         double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
@@ -4260,9 +4279,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
-            gr_feed(draft[k]); k++;
+            gr_feed(&g_grd,draft[k]); k++;
         }
-        if(gsrc==1) g_gr_acc+=(uint64_t)k;
+        if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
@@ -4564,7 +4583,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc((cap+2)*sizeof(int));
@@ -4605,7 +4624,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     ProfBase pb; prof_base(m,&pb);
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
-    grammar_reset();
+    grammar_reset(&g_grd);
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
@@ -4632,8 +4651,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
-    if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
-        100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
+    if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
+        100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
     if(g_disk_split) printf("disk-load split: draft %llu + absorb %llu + verify/main %llu misses | "
            "MTP-layer %llu loads %.2f GB | main-layers %llu loads %.2f GB (MTP %.1f%% of bytes)\n",
         (unsigned long long)m->miss_draft, (unsigned long long)m->miss_absorb,
@@ -4953,8 +4972,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
-static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
-                      int maxctx, int eos){
+static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *grd,
+                      int nctx, int maxctx, int eos){
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
@@ -4975,21 +4994,31 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
     if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
+    char *gtxt=NULL;                     /* optional per-request grammar/schema text */
+    if(sub.gbytes){
+        gtxt=malloc((size_t)sub.gbytes+1);
+        if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
+        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
+            free(gtxt); free(raw); free(line); return -1; }
+        gtxt[sub.gbytes]=0;
+    }
     int delim=fgetc(stdin);
     if(delim!='\n'){
         printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
-        free(raw); free(line); return -1;
+        free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
-        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     if(req[sub.slot].active){
-        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
     for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
-        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
+    grammar_teardown(&grd[sub.slot]);    /* new request owns the slot's grammar state */
+    if(gtxt) grammar_setup_text(&grd[sub.slot],T,gtxt,"request");   /* fail-soft; owns gtxt */
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
@@ -5015,6 +5044,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
     if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next);
     if(r->emitted>=r->maximum) mux_done(m,sc,r);
     return 1;
@@ -5023,14 +5053,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
-    g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
+    g_draft=0; /* one scheduler owns every forward; MTP/n-gram speculation is not ragged-safe.
+                * Grammar-forced drafts ARE mux-safe (below): a drafting slot leaves the shared
+                * batch for one forward and runs the proven single-sequence verify path
+                * (kv_bind + step_all), exactly like prefill already does per submission. */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
-    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    GrDraft *grd=calloc(nctx,sizeof(*grd));   /* per-slot request grammars (SUBMIT 7th field) */
+    for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx); grd[i].max=24; }
 #ifdef _WIN32
     /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
      * fread() payloads (waits forever for the missing bytes) and expands LF on the
@@ -5078,14 +5112,47 @@ static void run_serve_mux(Model *m, const char *snap){
             else ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
             if(ready)
 #endif
-                if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+                if(mux_submit(m,&T,ctx,req,grd,nctx,maxctx,eos)<0) eof=1;
         }
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
         DecodeRow rows[512]; int slots[512], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){
-            rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
+            ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i]; GrDraft *gd=&grd[i];
+            /* grammar-forced drafts (greedy requests only: verification under sampling
+             * needs rejection resampling, out of scope here). The slot leaves the shared
+             * batch for one forward and runs the single-sequence verify path. */
+            int draft[49], k=0;
+            if(gd->on && r->temp==0) k=grammar_draft(gd,draft,gd->max);
+            if(k>0 && sc->len+1+k<maxctx-1){
+                if(sc->len+1+k>=(int)sc->kv.max_t) k=(int)sc->kv.max_t-sc->len-2;
+                if(k<1){ rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i; continue; }
+                kv_bind(m,&sc->kv);
+                int seq[50]; seq[0]=r->pending;
+                memcpy(seq+1,draft,(size_t)k*sizeof(int));
+                float *lo=step_all(m,seq,1+k,sc->len); m->n_fw++;
+                gd->prop+=(uint64_t)k;
+                int done=0;
+                for(int j=0;j<=k && !done;j++){
+                    g_temp=r->temp; g_nuc=r->top_p;
+                    int next=pick_tok(lo+(int64_t)j*m->c.vocab,m->c.vocab,-1);
+                    sc->len++;                       /* seq[j] joins the committed history */
+                    if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
+                    r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+                    if(gd->on) gr_feed(gd,next);
+                    mux_data(&T,r->id,next);
+                    if(r->emitted>=r->maximum){ mux_done(m,sc,r); done=1; break; }
+                    if(j<k){
+                        if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
+                        gd->acc++;
+                    }
+                }
+                free(lo);
+                continue;                            /* handled outside the shared batch */
+            }
+            rows[S]=(DecodeRow){&sc->kv,r->pending,sc->len}; slots[S++]=i;
         }
+        if(S==0) continue;               /* every active slot drafted this round */
         double tf0=g_prof?now_s():0;
         float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
         m->n_fw++;
@@ -5096,13 +5163,15 @@ static void run_serve_mux(Model *m, const char *snap){
             int next=pick_tok(lo+(int64_t)s*m->c.vocab,m->c.vocab,-1);
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next);
             if(r->emitted>=r->maximum) mux_done(m,sc,r);
         }
         free(lo);
     }
     usage_save(m);
-    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
+    for(int i=0;i<nctx;i++){ serve_ctx_free(m,&ctx[i]); grammar_teardown(&grd[i]); }
+    free(ctx); free(req); free(grd);
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
@@ -5126,7 +5195,7 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
+    grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
@@ -5245,7 +5314,7 @@ static void run_serve(Model *m, const char *snap){
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
-        grammar_reset();                         /* nuova risposta = nuovo documento (MORE invece continua) */
+        grammar_reset(&g_grd);                         /* nuova risposta = nuovo documento (MORE invece continua) */
         if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
