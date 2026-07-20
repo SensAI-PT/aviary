@@ -70,6 +70,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCud
 
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
+/* Async issue/take split of the group call below (Inc.4): issue launches on the
+ * device stream and returns; take syncs and returns the pinned result rows (valid
+ * until the next issue on that device). Small totals only (<=8 rows); one
+ * outstanding issue per device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+                               ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs,
+                               const int *rows, int count, const float *x);
+COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs,

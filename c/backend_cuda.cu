@@ -40,6 +40,7 @@ typedef struct {
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
+    int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
 } DeviceContext;
 
 typedef struct {
@@ -837,6 +838,74 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
     return 1;
+}
+
+/* ---- Async expert group (Inc.4): issue/take split of coli_cuda_expert_group ----
+ * The measured cost of the sync call at decode is ~0.45 ms/call of HOST-side wait
+ * (stream sync + staging), vs ~0.18 ms of actual GPU work — 70% tax, paid ~5x per
+ * layer because a token's 8 experts scatter across devices. issue() stages and
+ * launches on the device stream and returns immediately; take() syncs and hands
+ * back the pinned result rows. One issue may be outstanding per device; moe()
+ * takes at each layer end, which also orders the next layer's reuse of the ctx
+ * scratch buffers. Small batches only (decode/spec): bigger totals keep the sync
+ * path with its TC variants. Numerics are the sync path's small-batch kernels,
+ * so greedy output is byte-identical by construction. */
+extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+                                              ColiCudaTensor *const *ups,
+                                              ColiCudaTensor *const *downs,
+                                              const int *rows, int count,
+                                              const float *x) {
+    if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
+    ColiCudaTensor *first=gates[0];
+    if (!first) return 0;
+    int device=first->device,D=first->I,I=first->O,total=0;
+    GroupDesc host[64];
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
+        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
+                 g->fmt,u->fmt,d->fmt,rows[c],total};
+        total+=rows[c];
+    }
+    if(total>8) return 0;                       /* decode-scale only */
+    DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
+    size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                "expert group issue upload")) return 0;
+    for(int c=0;c<count;c++){
+        int r=rows[c];
+        float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
+        float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
+        quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
+            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
+        quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
+            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
+        silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
+        quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
+            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                "expert group issue download")) return 0;
+    ctx->group_pending=1; ctx->group_pending_bytes=xb;
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+    return 1;
+}
+
+extern "C" const float *coli_cuda_expert_group_take(int device) {
+    DeviceContext *ctx=find_ctx(device);
+    if(!ctx||!ctx->group_pending) return nullptr;
+    ctx->group_pending=0;
+    if(!select_ctx(ctx)) return nullptr;
+    if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group take")) return nullptr;
+    return ctx->host_y;
 }
 
 
