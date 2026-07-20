@@ -344,6 +344,23 @@ static int run_rtop8(int mode, int S, int E, float topp, int normk, float rscale
 // kv_b is deliberately left fmt=2: it never flows through bind_gemv (a_qabs/a_ctx
 // dequantize it with a per-row-only helper) -- a fmt=4 kv_b is out of scope for this
 // stage (see PR_BODY.md UNCERTAINTIES).
+//
+// Two blind spots closed here (review round 1 -- see PR_BODY.md sec 10):
+//  (a) pos_base must be >0 for any S=1 case. At pos_base=0, T=pos_base+S=1: softmax
+//      over a SINGLE key is identically 1.0 regardless of the score's value, so the
+//      final output is provably independent of q_a's kernel output entirely -- an S=1
+//      pos=0 case cannot catch ANY defect in q_a, not just scale bugs. Every S=1 call
+//      below now uses pos_base>0 (mirroring run_attn's own S=1 pos=37 case, which exists
+//      for the same reason on the non-grouped kernels).
+//  (b) RMSNorm(c*v) == RMSNorm(v) for any positive scalar c -- it divides out any
+//      UNIFORM rescale of its input before qb/RoPE/attention ever see it. So even with
+//      T>1, a whole-tensor scale-calibration bug in q_a's grouped-int4 kernel (every
+//      group's scale off by the same factor) would be invisible in `got`/`ref` below no
+//      matter how the rest of the pipeline is shaped -- fixing (a) alone does not fix
+//      this. Closed by comparing q_a's RAW GEMV output (before RMSNorm swallows it)
+//      directly against the CPU oracle, via the standalone coli_metal_matmul entry point
+//      on the EXACT weight/scale/x data this attention test generated (not a re-run of
+//      run_grouped()'s own separate random data) -- see the qraw block below.
 static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
   const float eps=1e-5f, theta=10000.f, ascale=1.f/16.f;
   srand(5150+S+pos_base+gs);
@@ -359,9 +376,24 @@ static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
   std::vector<float> Lr((size_t)T*TKVL), Rr((size_t)T*TROPE);
   memcpy(Lr.data(),Lc,(size_t)pos_base*TKVL*4); memcpy(Rr.data(),Rc,(size_t)pos_base*TROPE*4);
   std::vector<float> Q((size_t)S*THH*TQH), ref((size_t)S*TH);
+  ColiMetalTensor *traw=nullptr;         // persistent handle for the raw-qa GPU probe (blind spot (b))
+  double qraw_worst=0; int qraw_bad=0;
   for(int s=0;s<S;s++){ int pos=pos_base+s;
     std::vector<float> qr(TQL), comp(TKVL+TROPE);
-    t_gemv4g(qr.data(),&x[(size_t)s*TH],qa.w,qa.s,TQL,TH,gs); t_rms(qr.data(),qr.data(),qaln.data(),TQL,eps);   // <- grouped
+    t_gemv4g(qr.data(),&x[(size_t)s*TH],qa.w,qa.s,TQL,TH,gs);                          // <- grouped, RAW (pre-RMSNorm)
+    { // Blind spot (b): compare this RAW q_a output against the CPU oracle BEFORE
+      // t_rms below overwrites qr in place -- RMSNorm is what makes the post-norm
+      // comparison blind to a uniform scale error, so the check has to happen here,
+      // not on `got`/`ref`. Same magnitude-relative construction as run_grouped().
+      std::vector<double> qrd(TQL), qrmag(TQL);
+      cpu_ref_grouped(qa.w,qa.s,&x[(size_t)s*TH],qrd.data(),qrmag.data(),1,TH,TQL,gs);
+      std::vector<float> qraw(TQL);
+      int qok=coli_metal_matmul(&traw,qraw.data(),&x[(size_t)s*TH],qa.w,qa.s,4,1,TH,TQL,gs);
+      if(!qok) qraw_bad++;
+      for(int i=0;i<TQL;i++){ double d=fabs((double)qraw[i]-qrd[i]); double rel=qrmag[i]>1e-30?d/qrmag[i]:d;
+        if(rel>qraw_worst) qraw_worst=rel; if(rel>1e-4) qraw_bad++; }
+    }
+    t_rms(qr.data(),qr.data(),qaln.data(),TQL,eps);   // <- grouped
     t_gemv4(&Q[(size_t)s*THH*TQH],qr.data(),qb.w,qb.s,THH*TQH,TQL);
     for(int h=0;h<THH;h++) t_rope(&Q[(size_t)s*THH*TQH+(size_t)h*TQH+TNOPE],pos,theta);
     t_gemv4(comp.data(),&x[(size_t)s*TH],kva.w,kva.s,TKVL+TROPE,TH);
@@ -395,8 +427,9 @@ static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
     for(int i=0;i<TKVL;i++) mc=fmax(mc,fabs(Lc[(size_t)pos*TKVL+i]-Lr[(size_t)pos*TKVL+i]));
     for(int i=0;i<TROPE;i++) mc=fmax(mc,fabs(Rc[(size_t)pos*TROPE+i]-Rr[(size_t)pos*TROPE+i])); }
   double nerr=ma/(ym+1e-9);
-  int pass = ok && nerr<2e-4 && mc<1e-4;
-  printf("  %-24s nerr=%.2e cache=%.2e  %s\n", name, nerr, mc, pass?"ok":"*** MISMATCH");
+  int pass = ok && nerr<2e-4 && mc<1e-4 && qraw_bad==0;
+  printf("  %-24s nerr=%.2e cache=%.2e qraw=%.2e  %s\n", name, nerr, mc, qraw_worst, pass?"ok":"*** MISMATCH");
+  coli_metal_tensor_free(traw);
   auto freew=[&](TW&t){ coli_metal_unregister(t.w); coli_metal_unregister(t.s); free(t.w); free(t.s); };
   freew(qa); freew(qb); freew(kva); freew(kvb); freew(o);
   coli_metal_unregister(Lc); coli_metal_unregister(Rc); free(Lc); free(Rc);
@@ -477,7 +510,10 @@ int main(void) {
   fail |= run_attn(4, 12,  "attn S=4 pos=12 (MTP)");
   fail |= run_attn(3, 0,   "attn S=3 pos=0");
   printf("Metal fused attention tests (fmt=4 grouped q_a, proves bind_gemv gs plumbing):\n");
-  fail |= run_attn_grouped(1, 0,  64, "attn grouped-qa S=1 pos=0");
+  // pos_base=37 (not 0): at T=1 softmax is identically 1.0 regardless of q_a's output,
+  // so an S=1 pos=0 case cannot catch ANY q_a defect (review round 1, auditor -- see
+  // PR_BODY.md sec 10). Both cases also carry the raw pre-RMSNorm qraw check internally.
+  fail |= run_attn_grouped(1, 37, 64, "attn grouped-qa S=1 pos=37");
   fail |= run_attn_grouped(4, 12, 64, "attn grouped-qa S=4 pos=12 (MTP)");
   printf("Metal negative control: fmt 1/2/3 unaffected by the fmt=4 shader branch --\n"
          "  see the runs above (int8/int4/int2/f32/moe/gemm/attn cases): all still ok.\n");
