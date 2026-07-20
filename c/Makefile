@@ -56,10 +56,15 @@ OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
-# which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
+# which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+# For older X86_64 Macs (for example, Mac Pro 2019) we need to use -march
 ifneq ($(ARCH),)
+ifneq (,$(X86_64))
+CFLAGS += -march=$(ARCH)
+else
 CFLAGS += -mcpu=$(ARCH)
+endif
 endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
@@ -70,7 +75,7 @@ else ifneq ($(IS_WIN),)
 # ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
 # machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
 # it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
-# which the x86-64-v3 baseline does not define. The #ifdef guards in glm.c mean
+# which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
@@ -166,7 +171,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_pipe_block$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -207,17 +212,18 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE)
+all: colibri$(EXE)
 
-# phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
-glm: glm$(EXE)
+# phony targets — 'glm' kept for backward compatibility
+colibri: colibri$(EXE)
+glm: colibri$(EXE)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
-# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
-# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
-# worked but isn't. We record the build-affecting flags in .build-config and rewrite
-# it ONLY when they change (evaluated here at parse time, so the file's timestamp
-# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# `make colibri.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date"
+# and silently keeps the CPU-only binary (no CUDA loader) — a build that looks like
+# it worked but isn't. We record the build-affecting flags in .build-config and
+# rewrite it ONLY when they change (evaluated here at parse time, so the file's
+# timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
 BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
@@ -226,8 +232,8 @@ $(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
 endif
 .build-config: ;
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -272,8 +278,9 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+# Intel Macs need -march for vector instructions
 ifneq (,$(DARWIN))
-PORTABLE_ARCH =
+PORTABLE_ARCH = $(if $(X86_64),x86-64-v3,)
 else ifneq (,$(AARCH64))
 PORTABLE_ARCH = armv8-a
 else ifneq (,$(PPC64))
@@ -285,13 +292,18 @@ PORTABLE_ARCH = native
 endif
 
 portable:
-	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
+	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
+	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -308,16 +320,30 @@ tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h j
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
+# gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
@@ -326,7 +352,15 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
+# NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_pipe_block$(EXE): tests/test_pipe_block.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
@@ -340,18 +374,41 @@ test-python:
 
 test: test-c test-python
 
+# --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
+# The tiny-model assertions live in test_inefficiency.py and run as part of
+# test-python (they're discovered by the test_*.py glob). These targets are
+# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+#
+#   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
+#   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
+#   make efficiency-report opt-in full-model 🟢/🔴 diagnostic, never fails CI
+#
+# CUDA build (Windows): the CUDA tests need a host built with -DCOLI_CUDA plus
+# the runtime DLL. Do this FIRST — note CUDA_DLL=1 on BOTH the host and the
+# rule below, or `make glm.exe` will rebuild a CPU-only host and overwrite it:
+#   make clean && make glm.exe CUDA_DLL=1 && make cuda-dll
+# The tests auto-skip with a clear message if the host is CPU-only.
+efficiency: test-python
+	$(PYTHON) -m unittest tests.test_inefficiency -v
+
+efficiency-cuda:
+	$(PYTHON) -m unittest tests.test_inefficiency.TinyCudaEfficiencyTest -v
+
+efficiency-report:
+	$(PYTHON) tests/test_efficiency_report.py
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
-	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
+	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
@@ -365,4 +422,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
