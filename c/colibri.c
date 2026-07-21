@@ -2038,6 +2038,9 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        axpy_i4f_avx512(w,c,acc,I); return;   /* bit-identical: one fma per element */
+#endif
         for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
     const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
@@ -2058,6 +2061,10 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            /* same accumulation-order tradeoff (and gate) as matmul_i4's I4_ACC512 path */
+            if(g_i4_acc512 && !(I&31)){ y[j]=dot_i4f_avx512(w,x,I)*s; continue; }
+#endif
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
         else if(t->fmt==4){ /* per-gruppo, come matmul_i4_grouped / per-group, as matmul_i4_grouped */
