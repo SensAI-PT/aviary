@@ -121,6 +121,12 @@ class TestIq3Pack(unittest.TestCase):
         self.assertTrue(np.allclose(wr @ xr, w @ x, rtol=1e-4, atol=1e-5),
                         f"max |Δ| = {np.abs(wr @ xr - w @ x).max()}")
 
+    def test_unrotate_inverts_rotate(self):
+        w = (np.random.randn(4, 768) * 0.05).astype(np.float32)
+        back = P.unrotate_rows(P.rotate_rows(w))
+        self.assertTrue(np.allclose(back, w, rtol=1e-5, atol=1e-7),
+                        f"max |Δ| = {np.abs(back - w).max()}")
+
 
 if __name__ == "__main__":
     unittest.main()

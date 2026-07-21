@@ -210,6 +210,19 @@ def rot_blocks(dim):
     return out
 
 
+def _fwht_rows(blk, b):
+    """In-place-style FWHT over rows of [..., b] (b a power of two)."""
+    h = 1
+    while h < b:
+        blk = blk.reshape(-1, b // (2 * h), 2, h)
+        u, v = blk[:, :, 0, :].copy(), blk[:, :, 1, :].copy()
+        blk[:, :, 0, :] = u + v
+        blk[:, :, 1, :] = u - v
+        blk = blk.reshape(-1, b)
+        h <<= 1
+    return blk / np.sqrt(b, dtype=np.float32)
+
+
 def rotate_rows(x):
     """Apply the rotation to rows of float32 [..., dim] (weights W@Q or
     activations Q^T x — the transform is the same). Returns a new array."""
@@ -218,15 +231,19 @@ def rotate_rows(x):
     rows = x.reshape(-1, dim).copy()
     off = 0
     for b in rot_blocks(dim):
-        blk = rows[:, off:off + b] * signs(b)[None, :]
-        h = 1
-        while h < b:                     # in-place FWHT, vectorized over rows
-            blk = blk.reshape(-1, b // (2 * h), 2, h)
-            u, v = blk[:, :, 0, :].copy(), blk[:, :, 1, :].copy()
-            blk[:, :, 0, :] = u + v
-            blk[:, :, 1, :] = u - v
-            blk = blk.reshape(-1, b)
-            h <<= 1
-        rows[:, off:off + b] = blk / np.sqrt(b, dtype=np.float32)
+        rows[:, off:off + b] = _fwht_rows(rows[:, off:off + b] * signs(b)[None, :], b)
+        off += b
+    return rows.reshape(x.shape)
+
+
+def unrotate_rows(x):
+    """Inverse of rotate_rows (Q v back to v): FWHT first, then the sign flip.
+    Eval-side only — the engine always works in the rotated space."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    dim = x.shape[-1]
+    rows = x.reshape(-1, dim).copy()
+    off = 0
+    for b in rot_blocks(dim):
+        rows[:, off:off + b] = _fwht_rows(rows[:, off:off + b].copy(), b) * signs(b)[None, :]
         off += b
     return rows.reshape(x.shape)
