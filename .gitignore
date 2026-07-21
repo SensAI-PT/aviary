@@ -25,18 +25,11 @@ c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
-c/tests/test_json
-c/tests/test_json.exe
-c/tests/test_st
-c/tests/test_st.exe
-c/tests/test_tier
-c/tests/test_tier.exe
-c/tests/test_grammar
-c/tests/test_grammar.exe
-c/tests/test_schema_gbnf
-c/tests/test_schema_gbnf.exe
-c/tests/test_compat_direct
-c/tests/test_compat_direct.exe
+c/tests/test_*
+!c/tests/test_*.c
+!c/tests/test_*.cu
+!c/tests/test_*.mm
+!c/tests/test_*.py
 result
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
