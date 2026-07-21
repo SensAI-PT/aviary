@@ -41,9 +41,12 @@
 #define cudaStreamNonBlocking    hipStreamNonBlocking
 #define cudaStreamDestroy        hipStreamDestroy
 #define cudaStreamSynchronize    hipStreamSynchronize
+#define cudaStreamWaitEvent      hipStreamWaitEvent
 #define cudaDeviceSynchronize    hipDeviceSynchronize
 #define cudaEvent_t              hipEvent_t
 #define cudaEventCreate          hipEventCreate
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDisableTiming   hipEventDisableTiming
 #define cudaEventDestroy         hipEventDestroy
 #define cudaEventRecord          hipEventRecord
 #define cudaEventSynchronize     hipEventSynchronize
@@ -52,6 +55,7 @@
 #define cudaFreeHost             hipHostFree
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer
+#define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
 #else
 #include <cuda_runtime.h>
