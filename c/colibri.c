@@ -2530,7 +2530,26 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
-                float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+                /* MLA-absorb score: dot(qabs, Lt) + dot(qr, kr). #442: the qabs·Lt
+                 * reduction is the hot f32 dot at this site (kvl=512 on GLM-5.2,
+                 * runs nt times per (s,h), grows with context). SIMD-ify under
+                 * AVX2 (8-lane fmadd + hsum256, same shape as matmul_q in quant.h)
+                 * and NEON, with a scalar tail for the remainder. Reassociation
+                 * is accepted here — softmax downstream softens the rounding flip. */
+                float a=0; int i=0;
+#if defined(__AVX2__)
+                __m256 acc=_mm256_setzero_ps();
+                for(;i+8<=kvl;i+=8)
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i), acc);
+                a=hsum256(acc);
+#elif defined(__ARM_NEON)
+                float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+                for(;i+8<=kvl;i+=8){
+                    ac0=vfmaq_f32(ac0, vld1q_f32(qabs+i),   vld1q_f32(Lt+i));
+                    ac1=vfmaq_f32(ac1, vld1q_f32(qabs+i+4), vld1q_f32(Lt+i+4)); }
+                a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+                for(;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
                 sc[jj]=a*c->attn_scale;
             }
@@ -2538,7 +2557,25 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float clat[512]; memset(clat,0,kvl*sizeof(float));
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
-                float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
+                /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
+                 * #442: SIMD-ified — each lane writes back independently so there
+                 * is no reassociation here (strictly bit-identical to scalar). */
+                float a=sc[jj]; int i=0;
+#if defined(__AVX2__)
+                __m256 va=_mm256_set1_ps(a);
+                for(;i+8<=kvl;i+=8){
+                    __m256 cl=_mm256_loadu_ps(clat+i), lt=_mm256_loadu_ps(Lt+i);
+                    _mm256_storeu_ps(clat+i, _mm256_fmadd_ps(va, lt, cl));
+                }
+#elif defined(__ARM_NEON)
+                float32x4_t va=vdupq_n_f32(a);
+                for(;i+8<=kvl;i+=8){
+                    vst1q_f32(clat+i,   vfmaq_f32(vld1q_f32(clat+i),   va, vld1q_f32(Lt+i)));
+                    vst1q_f32(clat+i+4, vfmaq_f32(vld1q_f32(clat+i+4), va, vld1q_f32(Lt+i+4)));
+                }
+#endif
+                for(;i<kvl;i++) clat[i]+=a*Lt[i];
+            }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         }
