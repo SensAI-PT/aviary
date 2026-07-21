@@ -59,6 +59,24 @@ static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
+/* acc[0..I) += coef * dequant(int4 row) — the axpy twin of dot_i4f_avx512, for the
+ * MLA absorption path (qt_addrow). Each acc[i] receives exactly ONE fma per call
+ * (no cross-element accumulation), so this is bit-identical to the scalar loop
+ * (gcc -O3 -ffp-contract already emits scalar fma there). Tail handled scalar. */
+static inline void axpy_i4f_avx512(const uint8_t *w,float coef,float *acc,int I){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    const __m512 cv=_mm512_set1_ps(coef); int i=0;
+    for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+        _mm512_storeu_ps(acc+i,   _mm512_fmadd_ps(cv,w0,_mm512_loadu_ps(acc+i)));
+        _mm512_storeu_ps(acc+i+16,_mm512_fmadd_ps(cv,w1,_mm512_loadu_ps(acc+i+16)));
+    }
+    for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=coef*(float)((int)(b&0xF)-8); acc[i+1]+=coef*(float)((int)(b>>4)-8); }
+    if(i<I){ uint8_t b=w[i>>1]; acc[i]+=coef*(float)((int)(b&0xF)-8); }
+}
 static int i4_acc512_selftest(void){
     enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
     for(int i=0;i<N;i++){
