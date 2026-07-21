@@ -930,7 +930,8 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total};
+                 g->fmt,u->fmt,d->fmt,rows[c],total,
+                 g->gs,u->gs,d->gs};
         total+=rows[c];
     }
     if(total>8) return 0;                       /* decode-scale only */
@@ -1384,7 +1385,8 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
         if(!g||!u||!d||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,1,total};
+                 g->fmt,u->fmt,d->fmt,1,total,
+                 g->gs,u->gs,d->gs};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         total++;
     }
