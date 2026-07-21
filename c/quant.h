@@ -360,6 +360,18 @@ static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S
 #else
 static int g_i4s=2;
 #endif
+static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
+                       * region across all experts of the batch-union block instead of ~2
+                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
+                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
+                       * byte-identical to that family (same dot_i4i8 per row, same silu,
+                       * same requant, same accumulation order into out). Measured on a
+                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
+                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
+                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
+                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
+                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * opt-in; measure on your host. */
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }

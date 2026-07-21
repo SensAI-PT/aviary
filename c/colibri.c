@@ -3163,7 +3163,74 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
         }
 #endif
-        if(!metal_done)
+        /* ---- XEXP=1: one parallel region across ALL experts of the block (S==1, all
+         * resident, all int4, IDOT S=1 family active). The default path opens ~2 OpenMP
+         * regions per expert (16/layer at topk=8) and each worker touches only ~200 KB
+         * per region; on wide multi-socket hosts the fork/join cadence and short streams
+         * cap the expert loop well below DRAM bandwidth. Here: phase 1 computes gate+up
+         * row-chunks (dot_i4i8 per row, same function as matmul_i4_idot S=1) and applies
+         * silu*up on the chunk; a per-expert pass requantizes the intermediate; phase 2
+         * computes down-projection row-chunks. One region, two internal barriers, per
+         * block. Byte-identical to the stock g_i4s<=1 + COLI_NO_FUSED_PAIR path (verified
+         * on GLM-5.2 int4: identical 256-token greedy output, and on the int4 tiny
+         * oracle). Gated off the speculation window like every S-dependent kernel switch. */
+        int xexp_done=0;
+        if(g_xexp && !metal_done && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
+#ifdef COLI_CUDA
+           && !g_cuda_enabled
+#endif
+          ){
+            int allq4=1;
+            for(int j=0;j<nb;j++){ ESlot *e=use[j];
+                if(e->g.fmt!=2||e->u.fmt!=2||e->d.fmt!=2||e->g.I!=D||e->g.O!=I||e->d.I!=I||e->d.O!=D){ allq4=0; break; } }
+            if(allq4){
+                double t0=now_s();
+                float wj[64]; int okw=1;
+                for(int j=0;j<nb;j++){ int eid=uniq[base+j]; wj[j]=0; int f=0;
+                    for(int kk=0;kk<keff[0];kk++) if(idxs[kk]==eid){ wj[j]=ws[kk]; f=1; break; }
+                    if(!f) okw=0; }
+                if(okw){
+                    int rbD=(D+1)/2, rbI=(I+1)/2;
+                    int8_t *xq8=malloc((size_t)D + (size_t)nb*I);
+                    float *GG=falloc((int64_t)nb*I), *UU=falloc((int64_t)nb*I), *HH=falloc((int64_t)nb*D);
+                    float gsc[64];
+                    if(!xq8){ fprintf(stderr,"OOM xexp scratch\n"); exit(1); }
+                    int8_t *GQ=xq8+D;
+                    float sx0=qrow_i8(x, xq8, D);
+                    const int C1=12, C2=12;           /* chunks per expert per phase */
+                    int r1=(I+C1-1)/C1, r2=(D+C2-1)/C2;
+                    #pragma omp parallel
+                    {
+                        #pragma omp for schedule(dynamic,1)
+                        for(int it=0; it<nb*C1; it++){ int j=it/C1, c0=(it%C1)*r1;
+                            int c1=c0+r1<I?c0+r1:I; ESlot *e=use[j];
+                            const uint8_t *qg=e->g.q4, *qu=e->u.q4;
+                            float *gj=GG+(int64_t)j*I, *uj=UU+(int64_t)j*I;
+                            for(int o=c0;o<c1;o++) gj[o]=(float)dot_i4i8(qg+(int64_t)o*rbD,xq8,D)*e->g.s[o]*sx0;
+                            for(int o=c0;o<c1;o++) uj[o]=(float)dot_i4i8(qu+(int64_t)o*rbD,xq8,D)*e->u.s[o]*sx0;
+                            for(int o=c0;o<c1;o++) gj[o]=siluf(gj[o])*uj[o];
+                        }                              /* implicit barrier */
+                        #pragma omp for schedule(static)
+                        for(int j=0;j<nb;j++) gsc[j]=qrow_i8(GG+(int64_t)j*I, GQ+(int64_t)j*I, I);
+                        #pragma omp for schedule(dynamic,1)
+                        for(int it=0; it<nb*C2; it++){ int j=it/C2, c0=(it%C2)*r2;
+                            int c1=c0+r2<D?c0+r2:D; ESlot *e=use[j];
+                            const uint8_t *qd=e->d.q4; const int8_t *gq=GQ+(int64_t)j*I;
+                            float *hj=HH+(int64_t)j*D;
+                            for(int o=c0;o<c1;o++) hj[o]=(float)dot_i4i8(qd+(int64_t)o*rbI,gq,I)*e->d.s[o]*gsc[j];
+                        }
+                    }
+                    for(int j=0;j<nb;j++){ float w=wj[j], *hj=HH+(int64_t)j*D;
+                        for(int d=0;d<D;d++) out[d]+=w*hj[d]; }
+                    double dt=now_s()-t0; m->t_emm+=dt;
+                    if(g_prof){ m->t_ecpu+=dt; m->cpu_expert_rows+=(uint64_t)nb;
+                        for(int j=0;j<nb;j++) m->cpu_expert_bytes+=qt_bytes(&use[j]->g)+qt_bytes(&use[j]->u)+qt_bytes(&use[j]->d); }
+                    free(xq8); free(GG); free(UU); free(HH);
+                    xexp_done=1;
+                }
+            }
+        }
+        if(!metal_done && !xexp_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
 #ifdef COLI_CUDA
             if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
@@ -6254,6 +6321,7 @@ int main(int argc, char **argv){
      * EN: matmul_qt documents the int4 IDOT threshold as "configurable via I4S", but the
      * getenv was missing, so the knob did nothing. I4S=<n> -> int4 IDOT only for S>=n. */
     if(getenv("I4S")) g_i4s=atoi(getenv("I4S"));
+    if(getenv("XEXP")) g_xexp=atoi(getenv("XEXP"))!=0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
