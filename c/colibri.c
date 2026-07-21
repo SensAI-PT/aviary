@@ -6171,12 +6171,19 @@ int main(int argc, char **argv){
          * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
          * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
          * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
+        /* CPU_SETSIZE is only exposed when _GNU_SOURCE was defined before the first
+         * system header. The standalone engine build defines it at the top of this
+         * file so the reset is active where it matters; test TUs that #include this
+         * file after <assert.h>/<math.h> get it too late, so guard for them (a test
+         * never re-execs — skipping the reset there is harmless). */
+#ifdef CPU_SETSIZE
         { cpu_set_t all; CPU_ZERO(&all);
           long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
           if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
           for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
           if(sched_setaffinity(0, sizeof(all), &all) != 0)
               perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+#endif
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
