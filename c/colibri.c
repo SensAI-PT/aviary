@@ -4776,7 +4776,17 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                                KVState *const *kvs, const int *positions, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
-        for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
+        for(int z=0;z<m->enr[li];z++){
+            int pe=m->eroute[li][z];
+#ifdef COLI_VULKAN
+            /* VK-tier-served experts never need host bytes at decode — their pages are
+             * never demand-read, so on a RAM-tight box this WILLNEED would re-fetch the
+             * same hot experts from disk every time cache pressure evicts them (#523).
+             * S>4 = prefill batches, where the tier doesn't serve and the hint stays. */
+            if(S<=4 && vk_reg_served(li,pe)) continue;
+#endif
+            expert_prefetch(m,li,pe);
+        }
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
 #ifdef COLI_METAL
     /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
