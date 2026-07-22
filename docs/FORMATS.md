@@ -203,6 +203,80 @@ reference implementation of this proposal:
   documentation for the exact rule, including the cases where even a
   correct stamp still can't resolve one (the UE8M0 corners above).
 
+### Non-retroactivity
+
+The stamp is a **forward convention**, not a migration path. It describes
+containers written *going forward* by a tool that has been updated to write
+`__metadata__["colibri.fmt"]` — it says nothing about, and does nothing to,
+containers that already exist. A pre-convention container (anything written
+before this feature existed — including every container this repo's own
+tooling has produced to date, and every upstream Z.ai/DeepSeek checkpoint)
+is simply **unstamped**: `st_fmt_stamp` returns `NULL` for every tensor in
+it, `qt_verify_fmt_stamp` is a no-op, and `qt_resolve_fmt` resolves it by
+byte arithmetic alone, exactly as it did before this PR. There is no
+in-place upgrade path, no "adopt the stamp on an existing container"
+tooling, and none is implied by anything in this document — the only way a
+container gains a stamp is to be produced (or re-produced) by a tool that
+writes one. An absent stamp is therefore never itself a signal that
+anything is wrong with a container; it is the default, expected state for
+everything that predates this convention (which, as of this PR, is
+everything).
+
+### Stamp-map scan bound
+
+`st_fmt_stamp_ingest` (`c/st.h`) caps the total number of stamped-tensor
+entries it will ingest across a container's shards at `ST_FMT_STAMP_MAX`
+(4096) and refuses loudly (`exit(1)`) if a container's combined
+`__metadata__["colibri.fmt"]` entries exceed it. This is a **cap, not a
+switch to a hash table**: stamps are a resident-tensor convention — a
+handful to a few hundred tensors per model (`q_a`/`q_b`/`kv_a`/`kv_b_proj`,
+`o_proj`, shared-expert and dense-MLP gate/up/down; see the resident-role
+census in `c/tools/fp8_collision_census.py`), **never** the tens of
+thousands of routed-expert tensors a large MoE checkpoint carries. A
+container whose combined stamp map exceeds 4096 entries is not using this
+convention as it's designed to be used — most plausibly a malformed or
+adversarial container trying to force an unbounded ingest allocation during
+header parsing, before any size/shape validation has even run. Refusing
+loudly at that bound is the same "untrusted container, refuse rather than
+guess" discipline `qt_resolve_fmt` applies everywhere else in this feature.
+
+### Discovery-time abort surface
+
+`st_fmt_stamp_ingest`'s `exit(1)` calls (a `colibri.fmt` value that isn't a
+JSON string, one that doesn't parse to a JSON object, an entry whose value
+isn't a string, or the 4096-entry cap above) all fire from inside
+`st_init_multi`'s shard-header-parse loop — i.e. at **container discovery
+time**, while the engine is still building its tensor index, before it has
+resolved a single tensor against the model's architecture or read one byte
+of weight data. This is a coarser-grained, EARLIER abort surface than
+`qt_resolve_fmt`/`qt_verify_fmt_stamp`'s own per-tensor refusals (which fire
+much later, once a *specific* tensor's `[O,I]` shape and stamp are both
+known during weight load): a malformed stamp anywhere in any shard aborts
+the *entire* model load immediately, before the user ever sees which layer
+or tensor was implicated. Operationally, a stamp-related `exit(1)` whose
+message names a *file* (shard path) rather than a *tensor* is this
+discovery-time surface; one that names a tensor is the later, per-tensor
+one.
+
+### Scope: `.qs`-backed tensors only
+
+The stamp lookup (`st_fmt_stamp`, called from `qt_from_disk`) is consulted
+**only** inside `qt_from_disk`'s `st_has(&m->S, name+".qs")` branch — i.e.
+only for a tensor that already carries a quantized `.qs` scale sidecar. A
+`colibri.fmt` entry naming some *other* tensor (a raw f32/bf16 weight, a
+norm, a router, embed/lm_head) is parsed and stored exactly like any other
+entry — `st_fmt_stamp_ingest` has no way to know, and does not check,
+whether the name it's ingesting belongs to a `.qs`-backed tensor — but it is
+then **silently ignored by design**: `qt_from_disk`'s plain f32/bf16 read
+path never calls `st_fmt_stamp` for it, so nothing ever consults that entry.
+This is intentional, not an oversight this document is patching over: the
+whole point of the stamp is to disambiguate a *byte-count* collision among
+quantized formats, and only a `.qs`-backed tensor can have one — stamping
+anything else has no failure mode to guard against, so the convention simply
+doesn't extend its verification there. A future stamping tool that writes
+`colibri.fmt` entries for non-`.qs` tensors would not break anything, but
+those entries would have no effect.
+
 This is offered as a **reference implementation**, not a mandate: a future
 public format registry could standardize the metadata key and stamp shape
 (`colibri.fmt` and its JSON-map-of-name convention are this PR's proposal,

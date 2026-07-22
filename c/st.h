@@ -239,6 +239,18 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
+/* Stamps are a resident-tensor convention (see docs/FORMATS.md's "Stamp-map
+ * scan bound"): a handful to a few hundred entries per model
+ * (q_a/q_b/kv_a/kv_b_proj, o_proj, shared-expert and dense-MLP gate/up/down),
+ * NEVER the tens of thousands of routed-expert tensors a large MoE model
+ * carries (tools/repack_fp8_passthrough.py never stamps routed experts). A
+ * container whose combined __metadata__["colibri.fmt"] entries exceed this
+ * cap is not using the convention as designed -- CAP, not a switch to a hash
+ * table: refuse loudly rather than grow an unbounded array for an untrusted
+ * container that might be trying to force a large ingest allocation during
+ * header parsing, before any other validation has run. */
+#define ST_FMT_STAMP_MAX 4096
+
 /* Parses one shard's __metadata__["colibri.fmt"] value (a safetensors metadata
  * value is always a plain string, so colibri.fmt's VALUE is itself JSON text --
  * a flat {tensor_name: format_name} object -- parsed a second time here) and
@@ -250,7 +262,22 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
  * loudly -- same "untrusted container" discipline qt_resolve_fmt applies
  * elsewhere: a stamp the engine cannot make sense of must not be silently
  * ignored (that would be indistinguishable from a real mismatch going
- * unnoticed). */
+ * unnoticed).
+ *
+ * DISCOVERY-TIME ABORT SURFACE: every exit(1) below (malformed stamp value,
+ * malformed entry, or the ST_FMT_STAMP_MAX cap) fires from inside
+ * st_init_multi's shard-header-parse loop -- i.e. at CONTAINER DISCOVERY
+ * time, while the engine is still building its tensor index, before it has
+ * resolved a single tensor against the model's architecture or read one byte
+ * of weight data. This is coarser-grained and EARLIER than
+ * qt_resolve_fmt/qt_verify_fmt_stamp's own per-tensor refusals in colibri.c
+ * (which fire much later, during weight load, once a specific tensor's
+ * [O,I] shape and stamp are both known): a malformed stamp anywhere in any
+ * shard aborts the ENTIRE model load immediately, before the user ever sees
+ * which layer or tensor was implicated -- these messages name a shard FILE,
+ * never a tensor, which is how to tell this abort surface apart from the
+ * later per-tensor one at a glance. See docs/FORMATS.md's own section on
+ * this. */
 static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
     jval *meta = json_get(root, "__metadata__");
     if (!meta || meta->t != J_OBJ) return;                /* no metadata object: unstamped, fine */
@@ -269,6 +296,12 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         if (v->t != J_STR) {
             fprintf(stderr, "%s: colibri.fmt entry '%s' is not a string -- malformed stamp, refusing (untrusted container)\n",
                     shard_path, inner->keys[i]); exit(1); }
+        if (S->fmt_n >= ST_FMT_STAMP_MAX) {
+            fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
+                    "this container's shards -- stamps are a resident-tensor convention (docs/FORMATS.md), "
+                    "not a bulk migration path; a container stamping this many names is malformed, "
+                    "refusing (untrusted container)\n",
+                    shard_path, ST_FMT_STAMP_MAX); exit(1); }
         if (S->fmt_n == S->fmt_cap) {
             S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
             S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
@@ -286,7 +319,19 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
 /* Stamped format NAME for `name`, or NULL if this tensor carries no stamp
  * (either because no shard stamped it, or the container predates this
  * feature). Linear scan: S->fmt_n is a subset of S->n (only stamped tensors),
- * small in practice -- see the shards struct comment. */
+ * small in practice -- see the shards struct comment.
+ *
+ * SCOPE: .qs-BACKED TENSORS ONLY. This function itself will happily look up
+ * ANY name that got stamped -- st_fmt_stamp_ingest doesn't know or check
+ * whether a stamped name belongs to a quantized (.qs-backed) tensor -- but
+ * qt_from_disk (colibri.c) only ever CALLS this inside its `st_has(name+
+ * ".qs")` branch, i.e. only for a tensor that already carries a quantized
+ * scale sidecar. A colibri.fmt entry naming a raw f32/bf16 weight, a norm, a
+ * router, or embed/lm_head is stored here like any other entry but never
+ * looked up: it is silently ignored BY DESIGN, not an oversight -- the
+ * convention exists to disambiguate a byte-count collision among quantized
+ * formats, and only a .qs-backed tensor can have one. See docs/FORMATS.md's
+ * "Scope: .qs-backed tensors only". */
 static const char *st_fmt_stamp(shards *S, const char *name) {
     for (int i = 0; i < S->fmt_n; i++)
         if (!strcmp(S->fmt_name[i], name)) return S->fmt_val[i];

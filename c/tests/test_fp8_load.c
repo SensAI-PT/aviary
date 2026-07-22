@@ -959,6 +959,114 @@ static void test_stamp_absent(void){
     char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
 }
 
+/* ---- Stamp-map scan bound (maintainer review, #529): st_fmt_stamp_ingest
+ * (st.h) caps the number of stamped-tensor entries it will ingest across a
+ * container's shards at ST_FMT_STAMP_MAX and refuses (exit(1)) past it --
+ * see st.h's own comment and docs/FORMATS.md's "Stamp-map scan bound" for
+ * why (stamps are a resident-tensor convention, never a bulk migration path
+ * for the tens of thousands of routed-expert tensors a large MoE model
+ * carries). Writes a minimal ONE-tensor shard (the shard's actual tensor
+ * content is irrelevant to this check -- the cap fires during
+ * st_init_multi's header-parse loop, at CONTAINER DISCOVERY time, before any
+ * tensor is resolved against the model, see st_fmt_stamp_ingest's own
+ * "DISCOVERY-TIME ABORT SURFACE" comment) carrying an oversized
+ * __metadata__["colibri.fmt"] blob of N distinct, entirely fictitious tensor
+ * names -- st_fmt_stamp_ingest parses that blob independently of the
+ * shard's real tensor list, so the names never need to correspond to
+ * anything real for the cap to trigger. Tests BOTH sides of the boundary:
+ * exactly ST_FMT_STAMP_MAX entries must still load fine (no off-by-one
+ * false refusal), one more must refuse. */
+static void write_stamp_cap_fixture(const char *dir, int n_entries){
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir,0755);
+#endif
+    size_t inner_cap = (size_t)n_entries*40 + 64;
+    char *inner = malloc(inner_cap);
+    size_t p = 0; inner[p++]='{';
+    for(int i=0;i<n_entries;i++)
+        p += (size_t)snprintf(inner+p, inner_cap-p, "%s\"stamp_%d\":\"int8-row\"", i?",":"", i);
+    inner[p++]='}'; inner[p]=0;
+
+    /* JSON-escape `inner` into a quoted string literal for the OUTER header's
+     * colibri.fmt VALUE (double-JSON-encoding, same shape write_stamp_fixture's
+     * callers hand-escape for small fixtures -- built programmatically here
+     * since n_entries is too many to hand-escape). */
+    char *esc = malloc(p*2 + 4);
+    size_t q = 0; esc[q++]='"';
+    for(size_t i=0;i<p;i++){
+        char c = inner[i];
+        if(c=='"' || c=='\\') esc[q++]='\\';
+        esc[q++]=c;
+    }
+    esc[q++]='"'; esc[q]=0;
+    free(inner);
+
+    enum { O=1, I=1 };
+    static uint8_t q1[O*I]; static float s1[O];
+    q1[0]=1; s1[0]=0.01f;
+    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
+    int64_t nb=(int64_t)O*I, ns=(int64_t)O*4;
+    char *hdr = malloc(q + 512);
+    int hl = snprintf(hdr, q+512,
+        "{\"__metadata__\":{\"colibri.fmt\":%s},"
+        "\"w\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+        "\"w.qs\":{\"dtype\":\"F32\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+        esc,
+        (long long)nb,(long long)nb,
+        (long long)(ns/4),(long long)nb,(long long)(nb+ns));
+    free(esc);
+    FILE *f=fopen(path,"wb");
+    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; free(hdr); return; }
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f); fwrite(hdr,1,(size_t)hl,f);
+    fwrite(q1,1,(size_t)nb,f); fwrite(s1,1,(size_t)ns,f);
+    fclose(f);
+    free(hdr);
+}
+
+static void test_stamp_map_cap_boundary_ok(void){
+    const char *dir="tests/tmp_fp8_stamp_cap_ok";
+    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX);   /* exactly at the cap: must NOT refuse */
+    static Model gm; memset(&gm,0,sizeof gm);
+    st_init(&gm.S, dir);
+    CHECK(gm.S.fmt_n == ST_FMT_STAMP_MAX);
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
+static void test_stamp_map_cap_exceeded(void){
+    const char *dir="tests/tmp_fp8_stamp_cap_over";
+    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX+1);  /* one past the cap: must refuse */
+#ifndef _WIN32
+    int pipefd[2];
+    if(pipe(pipefd)==0){
+        pid_t pid = fork();
+        if(pid == 0){
+            dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
+            static Model gm; memset(&gm,0,sizeof gm);
+            st_init(&gm.S, dir);   /* must exit(1) inside st_fmt_stamp_ingest's cap check */
+            _exit(42);              /* reaching here is the bug */
+        } else if(pid > 0){
+            close(pipefd[1]);
+            char err[1024]={0}; ssize_t n=read(pipefd[0],err,sizeof(err)-1); (void)n;
+            close(pipefd[0]);
+            int status=0; waitpid(pid,&status,0);
+            int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
+            if(!ok) printf("FAIL stamp-map cap exceeded: expected exit(1), got status=%d, stderr=%.200s\n", status, err);
+            CHECK(ok);
+            if(ok && !strstr(err,"refus")){
+                printf("FAIL stamp-map cap exceeded: exited(1) but message lacked a refusal explanation: %.200s\n", err);
+                fails++;
+            }
+        } else fails++;
+    } else fails++;
+#else
+    printf("skipped on Windows (no fork): stamp-map cap exceeded\n");
+#endif
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
 int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
@@ -982,6 +1090,8 @@ int main(void){
     test_stamp_mismatching();
     test_stamp_unrecognized_name();
     test_stamp_absent();
+    test_stamp_map_cap_boundary_ok();
+    test_stamp_map_cap_exceeded();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;
