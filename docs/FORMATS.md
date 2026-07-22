@@ -27,12 +27,15 @@ discussion separate from the CPU+Metal implementation.
 
 ## Known formats
 
-Every row below is verified against branch `fmt7/stamp-registry` (base commit
-`9a1690e`, this document's own commit stacked directly on it), itself stacked
-on `fmt7/fp8-passthrough`, based on dev `9baae9b` (post-#465-merge, post-#526)
-— no cross-tree line-number mixing. The fmt=6 rows are upstream's own merged
-code (this branch's only fmt=6-adjacent change is the collision handling
-inside `qt_resolve_fmt`, `c/colibri.c`).
+Every row below is verified against branch `fmt7/stamp-registry-rev1` (base
+commit `696ce96`, this document's own commit stacked directly on it), itself
+restacked on the revised `fmt7/fp8-passthrough-rev1` (base `a77421d`, the
+#528 review round's INVERSION/qt_wire_split/stale-comment fixes), which is
+in turn based on dev `9baae9b` (post-#465-merge, post-#526) — no cross-tree
+line-number mixing. Every `c/colibri.c` line number in this document reflects
+that restack; re-verify them again if this branch is rebased further. The
+fmt=6 rows are upstream's own merged code (this branch's only fmt=6-adjacent
+change is the collision handling inside `qt_resolve_fmt`, `c/colibri.c`).
 
 `qt_resolve_fmt` (`c/colibri.c`) is the authoritative reader: it infers a
 tensor's format from byte arithmetic alone (weight-byte count + scale-byte
@@ -60,9 +63,9 @@ this document would naturally land there, but per the convention below it
 isn't claimed here; the maintainer assigns at merge.
 
 Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
-`fmt7/stamp-registry` @ this commit, base dev `9baae9b`):
+`fmt7/stamp-registry-rev1` @ this commit, base dev `9baae9b`):
 
-- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:893`
+- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:910`
   (`bits>=16→fmt=0`, `bits>=5→fmt=1`, `bits>=4→fmt=2`, else `fmt=3`).
   Kernels: `matmul_q` (`quant.h:105`, fmt=1), `matmul_i4` (`quant.h:125`,
   fmt=2), `matmul_i2` (`quant.h:251`, fmt=3); pack/quantize helpers
@@ -71,12 +74,12 @@ Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
 - **fmt=4** (`int4-grouped`) — kernel `matmul_i4_grouped`, `quant.h:168`;
   group size `gs` is per-tensor, not fixed at 64 (contrast fmt=5). Byte-count:
   `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:164`); scale-count split:
-  `qt_scale_bytes`, `c/colibri.c:216`.
+  `qt_scale_bytes`, `c/colibri.c:223`.
 - **fmt=5** (`int3-g64`) — group size is fixed (`I3_GROUP=64`,
   `quant.h:293`; `I3_GBYTES=24`, `quant.h:294`); helpers `i3_groups`
   (`quant.h:295`), `i3_rowbytes` (`quant.h:296`); kernel `matmul_i3`
   (`quant.h:302`); pack helper `pack_int3_g64` (`quant.h:899`). Allocation:
-  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:893`).
+  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:910`).
 - **fmt=6** (`e8-iq3`) — upstream's merged code: format section header
   precedes `quant.h:951`; constants `E8_QK=256` (`quant.h:951`),
   `E8_SUB=32` (`quant.h:952`), `E8_BBYTES=98` (`quant.h:953`); row-byte
@@ -84,7 +87,7 @@ Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
   documented at `quant.h:1248` ("fmt=6 stores W@Q, so activations must be
   transformed before"). Loader discriminator, upstream form (dev, ns==4 tag
   check at the top of `qt_resolve_fmt`): this branch's SECOND DESIGN
-  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c:1144`) hardens that check
+  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c:1161`) hardens that check
   against the degenerate collisions below without changing any genuine-fmt=6
   outcome.
 - **fmt=7** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
@@ -94,10 +97,10 @@ Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
   weight bytes are byte-identical and can only be told apart by
   scale-array geometry, which is ambiguous for some small shapes) and the
   fmt=6 collision ("SECOND DESIGN LANDMINE") both live in `qt_resolve_fmt`
-  (`c/colibri.c:1144`), which now also consults an optional `stamped_name`
+  (`c/colibri.c:1161`), which now also consults an optional `stamped_name`
   parameter (this PR) to resolve them instead of refusing unconditionally
   — see "The metadata stamp" below. FMT_NAMES table (name string <-> fmt
-  int): `c/colibri.c:1104`.
+  int): `c/colibri.c:1121`.
 
 ## Scale encoding is a declared property (fmt=7)
 
