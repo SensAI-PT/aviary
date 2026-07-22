@@ -26,6 +26,20 @@ Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 Vulkan, and spinning worker threads starve the async I/O pool (measured
 CPU expert bandwidth 28 → 5 GB/s without it).
 
+**Discrete cards need Resizable BAR.** The weight tiers allocate
+HOST_VISIBLE|DEVICE_LOCAL memory; with ReBAR disabled that combination only
+exists in a ~256 MB BAR window, and the driver silently places everything
+beyond it in system RAM — the tier then *reports* resident experts while every
+access crosses PCIe, slower than the CPU path (measured 0.11 vs 0.24 tok/s
+either side of the BIOS toggle on an RX 9070 XT). The engine now warns at init
+when the host-visible slice of VRAM is small; if you see that warning, enable
+Resizable BAR / Smart Access Memory in the BIOS. Unified-memory APUs are
+unaffected.
+
+The compiled shaders are found via `COLI_VK_SHADERS` (either the
+`qmatmul.spv` file or the directory holding the `.spv` set); unset, the
+engine looks in `shaders/` next to the binary, then relative to the CWD.
+
 ## What runs on the GPU
 
 | Piece | Env | Mechanism |
@@ -64,6 +78,27 @@ NVMe-streamed) decode on a 12-core Zen2 + RX 9070 box: Vulkan
 The two write-combined-memory rules that make this possible: buffers the CPU
 reads back must be HOST_CACHED (ReBAR VRAM reads at ~40 MB/s otherwise), and
 everything else lives HOST_VISIBLE|DEVICE_LOCAL.
+
+## Benchmarking against other backends
+
+Two defaults will silently skew any Vulkan-vs-CUDA/HIP comparison:
+
+- **MTP speculation**: CUDA/HIP builds disable model drafts by default
+  (`DRAFT` auto-resolves to 0 under `COLI_CUDA=1`, see #163), while CPU and
+  Vulkan runs keep `DRAFT=3`. The arms then execute different decode loops —
+  the speculative arm routes ~2× the expert positions per emitted token
+  (rejected draft positions still pay their expert I/O), which dominates on
+  storage-bound boxes. Output is identical either way (greedy verify is
+  lossless), so nothing looks wrong. Pin `DRAFT=0` (or `DRAFT=3
+  COLI_CUDA_MTP=1`) explicitly on **both** arms.
+- **GPU clocks**: decode dispatches are microsecond bursts that never ramp
+  DPM on their own; the memory clock can sit parked through an entire run.
+  Pin `power_dpm_force_performance_level=high` (both arms) or disclose it.
+
+Also note `experts loaded/token` in the run stats counts *routed positions*
+(including rejected speculative ones) before any cache/tier is consulted —
+it does not fall when the VK tier serves a hit; the `vk` bucket in the
+hit-rate line is the tier-effectiveness number.
 
 ## Limits and future work
 
