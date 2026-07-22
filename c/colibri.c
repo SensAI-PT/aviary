@@ -205,9 +205,9 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
  * qt_wire_mmap/qt_unwire_mmap mlock the weight and scale ranges as TWO SEPARATE
  * regions (separate allocations, not one contiguous buffer: qt_from_disk always
  * qalloc's t->q8/t->q4 and t->s independently) and need the scale byte count on
- * its own to split qt_bytes(t) into a weight half and a scale half. The two call
- * sites used to hardcode scale_b=O*4 -- i.e. assume PER-ROW scale for every
- * format -- which is right for fmt 0/1/2/3 but wrong for fmt=4 (grouped,
+ * its own to split qt_bytes(t) into a weight half and a scale half. Hardcoding
+ * scale_b=O*4 at those two call sites -- i.e. assuming PER-ROW scale for every
+ * format -- is right for fmt 0/1/2/3 but wrong for fmt=4 (grouped,
  * O*ceil(I/gs) scales), fmt=5 (int3-g64, O*ceil(I/64) scales), and fmt=7
  * (per-128x128-block, ceil(O/128)*ceil(I/128) scales): any tensor in one of
  * those three formats reaching qt_wire_mmap/qt_unwire_mmap would mlock/munlock
@@ -217,14 +217,21 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
  * qt_bytes' `+4` literal above), and t->fmt==6 tensors never reach
  * qt_wire_mmap/qt_unwire_mmap's mlock path in this build (int3-g64/E8 stay
  * CPU-side, see qt_cuda_upload -- MMAP wiring is a CUDA/Metal-adjacent memory
- * concern this build doesn't extend to them). fixed generically since the same
- * bug shape applies to fmt=4/5, not just the format that surfaced it -- fmt=4
- * is the routed-expert "int4-g64" format (qt_resolve_fmt assigns it to ESlot
- * g/u/d the same as any other tensor, see expert_load_impl), so this is not
- * purely a dormant fmt=7-only fix: any COLI_MMAP + mem_should_wire() session
- * pinning fmt=4 experts was already mlocking the wrong ranges before this
- * branch existed. UNVERIFIED at runtime (no model run performed -- static/
- * arithmetic fix only, see the report). */
+ * concern this build doesn't extend to them). This is not purely a dormant
+ * fmt=7-only fix: fmt=4 is the routed-expert "int4-g64" format (qt_resolve_fmt
+ * assigns it to ESlot g/u/d the same as any other tensor, see
+ * expert_load_impl), so any COLI_MMAP + mem_should_wire() session pinning
+ * fmt=4 experts mlocks the wrong ranges without this. UNVERIFIED at runtime
+ * (no model run performed -- static/arithmetic fix only, see the report).
+ *
+ * REVIEW FINDING (maintainer, #528): this function existed correctly (the
+ * fmt=7 branch below is right) but neither qt_wire_mmap nor qt_unwire_mmap
+ * actually called it -- both independently hardcoded scale_b=(int64_t)t->O*4
+ * inline, so the "fix" this comment describes was never applied at either
+ * call site, and the resulting -Wunused-function warning on this then-dead
+ * function was suppressed by -Wno-unused-function in CFLAGS rather than
+ * caught. qt_wire_split() below is now the ONE place both call sites get
+ * weight_b/scale_b from -- see it and its call sites for the actual fix. */
 static int64_t qt_scale_bytes(const QT *t){
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
@@ -232,6 +239,16 @@ static int64_t qt_scale_bytes(const QT *t){
     return (int64_t)t->O*4;   /* fmt 0 (t->s NULL, guarded by callers)/1/2/3/6: per-row (or, for
                               * fmt=6, the 4-byte tag -- callers of this function never see fmt=6,
                               * see the comment above; the fallback is harmless dead code for it). */
+}
+/* qt_wire_mmap/qt_unwire_mmap's shared weight/scale byte-range split -- the ONE
+ * place that computes it, so the two sites can never independently drift back
+ * to a hardcoded per-row-only formula (that drift -- qt_scale_bytes() existing
+ * but unused at both sites -- was the maintainer's #528 finding, see the
+ * comment above qt_scale_bytes()). Directly unit-tested (test_fp8_load.c) so a
+ * regression here, not just at a call site, fails the suite. */
+static void qt_wire_split(const QT *t, int64_t *weight_b, int64_t *scale_b){
+    *scale_b = qt_scale_bytes(t);
+    *weight_b = qt_bytes(t) - *scale_b;
 }
 
 typedef struct {
@@ -7268,8 +7285,7 @@ static int mem_wire(void *addr, size_t len){
 static void qt_unwire_mmap(QT *t){
     if(!g_mmap || !mem_should_wire()) return;
     if(!t->q8 && !t->q4) return;
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b, scale_b; qt_wire_split(t,&weight_b,&scale_b);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(weight_b>0 && !munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
@@ -7282,8 +7298,7 @@ static void qt_unwire_mmap(QT *t){
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
     if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b, scale_b; qt_wire_split(t,&weight_b,&scale_b);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
     if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
     if(t->s && scale_b>0){ if(mem_wire(t->s,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }

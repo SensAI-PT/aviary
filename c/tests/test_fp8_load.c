@@ -399,6 +399,40 @@ static void check_fp8_bytes(int O, int I, const char *tag){
     if(!(O==1 && I==1)) CHECK(got_total != old_wrong);
 }
 
+/* qt_wire_mmap()/qt_unwire_mmap() (colibri.c) both compute weight_b/scale_b via
+ * qt_wire_split(t,&weight_b,&scale_b) -- this calls that EXACT shared function
+ * directly (no mlock syscall: same reasoning as check_fp8_bytes above, mem_wire's
+ * actual RLIMIT_MEMLOCK behavior is environment-dependent and not what changed)
+ * so a regression at qt_wire_split() itself -- e.g. reverting to the
+ * scale_b=(int64_t)t->O*4 hardcode the maintainer's #528 review found dead-coded
+ * behind an unused qt_scale_bytes() (compiling clean only because
+ * -Wno-unused-function suppressed the warning that should have caught it) --
+ * fails here. Covers every format qt_wire_split's callers can see in practice
+ * (fmt=1 per-row unaffected; fmt=4/5 grouped-scale formats qt_scale_bytes'
+ * own comment names as previously-broken too; fmt=7 nblk>O, the shape this
+ * review round is about). */
+static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
+    QT t; memset(&t,0,sizeof t); t.fmt=fmt; t.O=O; t.I=I; t.gs=gs;
+    int64_t want_scale = qt_scale_bytes(&t);
+    int64_t want_weight = qt_bytes(&t) - want_scale;
+    int64_t got_weight=-1, got_scale=-1;
+    qt_wire_split(&t,&got_weight,&got_scale);
+    if(got_scale != want_scale)
+        printf("FAIL %s: qt_wire_split scale_b=%lld want=%lld\n", tag, (long long)got_scale, (long long)want_scale);
+    CHECK(got_scale == want_scale);
+    if(got_weight != want_weight)
+        printf("FAIL %s: qt_wire_split weight_b=%lld want=%lld\n", tag, (long long)got_weight, (long long)want_weight);
+    CHECK(got_weight == want_weight);
+    /* the regression this test exists to catch: a per-row-only scale_b==O*4
+     * must NOT be what qt_wire_split returns for a format whose real scale
+     * cardinality differs from O (fmt=4/5/7 here) -- confirm the value has
+     * actually moved off that old constant, not just matched qt_scale_bytes()
+     * by coincidence at a degenerate shape. */
+    int64_t old_wrong_scale = (int64_t)O*4;
+    if((fmt==4 || fmt==5 || fmt==7) && want_scale != old_wrong_scale)
+        CHECK(got_scale != old_wrong_scale);
+}
+
 int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
@@ -408,6 +442,11 @@ int main(void){
     check_fp8_bytes(6144,2048, "qt_bytes fmt=7 down-shaped O=6144 I=2048");
     check_fp8_bytes(130,200,   "qt_bytes fmt=7 block edges O,I both non-mult-128");
     check_fp8_bytes(1,1,       "qt_bytes fmt=7 degenerate 1x1");
+    check_wire_split(1, 4096,4096, 0,  "qt_wire_split fmt=1 plain int8 (per-row scale, unaffected by the fix)");
+    check_wire_split(4, 2048,6144, 64, "qt_wire_split fmt=4 grouped int4 (O*ceil(I/gs) scale, not O*4)");
+    check_wire_split(5, 2048,6144, 0,  "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
+    check_wire_split(7, 2,16384, 0,    "qt_wire_split fmt=7 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
+    check_wire_split(7, 2048,6144, 0,  "qt_wire_split fmt=7 spec example: scale=3072B, NOT O*4=8192B");
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;
