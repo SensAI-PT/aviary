@@ -18,9 +18,8 @@ test does, end to end:
      Makefile's own CFLAGS, asserted to produce zero warnings -- into a
      temp binary;
   4. run that binary against the REAL repacked output directory, asserting
-     every selected tensor loads fmt=8 through the real qt_from_disk with
-     finite dequantized values (byte-arithmetic inference alone -- this PR's
-     repack tool writes no container metadata stamp).
+     every stamped tensor loads fmt=8 through the real qt_from_disk with
+     finite dequantized values.
 
 Hermetic: everything (checkpoint, repacked output, compiled harness binary)
 lives under one TemporaryDirectory; nothing is left behind.
@@ -86,7 +85,7 @@ class Fp8RepackLoadE2ETest(unittest.TestCase):
             "model.layers.0.self_attn.q_a_proj.weight": torch.randn(D, D) * 0.02,
             "model.layers.0.mlp.shared_experts.gate_proj.weight": torch.randn(D, I_) * 0.02,
             "model.layers.0.mlp.gate_proj.weight": torch.randn(D, I_) * 0.02,
-            # routed expert: must NOT be selected (stays int4-g64 path) -- included
+            # routed expert: must NOT be selected/stamped (stays int4-g64 path) -- included
             # as a negative control so this test also proves the real tool's selection
             # logic held on the real round trip, not just in test_fp8_repack.py's own suite.
             "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(I_, D) * 0.02,
@@ -113,24 +112,19 @@ class Fp8RepackLoadE2ETest(unittest.TestCase):
         outs = glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors"))
         self.assertEqual(len(outs), 1, "expected exactly one repacked output shard")
 
-        # Sanity-check the real tool's own selection BEFORE asking the C harness to load
-        # it: if this fails, the bug is in the tool, not the loader, and running the
-        # harness anyway would only muddy which side broke. This PR's repack tool writes
-        # NO container metadata stamp (that's a separate, follow-up PR -- see the tool's
-        # own module docstring), so selection is checked by tensor presence instead of a
-        # stamp's tensor-name set, and the stamp's ABSENCE is itself asserted below: a
-        # regression guard that this PR's tool really stays out of that scope.
+        # Sanity-check the real tool's own selection/stamp BEFORE asking the C harness
+        # to load it: if this fails, the bug is in the tool, not the loader, and running
+        # the harness anyway would only muddy which side broke.
         with open(outs[0], "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
             hdr = json.loads(f.read(hlen))
-        for name in shapes:
-            self.assertIn(name, hdr, f"{name}: expected tensor missing from repacked output")
-            self.assertIn(name + ".qs", hdr, f"{name}.qs: expected scale sidecar missing")
+        self.assertIn("__metadata__", hdr)
+        self.assertIn("colibri.fmt", hdr["__metadata__"])
+        stamp = json.loads(hdr["__metadata__"]["colibri.fmt"])
+        self.assertEqual(set(stamp.keys()), set(shapes.keys()),
+                         "real tool's selection must match exactly the resident-kind tensors")
         self.assertNotIn("model.layers.0.mlp.experts.0.gate_proj.weight", hdr)
         self.assertNotIn("model.layers.0.input_layernorm.weight", hdr)
-        self.assertNotIn("__metadata__", hdr,
-                         "this PR's repack tool must not write a container metadata stamp "
-                         "(stamp writer is a separate, follow-up PR)")
 
         cc, cflags, ldflags = _cc_flags()
         if not cc:

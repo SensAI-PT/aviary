@@ -15,9 +15,9 @@
  * Usage: test_fp8_e2e_loader <container_dir> [name O I]...
  * For every (name,O,I) triple, calls the REAL qt_from_disk (the identical
  * function every model load uses) and asserts:
- *   (a) fmt==8 resolved (native fp8-e4m3-passthrough, via byte-arithmetic
- *       inference alone -- this PR's repack tool writes no container
- *       metadata stamp, see repack_fp8_passthrough.py's module docstring);
+ *   (a) fmt==8 resolved (native fp8-e4m3-passthrough -- byte-arithmetic
+ *       inference AND, since this tool stamps its output, metadata-stamp
+ *       agreement, both exercised for real here, neither mocked);
  *   (b) the weight (q8) and scale (s) buffers are non-NULL;
  *   (c) every dequantized value (e4m3_decode(byte) * block scale) is finite
  *       -- catches a decode-table or block-index bug a pure byte-count

@@ -133,7 +133,7 @@ class SelectionTest(unittest.TestCase):
         self.assertNotIn("model.layers.0.mlp.gate.weight", names)     # router, f32 kind
 
     def test_byte_preservation_and_qs_rename(self):
-        out, inv = rp.repack_shard(self.shard, n_layers=5)
+        out, inv, fmt_map = rp.repack_shard(self.shard, n_layers=5)
         self.assertEqual(len(inv), 4)
         with safe_open(self.shard, framework="pt") as f:
             for it in inv:
@@ -146,6 +146,19 @@ class SelectionTest(unittest.TestCase):
                 O, I_ = w_src.shape
                 nblkO, nblkI = (O + 127) // 128, (I_ + 127) // 128
                 self.assertEqual(out[name + ".qs"].numel(), nblkO * nblkI)
+
+    def test_fmt_map_covers_exactly_selected_weight_names(self):
+        """fmt_map (the METADATA STAMP payload) must cover exactly the selected
+        WEIGHT names -- never the ".qs" sidecars, never an excluded tensor -- and
+        every value must be FORMAT_NAME (the format's public NAME, not the
+        internal fmt=8 ordinal)."""
+        out, inv, fmt_map = rp.repack_shard(self.shard, n_layers=5)
+        selected_names = {it["name"] for it in inv}
+        self.assertEqual(set(fmt_map.keys()), selected_names)
+        for name in selected_names:
+            self.assertNotIn(name + ".qs", fmt_map)
+            self.assertEqual(fmt_map[name], rp.FORMAT_NAME)
+        self.assertEqual(rp.FORMAT_NAME, "fp8-e4m3-b128")
 
     def test_geometry_refusal_on_malformed_scale(self):
         """A shard whose _scale_inv shape doesn't match ceil(O/128)xceil(I/128) for
@@ -226,6 +239,27 @@ class ResumeAndParamsGuardTest(unittest.TestCase):
         self.assertNotIn("model.embed_tokens.weight", hdr)
         self.assertNotIn("model.layers.0.input_layernorm.weight", hdr)
         self.assertNotIn("model.layers.0.self_attn.kv_b_proj.weight", hdr)
+
+    def test_metadata_stamp_present_and_correct(self):
+        """End-to-end through the real CLI: __metadata__["colibri.fmt"] must be
+        present, parse as JSON, and name exactly the selected resident-kind
+        tensors -- the real round trip a unit-level rp.repack_shard() call
+        can't exercise (save_file's own metadata= handling)."""
+        self.assertEqual(self._run(5), 0)
+        outs = glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors"))
+        self.assertEqual(len(outs), 1)
+        hdr = _read_header(outs[0])
+        self.assertIn("__metadata__", hdr)
+        self.assertIn("colibri.fmt", hdr["__metadata__"])
+        stamp = json.loads(hdr["__metadata__"]["colibri.fmt"])
+        self.assertEqual(set(stamp.keys()), {
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "model.layers.0.mlp.shared_experts.gate_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+        })
+        for name, fmt_name in stamp.items():
+            self.assertEqual(fmt_name, rp.FORMAT_NAME, f"{name}: stamped format name mismatch")
 
     def test_resume_skips_completed_shard(self):
         self.assertEqual(self._run(5), 0)

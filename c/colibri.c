@@ -1294,6 +1294,46 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* FORMAT NAME <-> internal fmt-int table. The NAME is the public identity a
+ * container or a Feature Request advertises; the int on the right is this
+ * build's internal enum value (colibri.c's QT.fmt / qt_resolve_fmt's return
+ * value), never itself persisted to a container -- a container's __metadata__
+ * stamp (below) carries the NAME, never the number, matching docs/FORMATS.md's
+ * own registry. Covers every format qt_resolve_fmt can return, not just the
+ * one this branch's tool stamps: a single-entry table could only ever
+ * exercise the "unrecognized name" refusal path, never a genuine
+ * recognized-but-different-format mismatch. "e8-iq3-lattice" is this build's
+ * own placeholder name for upstream fmt=6 (#465 never stamped containers --
+ * dev has no metadata-stamp feature of its own) -- listed so
+ * qt_fmt_by_name/qt_name_by_fmt are total over every value qt_resolve_fmt can
+ * return, matching this comment's own claim; a real name for fmt=6 belongs to
+ * whoever upstreams a stamp for it. "fp8-e4m3-b128" (fmt=8) names the WEIGHT
+ * geometry only, not a specific scale encoding -- a tensor stamped
+ * "fp8-e4m3-b128" whose scale sidecar carries UE8M0 bytes still refuses (see
+ * qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment): the stamp
+ * confirms the WEIGHT format, it does not grant this build a decoder it
+ * doesn't have. */
+static const struct { const char *name; int fmt; } FMT_NAMES[] = {
+    { "f32",           0 },
+    { "int8-row",      1 },
+    { "int4-row",      2 },
+    { "int2-row",      3 },
+    { "int4-grouped",  4 },
+    { "int3-g64",      5 },
+    { "e8-iq3-lattice", 6 },
+    { "fp8-e4m3-b128", 8 },
+};
+#define N_FMT_NAMES (int)(sizeof(FMT_NAMES)/sizeof(FMT_NAMES[0]))
+
+static int qt_fmt_by_name(const char *name){
+    for(int i=0;i<N_FMT_NAMES;i++) if(!strcmp(FMT_NAMES[i].name,name)) return FMT_NAMES[i].fmt;
+    return -1;   /* unrecognized name -- never a valid qt_resolve_fmt() return value */
+}
+static const char *qt_name_by_fmt(int fmt){
+    for(int i=0;i<N_FMT_NAMES;i++) if(FMT_NAMES[i].fmt==fmt) return FMT_NAMES[i].name;
+    return NULL; /* fmt has no registered public name yet (e.g. upstream 0-5) */
+}
+
 /* SEC: risolve e VALIDA il formato quantizzato di un tensore [O,I] letto da un
  * container non fidato (mirror). L'inferenza precedente (`?1:?2:3`) cadeva su
  * int2 per QUALSIASI conteggio byte non riconosciuto: un peso troppo corto
@@ -1301,11 +1341,13 @@ static int detect_group_size(int O, int I, int64_t ns){
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
  * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/8) e scrive *gs.
- * No container-level format stamp is consulted here: a self-describing
- * __metadata__ stamp that could resolve a genuine byte-collision below
- * (instead of refusing it unconditionally) is a follow-up proposal, not
- * present in this build -- every ambiguous shape this function can see
- * refuses, full stop. */
+ * No container-level format stamp is consulted INSIDE this function yet in
+ * this commit -- qt_verify_fmt_stamp (below) checks one AFTER the fact, a
+ * pure post-hoc cross-check that cannot yet resolve a genuine byte-collision
+ * below (every ambiguous shape this function can see still refuses
+ * unconditionally here). A follow-up commit threads a `stamped_name`
+ * parameter into this function itself so a stamp can resolve those
+ * collisions instead of merely confirming an already-unambiguous result. */
 static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
@@ -1461,6 +1503,48 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
     return fmt;
 }
+
+/* TRUST-VERIFY-REFUSE: if `stamped` (the tensor's __metadata__ format-NAME
+ * stamp, or NULL if none -- see st_fmt_stamp/st_fmt_stamp_ingest in st.h)
+ * is present, verify it agrees with `fmt` (qt_resolve_fmt's byte-arithmetic
+ * result) and refuse loudly on disagreement -- same "untrusted container"
+ * discipline qt_resolve_fmt applies throughout. A stamp naming a format this
+ * build doesn't recognize is ALSO a refusal: silently accepting an
+ * unrecognized name would be indistinguishable from missing a real mismatch,
+ * and "refuse rather than guess" is the whole point of this function's
+ * design. No stamp at all is NOT an error -- the container simply predates
+ * this feature (or was never stamped by a stamping tool), and byte-arithmetic
+ * inference alone decides, exactly as before this function existed: zero
+ * behavior change for unstamped containers.
+ *
+ * Called from qt_from_disk right after qt_resolve_fmt -- the resident-tensor
+ * load path this branch's repack tool actually stamps. Deliberately NOT
+ * threaded into the routed-expert loader paths (expert_load_impl and
+ * friends, which call qt_resolve_fmt separately for g/u/d slab layout): this
+ * branch's tools/repack_fp8_passthrough.py never stamps routed experts (kind
+ * "x" is explicitly excluded, see that tool's module docstring), so there is
+ * no stamp for those paths to verify yet -- adding the plumbing there now
+ * would be framework-building ahead of any container that needs it, which
+ * this reference implementation deliberately avoids. */
+static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
+    if(!stamped) return;                       /* unstamped: infer exactly as today */
+    int stamped_fmt = qt_fmt_by_name(stamped);
+    if(stamped_fmt == fmt) return;              /* agree: silent pass-through, loads normally */
+    if(stamped_fmt < 0){
+        fprintf(stderr,
+            "%s: metadata stamp names format '%s', which this build does not recognize "
+            "(byte-arithmetic inference says fmt=%d) -- refusing (untrusted container, "
+            "unrecognized stamp name)\n", name, stamped, fmt);
+        exit(1);
+    }
+    const char *inferred_name = qt_name_by_fmt(fmt);
+    fprintf(stderr,
+        "%s: metadata stamp says format '%s' but byte-arithmetic inference says fmt=%d "
+        "(%s) -- refusing (untrusted container, stamp/inference mismatch)\n",
+        name, stamped, fmt, inferred_name ? inferred_name : "no registered name");
+    exit(1);
+}
+
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1475,6 +1559,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * non fidati (SEC). */
         int gs=0;
         int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
+        const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
+        qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             /* METAL: t->s must be page-aligned + coli_metal_register'd like every other
