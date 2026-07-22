@@ -1045,7 +1045,13 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
              * whole GPU dispatch silently CPU-falls-back (safe, but defeats the point of
              * wiring fmt=4 into the shader at all). falloc() here was a plain malloc --
              * O*ng floats never registered -- found while tracing the per-row-scale path
-             * this stage extends to per-group; fixed alongside it. */
+             * this stage extends to per-group; fixed alongside it.
+             * Trade-off (this site is NOT #ifdef COLI_METAL): on a CPU-only build this
+             * swaps falloc's checked-exit overflow/OOM guard for qalloc's unchecked
+             * malloc -- same hole qsalloc already has for fmt 1/2/3, so consistency,
+             * not a new class; noted rather than silent. fmt=5's group scales (just
+             * below) still use falloc and so remain Metal-inert -- pre-existing,
+             * inconsistent after this change, a candidate for whoever wires fmt=5. */
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
