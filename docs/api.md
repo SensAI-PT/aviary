@@ -24,14 +24,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
 `POST /v1/chat/completions`, and legacy `POST /v1/completions`. Chat and
 completion requests support JSON responses, SSE streaming, usage counts,
-`max_tokens`/`max_completion_tokens`, `temperature`, and `top_p`. The extension
+`max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
+custom `stop` sequences. Stop sequences are removed from the response and end
+generation early in both JSON and streaming modes. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
 The server is deliberately text-only and serves one generation at a time: the
 744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Tools, image/audio input, custom
-stop sequences, log probabilities, and token penalties return an explicit error
+instead of loading duplicate model copies. Image/audio input, log probabilities,
+and token penalties return an explicit error
 rather than being silently ignored. The default bind address is localhost; set
 `COLI_API_KEY` before exposing the server beyond the machine.
 

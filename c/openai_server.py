@@ -832,6 +832,72 @@ GENERIC_JSON_GBNF = (
     'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
 )
 
+
+def parse_stop_sequences(body):
+    value = body.get("stop")
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        sequences = [value]
+    elif isinstance(value, list):
+        sequences = value
+    else:
+        raise APIError(400, "`stop` must be a string or an array of strings.",
+                       "stop", "invalid_value")
+    if not 1 <= len(sequences) <= 4:
+        raise APIError(400, "`stop` must contain between 1 and 4 sequences.",
+                       "stop", "invalid_value")
+    for index, sequence in enumerate(sequences):
+        if not isinstance(sequence, str) or not sequence:
+            raise APIError(400, "Each `stop` sequence must be a non-empty string.",
+                           f"stop.{index}", "invalid_value")
+    return tuple(sequences)
+
+
+class StopFilter:
+    """Stream text without exposing a full or partial stop sequence."""
+    def __init__(self, sequences, emit):
+        self.sequences = tuple(sequences)
+        self.emit = emit
+        self.pending = ""
+        self.matched = None
+
+    def feed(self, chunk):
+        if self.matched is not None:
+            return
+        text = self.pending + chunk
+        match = None
+        for order, sequence in enumerate(self.sequences):
+            offset = text.find(sequence)
+            candidate = (offset, order, sequence)
+            if offset >= 0 and (match is None or candidate[:2] < match[:2]):
+                match = candidate
+        if match is not None:
+            offset, _order, self.matched = match
+            if offset:
+                self.emit(text[:offset])
+            self.pending = ""
+            return
+
+        hold = 0
+        maximum = min(len(text), max((len(s) - 1 for s in self.sequences), default=0))
+        for size in range(1, maximum + 1):
+            suffix = text[-size:]
+            if any(sequence.startswith(suffix) for sequence in self.sequences):
+                hold = size
+        flush = len(text) - hold
+        if flush:
+            self.emit(text[:flush])
+        self.pending = text[flush:]
+
+    def finish(self):
+        if self.matched is None and self.pending:
+            self.emit(self.pending)
+        self.pending = ""
+
+    def stopped(self):
+        return self.matched is not None
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -878,8 +944,7 @@ def generation_options(body, limit):
                            "tool_choice", "invalid_value")
         if choice != "none" and not (body.get("tools") or body.get("functions")):
             raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
-    if body.get("stop") is not None:
-        raise APIError(400, "Custom stop sequences are not supported yet.", "stop", "unsupported_parameter")
+    stop_sequences = parse_stop_sequences(body)
     if body.get("logprobs"):
         raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
@@ -944,7 +1009,7 @@ def generation_options(body, limit):
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p), grammar
+    return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -1108,7 +1173,7 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None):
+                 cancelled=None, grammar=None, stopped=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -1150,12 +1215,18 @@ class Engine:
             raise
 
         cancel_sent = False
+        stop_sent = False
         while True:
             kind, value = events.get()
             if kind == "data":
-                if not cancel_sent:
+                if not cancel_sent and not stop_sent:
                     decode(value)
-                    if cancelled and cancelled():
+                    if stopped and stopped():
+                        stop_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"STOP {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    elif cancelled and cancelled():
                         cancel_sent = True
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
@@ -1443,7 +1514,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, grammar, stop_sequences = generation_options(
+            body, self.server.max_tokens)
         if grammar is not None and ARCH == "inkling":
             # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
@@ -1475,9 +1547,11 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
+                stop_filter = StopFilter(stop_sequences, output.append)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot,
-                    self.client_disconnected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                stop_filter.finish()
                 text = "".join(output)
                 reasoning = ""
                 if ARCH == "inkling":
@@ -1597,9 +1671,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
+                stop_filter = StopFilter(stop_sequences, emit_tools)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
+                stop_filter.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_tool_calls("".join(raw), tools)
@@ -1614,9 +1690,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (splitter.feed if splitter else emit)(chunk)
+                stop_filter = StopFilter(stop_sequences, emit_plain)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
+                stop_filter.finish()
                 if splitter:
                     splitter.close()
                 finish = "length" if stats["length_limited"] else "stop"
@@ -1710,7 +1788,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
-        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
+            body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
