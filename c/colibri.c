@@ -103,7 +103,11 @@ typedef struct {
  *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64.
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64,
+ * 6 E8/IQ3 lattice, 7 FP8-E4M3 (native, passthrough -- see quant.h). fmt=7 is a
+ * PUBLIC ordinal, assigned by the maintainer on #524; it developed under the
+ * PRIVATE ORDINAL BLOCK convention below as fmt=100 and graduated out of that
+ * block into this list at the same time this comment was written.
  * q4 ospita int4/int2/int3 packed. fmt=4 (grouped int4, #242): per-row nibbles + one f32
  * scale per group of `gs` inputs (s has O*ceil(I/gs) entries).
  * fmt=6 (E8/IQ3 lattice, #452): 98B per 256 weights = 3.0625 bits/weight, grid
@@ -112,7 +116,53 @@ typedef struct {
  * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
  * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
  * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
- * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
+ * bits/weight effective — the quality/size sweet spot measured in the #132 ablation.
+ * fmt=7 (native FP8-e4m3 passthrough, resident/quality-core tier -- see quant.h's
+ * FP8_BLOCK/e4m3_decode/matmul_fp8): q8 holds O*I raw e4m3 bytes, ONE byte per weight,
+ * byte-identical layout to fmt=1's weight bytes (q4 is unused/NULL, same as fmt=1) --
+ * disambiguated from fmt=1 (and, at small [O,I], from fmt=6 -- see below) purely by
+ * scale geometry, see qt_resolve_fmt's "THE DESIGN LANDMINE" comment further down.
+ * s holds ONE f32 scale PER 128x128 BLOCK, ceil(O/128)*ceil(I/128) entries total
+ * (row-major: block-row-major then block-col), NOT O and NOT O*ceil(I/gs) --
+ * qt_bytes()/qt_scale_bytes() below are the authoritative byte-count formulas. The
+ * scale ENCODING is itself a declared PROPERTY of this format, not a hardcoded
+ * constant -- f32 (4 bytes/block, what's above) is the value THIS build
+ * implements; qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment
+ * documents why (a DeepSeek-V4 checkpoint ships this identical weight geometry
+ * with a UE8M0 scale encoding instead) and how an unimplemented encoding is
+ * recognized and refused by name rather than silently misread.
+ * gs is unused (0) for fmt=7, same as fmt 1/2/3. */
+/* ---- PRIVATE ORDINAL BLOCK CONVENTION ------------------------------------
+ * fmt values 0-7 are upstream-assigned, public, stable ordinals -- do not
+ * reuse or renumber them (fmt=7 is the newest member: assigned by the
+ * maintainer on #524, after developing under this block as fmt=100 -- see
+ * "graduated" above). fmt values 100+ remain this repo's PRIVATE/EXPERIMENTAL
+ * block for any OTHER in-flight format proposal: ordinals a branch mints for
+ * itself during development so it can't collide with a number upstream claims
+ * out from under it -- exactly what happened to fmt=7's OWN earlier private
+ * number, fmt=6, when #465's E8/IQ3 proposal claimed that ordinal upstream
+ * while this branch was still developing against it, forcing a re-mint to
+ * fmt=100 (see upstream_contribution/FORMATS_registry_draft.md for the
+ * incident that prompted the rule).
+ *
+ * A PRIVATE-BLOCK ordinal is an internal enum value only -- qt_resolve_fmt
+ * (below) infers format purely from byte arithmetic; the container on disk
+ * carries no format ordinal at all. (A self-describing container stamp that
+ * would persist a format's NAME, not its ordinal, is a follow-up proposal --
+ * see qt_resolve_fmt's own note on where that plumbing would attach -- not
+ * present in this build.) Nothing outside this binary's own compiled code
+ * ever observes a 100+ number, so renumbering one later (e.g. when a format
+ * is upstreamed and assigned a real public ordinal at merge, as just happened
+ * for fmt=7) is a pure find-and-replace with zero on-disk or cross-version
+ * compatibility impact.
+ *
+ * Rule for adding a new format to this branch or a future one: claim the next
+ * unused 100+ integer, never a number already claimed upstream (check dev
+ * before picking one -- this is exactly the mistake that forced fmt=7's own
+ * proposal to renumber away from fmt=6) or by another in-flight private
+ * format. Never ship a 100+ ordinal as a public default/committed-upstream
+ * value -- the real ordinal is assigned by the maintainer at merge time,
+ * exactly as fmt=7's was. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
@@ -137,7 +187,51 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
     if(t->fmt==6)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
+    if(t->fmt==7){ /* fp8-e4m3 passthrough: O*I raw e4m3 bytes (n, byte-identical layout
+                    * to fmt=1's weight bytes) + one f32 scale per 128x128 block
+                    * (FP8_BLOCK in quant.h, included below qt_bytes -- keep the
+                    * arithmetic literal here, same discipline as fmt=5's comment
+                    * above). Missing this branch would fall through to the fmt=2
+                    * default below (packed-nibble formula, ~half the real weight
+                    * bytes) and undercount a resident fp8 tensor's byte footprint --
+                    * feeds AUTOPIN/RAM-budget math, so this branch is load-bearing
+                    * from day one, not a later fix (contrast fmt=6 above, upstream's
+                    * own #452 review round 1 caught this exact bug shape for E8). */
+        int64_t nblkO=((int64_t)t->O+127)/128, nblkI=((int64_t)t->I+127)/128;
+        return n + nblkO*nblkI*4; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
+}
+/* scale-array byte count only, format-aware -- split out of qt_bytes() because
+ * qt_wire_mmap/qt_unwire_mmap mlock the weight and scale ranges as TWO SEPARATE
+ * regions (separate allocations, not one contiguous buffer: qt_from_disk always
+ * qalloc's t->q8/t->q4 and t->s independently) and need the scale byte count on
+ * its own to split qt_bytes(t) into a weight half and a scale half. The two call
+ * sites used to hardcode scale_b=O*4 -- i.e. assume PER-ROW scale for every
+ * format -- which is right for fmt 0/1/2/3 but wrong for fmt=4 (grouped,
+ * O*ceil(I/gs) scales), fmt=5 (int3-g64, O*ceil(I/64) scales), and fmt=7
+ * (per-128x128-block, ceil(O/128)*ceil(I/128) scales): any tensor in one of
+ * those three formats reaching qt_wire_mmap/qt_unwire_mmap would mlock/munlock
+ * the wrong byte ranges on BOTH halves (weight_b = qt_bytes(t)-scale_b shifts
+ * too). fmt=6 (E8) is deliberately NOT covered here: its .qs is a fixed 4-byte
+ * tag with no wire-mmap-relevant weight/scale split of its own (matches
+ * qt_bytes' `+4` literal above), and t->fmt==6 tensors never reach
+ * qt_wire_mmap/qt_unwire_mmap's mlock path in this build (int3-g64/E8 stay
+ * CPU-side, see qt_cuda_upload -- MMAP wiring is a CUDA/Metal-adjacent memory
+ * concern this build doesn't extend to them). fixed generically since the same
+ * bug shape applies to fmt=4/5, not just the format that surfaced it -- fmt=4
+ * is the routed-expert "int4-g64" format (qt_resolve_fmt assigns it to ESlot
+ * g/u/d the same as any other tensor, see expert_load_impl), so this is not
+ * purely a dormant fmt=7-only fix: any COLI_MMAP + mem_should_wire() session
+ * pinning fmt=4 experts was already mlocking the wrong ranges before this
+ * branch existed. UNVERIFIED at runtime (no model run performed -- static/
+ * arithmetic fix only, see the report). */
+static int64_t qt_scale_bytes(const QT *t){
+    if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
+    if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
+    if(t->fmt==7){ int64_t nblkO=((int64_t)t->O+127)/128, nblkI=((int64_t)t->I+127)/128; return nblkO*nblkI*4; }
+    return (int64_t)t->O*4;   /* fmt 0 (t->s NULL, guarded by callers)/1/2/3/6: per-row (or, for
+                              * fmt=6, the 4-byte tag -- callers of this function never see fmt=6,
+                              * see the comment above; the fallback is harmless dead code for it). */
 }
 
 typedef struct {
@@ -407,6 +501,14 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
+    if(t->fmt==7) return 0;   /* fp8-e4m3 passthrough: no CUDA kernel yet either (matches the
+                               * fmt=5/6 idiom above; matmul_qt_ex's own caller-side fmt exclusion
+                               * already keeps this from being reached with cuda_eligible tensors
+                               * in the exact-kernel path, but row_bytes()/weight_at() in
+                               * backend_cuda.cu have no fmt=7 case either -- explicit early-
+                               * return here so a future caller doesn't have to rediscover that by
+                               * tracing through to the CUDA source. UNVERIFIED at runtime: no CUDA
+                               * toolchain on this macOS build host to compile-check. */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -684,13 +786,26 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
+    /* fmt=7 (fp8 passthrough) deliberately absent from this allowlist, same as fmt=5/6:
+     * the S>=g_metal_gemm_min batched prefill GEMM path (coli_metal_gemm) only knows
+     * fmt 1/2/4 in this build, so it fails CLOSED to the CPU branch below (matmul_fp8)
+     * rather than being silently misread. coli_metal_gemm() also carries its own
+     * internal fmt!=1&&fmt!=2&&fmt!=4 guard, so this is belt-and-braces. */
     if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
+    /* fmt=7 excluded exactly like fmt=5/6: the CUDA backend's row_bytes()/weight_at()
+     * (backend_cuda.cu) have no case for it and fall through to `return 0` / undefined
+     * weight_at() behavior. row_bytes()==0 already makes coli_cuda_tensor_upload_g
+     * refuse (defensive fail-closed), but that path is reached only after paying an
+     * upload attempt and printing a "disabled after an error" message every load;
+     * excluding it here up front is the same fmt=5/6 idiom, silent and immediate.
+     * UNVERIFIED on this build (no CUDA toolchain on macOS to compile-check; traced
+     * from backend_cuda.cu source only). */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=7 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
@@ -716,6 +831,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else if(w->fmt==5) matmul_i3(y,x,w->q4,w->s,S,w->I,w->O);
+    else if(w->fmt==7) matmul_fp8(y,x,(const uint8_t*)w->q8,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
@@ -1138,26 +1254,135 @@ static int detect_group_size(int O, int I, int64_t ns){
  * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
- * si termina invece di sforare. Ritorna fmt (1/2/3/4/5) e scrive *gs. */
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/7) e scrive *gs.
+ * No container-level format stamp is consulted here: a self-describing
+ * __metadata__ stamp that could resolve a genuine byte-collision below
+ * (instead of refusing it unconditionally) is a follow-up proposal, not
+ * present in this build -- every ambiguous shape this function can see
+ * refuses, full stop. */
 static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
      * convention is kept with a single-float tag — ns==4 is the discriminator
-     * (every other format carries at least O floats of real scales). */
-    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){ *gs=0; return 6; }
+     * (every other format carries at least O floats of real scales).
+     *
+     * SECOND DESIGN LANDMINE: e8_rowbytes(I) = ceil(I/256)*98 is the constant 98
+     * for every I in (0,256], so this check's nb==O*e8_rowbytes(I) collapses to
+     * nb==O*98 -- which is ALSO fp8-e4m3-b128's raw-byte weight count (O*I) at
+     * the ONE value of I where I itself equals 98 (solving 98k==I for I in
+     * ((k-1)*256,k*256] only admits k=1, I=98). At that same I=98 a handful of
+     * fp8 scale-array shapes ALSO carry exactly ns==4 bytes, same as this
+     * check's own tag, and each is a genuine collision candidate this block
+     * must catch before the unconditional `return 6` below:
+     *   - a SINGLE-BLOCK fp8 tensor (O<=128, fp8_nblk(O)*fp8_nblk(I)==1) with
+     *     f32 block scales: ns==1*4==4.
+     *   - a FOUR-BLOCK fp8 tensor (fp8_nblk(O)*fp8_nblk(I)==4, e.g. O in
+     *     (384,512] at this I) with UE8M0 (1 byte/block) scales: ns==4*1==4 --
+     *     the SAME arithmetic collision the fmt=1-vs-fmt=7 landmine below has
+     *     with UE8M0, just against fmt=6's tag instead of fmt=1's per-row
+     *     count; see that landmine's own comment for the general shape.
+     *   - at O==1 specifically, fmt=1's own per-row tag (O*4) is also 4.
+     * Refuse unconditionally when any of these coincide with the E8/IQ3 tag --
+     * this build has no stamp to break the tie (see the function's own header
+     * comment) -- rather than let dev's own unconditional `return 6` silently
+     * misread an fp8-e4m3-b128 (or, at O==1, plain int8) tensor as E8/IQ3-
+     * lattice-decoded garbage with no error. No real GLM tensor has these
+     * shapes; the discipline exists for untrusted containers. */
+    if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){
+        int fp8_blk_f32_also   = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==1);
+        int fp8_blk_ue8m0_also = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==4);
+        int i8_row_also        = (nb==(int64_t)O*I) && (O==1);   /* ns==O*4==4 iff O==1 */
+        if(fp8_blk_f32_also || fp8_blk_ue8m0_also || i8_row_also){
+            fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
+                "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
+                "container, fmt=6 collision at I=98)\n",
+                name,O,I,(long long)nb,(long long)ns,
+                fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=7, single block)" : "",
+                fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=7, 4 blocks, recognized-not-implemented)" : "",
+                i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "");
+            exit(1);
+        }
+        *gs=0; return 6;
+    }
     /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
      * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
      * are distinct, and the weight bytes — not the scale size — are the int3 tag, because
      * int3-g64 and grouped-int4-at-gs=64 carry the SAME scale cardinality O*ceil(I/64). */
     int fmt = (nb==exp_i8)?1 : (nb==exp_i4)?2 : (nb==exp_i2)?3 : (nb==exp_i3)?5 : 0;
     if(!fmt){
-        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64 layout for [%d,%d], refusing (untrusted container)\n",
+        fprintf(stderr,"%s: quantized weight is %lld bytes — no int8/int4/int2/int3-g64/fp8 layout for [%d,%d], refusing (untrusted container)\n",
                 name,(long long)nb,O,I); exit(1); }
     *gs=0;
     if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
+    /* fmt=1 vs fmt=7 (native FP8-e4m3 passthrough): THE DESIGN LANDMINE. Weight
+     * bytes are IDENTICAL (O*I raw bytes, both matched exp_i8 above) -- fmt=1
+     * and fmt=7 can only be told apart by the SCALE array's geometry: fmt=1 is
+     * per-row (ns==O*4 bytes); fmt=7 is per-128x128-BLOCK, ns==ceil(O/128)*
+     * ceil(I/128)*4 bytes for THIS build's implemented f32 scale encoding. For
+     * most real shapes these two byte counts are distinct and the match is
+     * unambiguous. But for small O (<=128) and/or small I, ceil(O/128)*
+     * ceil(I/128) can equal O exactly (e.g. O=1,I<=128 -> 1*1=1=O; O=2,I in
+     * [129,256] -> 1*2=2=O; O=256,I in (16256,16384] -> 2*128=256=O) -- a
+     * tensor whose scale array satisfies BOTH conventions at once. Guessing
+     * either way risks silently reading a genuine per-row-int8 tensor as
+     * block-scaled FP8 (or vice versa), which would corrupt every weight
+     * without any error. Refuse instead (same "untrusted container"
+     * discipline as the rest of this function).
+     *
+     * SCALE ENCODING IS A DECLARED PROPERTY, not a hardcoded constant: f32 (4
+     * bytes/block, above) is what THIS build implements, but it is not the
+     * only encoding real fp8-e4m3-b128 weight geometry ships with. DeepSeek-V4
+     * ships the SAME weight layout (FP8 E4M3, 128x128 blocks) with UE8M0
+     * scales instead -- one byte per block, a power-of-two exponent, dtype
+     * F8_E8M0 (maintainer finding, colibri #524) -- so a fp8-e4m3-b128
+     * container's scale sidecar can legitimately be ceil(O/128)*ceil(I/128)*1
+     * bytes, not *4. That byte count is a REAL, distinct signature (never
+     * equal to the f32 block-scale count above for any O,I>=1, since one is
+     * exactly 4x the other and 4n==n only at n==0) -- recognized here rather
+     * than silently misread as a truncated or corrupt f32 scale array. This
+     * build does not implement UE8M0 decode: recognizing the signature and
+     * refusing BY NAME (rather than falling through to the generic
+     * "wrong byte count" refusal below, or worse, matching it against the
+     * wrong candidate) is the whole point -- a future decoder lands into this
+     * seam rather than a near-duplicate format. Checked for collision against
+     * every OTHER format's ns arithmetic reachable from this nb==O*I branch
+     * (fmt=1 and fmt=7-f32, both above): the byte counts are realistically
+     * distinct (nblkO*nblkI is orders of magnitude smaller than O*4 for any
+     * real GLM-sized matrix), but NOT categorically distinct -- the same
+     * small-O regime that makes the fmt=1-vs-fmt=7-f32 collision above
+     * possible also makes a fmt=1-vs-fmt=7-ue8m0 collision possible (e.g.
+     * O=1, I in (384,512]: nblkO=1, nblkI=4, ue8m0 ns=4=O*4=fmt=1's own
+     * per-row count) -- handled below by refusing whenever the ue8m0
+     * signature matches, noting the row collision too when it also applies.
+     * No real GLM tensor has these shapes; see also the SECOND DESIGN
+     * LANDMINE above for the analogous ue8m0-vs-fmt=6 corner this same
+     * signature can hit. */
+    if(fmt==1){
+        int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
+        int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4, ns_blk_ue8m0=nblkO*nblkI;
+        int is_row=(ns==ns_row), is_blk=(ns==ns_blk), is_blk_ue8m0=(ns==ns_blk_ue8m0);
+        if(is_row && is_blk){
+            fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                "int8 (fmt=1) and per-128x128-block FP8 (fmt=7) scale geometry; refusing "
+                "rather than guessing (untrusted container, THE DESIGN LANDMINE)\n",
+                name,O,I,(long long)ns); exit(1);
+        }
+        if(is_blk_ue8m0){
+            fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
+                "implemented; only f32 block scales are supported in this build (nb=%lld "
+                "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
+                "1 byte/block)%s\n",
+                name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
+                is_row ? " -- scale array ALSO matches per-row int8 (fmt=1); refusing either way (untrusted container)" : "");
+            exit(1);
+        }
+        if(is_blk && !is_row) fmt=7;
+    }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
-                      : (fmt==5)? (int64_t)O*i3_groups(I) : (int64_t)O;   /* in FLOAT */
+                      : (fmt==5)? (int64_t)O*i3_groups(I)
+                      : (fmt==7)? fp8_nblk(O)*fp8_nblk(I)
+                      : (int64_t)O;   /* in FLOAT */
     if(ns != exp_scale*4){
         fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
@@ -1200,16 +1425,25 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         else if(fmt==6){   /* E8/IQ3: everything in-block, .qs is the 4-byte tag */
             if(t->fmt!=6||!t->q4){ t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1); }
             st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==7){ int64_t nblk=fp8_nblk(O)*fp8_nblk(I);   /* fp8-e4m3: raw bytes (q8, like fmt=1)
+            * + one f32 scale per 128x128 block. BOTH weights and scale via qalloc, not falloc,
+            * from day one -- the GPU-visibility lesson fmt=4 and fmt=5 each had to learn
+            * separately (see review round 1 audit history in the report). */
+            if(t->fmt!=7||!t->q8){ t->fmt=7; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=(float*)qalloc((size_t)nblk*sizeof(float)); }
+            st_read_raw(&m->S,name,t->q8,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
          * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
-         * O*ceil(I/gs) scales and int3-g64 (fmt=5) keeps O*i3_groups(I); everything
-         * else is per-row O. Using the per-row bound for a grouped format would
-         * reject a legitimate container (fmt=5 regressed exactly that way). */
+         * O*ceil(I/gs) scales, int3-g64 (fmt=5) keeps O*i3_groups(I), E8/IQ3 (fmt=6)
+         * keeps the 1-float tag, and fp8-e4m3 (fmt=7) keeps ceil(O/128)*ceil(I/128)
+         * block scales; everything else is per-row O. Using the per-row bound for a
+         * grouped/blocked format would reject a legitimate container (fmt=5 regressed
+         * exactly that way). */
         st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
-                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
+                        fmt==6 ? (int64_t)1               :
+                        fmt==7 ? fp8_nblk(O)*fp8_nblk(I) : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -2598,10 +2832,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * (step_decode_batch) passes per-row kvs[]/positions[] with pos_base=0, so the kernel
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
-     * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s]. */
+     * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s].
+     * fmt!=7 guards (q_a/q_b/kv_a/o): coli_metal_attn_decode's WP_() macro and the
+     * mm_gemv shader it dispatches through (bind_gemv) have no fmt=7 case in this
+     * build -- an fp8-passthrough tensor reaching here would be silently misread as
+     * f32 by the shader's default branch. Fail closed to the CPU path below instead
+     * (matmul_qt_ex there dispatches fmt=7 correctly via matmul_fp8). kv_b is already
+     * pinned to fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
+     * these four checks are the same discipline extended to the tensors that flow
+     * through the generic per-fmt shader. */
     if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
+       && l->q_a.fmt!=7 && l->q_b.fmt!=7 && l->kv_a.fmt!=7 && l->o.fmt!=7){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
@@ -4806,12 +5049,19 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
-     * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
+     * single Lc/Rc + pos_base contract — see the matching guard in attention_rows.
+     * fmt!=7 guards (q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): same fail-closed discipline
+     * as attention_rows, extended to the shared-expert MLP this fused kernel also
+     * covers -- none of these seven bind_gemv-routed tensors has fmt=7 support in this
+     * build's mm_gemv shader, so any of them carrying fmt=7 must skip the whole fused
+     * path (CPU below dispatches fmt=7 correctly via matmul_qt_ex/matmul_fp8). */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
-       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
+       && l->q_a.fmt!=7 && l->q_b.fmt!=7 && l->kv_a.fmt!=7 && l->o.fmt!=7
+       && l->sh_gate.fmt!=7 && l->sh_up.fmt!=7 && l->sh_down.fmt!=7){
         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
