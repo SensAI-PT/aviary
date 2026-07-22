@@ -27,6 +27,10 @@ completion requests support JSON responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
 custom `stop` sequences. Stop sequences are removed from the response and end
 generation early in both JSON and streaming modes. The extension
+`x_colibri_ignore_leading_stop: true` discards leading stop sequences until
+the first non-whitespace response content, which is useful for local templates
+that occasionally emit a role marker before the answer; strict OpenAI stop
+behavior remains the default. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 

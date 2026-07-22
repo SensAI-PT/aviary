@@ -856,27 +856,46 @@ def parse_stop_sequences(body):
 
 class StopFilter:
     """Stream text without exposing a full or partial stop sequence."""
-    def __init__(self, sequences, emit):
+    def __init__(self, sequences, emit, ignore_leading=False):
         self.sequences = tuple(sequences)
         self.emit = emit
+        self.ignore_leading = ignore_leading
         self.pending = ""
         self.matched = None
+        self.useful_content_seen = False
+        self.leading_matches_ignored = 0
+
+    def _emit(self, text):
+        if text:
+            self.emit(text)
+            if text.strip():
+                self.useful_content_seen = True
 
     def feed(self, chunk):
         if self.matched is not None:
             return
         text = self.pending + chunk
-        match = None
-        for order, sequence in enumerate(self.sequences):
-            offset = text.find(sequence)
-            candidate = (offset, order, sequence)
-            if offset >= 0 and (match is None or candidate[:2] < match[:2]):
-                match = candidate
-        if match is not None:
-            offset, _order, self.matched = match
-            if offset:
-                self.emit(text[:offset])
-            self.pending = ""
+        self.pending = ""
+        while True:
+            match = None
+            for order, sequence in enumerate(self.sequences):
+                offset = text.find(sequence)
+                candidate = (offset, order, sequence)
+                if offset >= 0 and (match is None or candidate[:2] < match[:2]):
+                    match = candidate
+            if match is None:
+                break
+            offset, _order, sequence = match
+            prefix = text[:offset]
+            if (self.ignore_leading and not self.useful_content_seen
+                    and not prefix.strip()):
+                self.leading_matches_ignored += 1
+                text = text[offset + len(sequence):]
+                if not text:
+                    return
+                continue
+            self.matched = sequence
+            self._emit(prefix)
             return
 
         hold = 0
@@ -887,12 +906,12 @@ class StopFilter:
                 hold = size
         flush = len(text) - hold
         if flush:
-            self.emit(text[:flush])
+            self._emit(text[:flush])
         self.pending = text[flush:]
 
     def finish(self):
         if self.matched is None and self.pending:
-            self.emit(self.pending)
+            self._emit(self.pending)
         self.pending = ""
 
     def stopped(self):
@@ -1521,6 +1540,10 @@ class APIHandler(BaseHTTPRequestHandler):
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, "`response_format` grammars are not supported by the Inkling "
                                 "engine yet.", "response_format", "unsupported_parameter")
+        ignore_leading_stop = body.get("x_colibri_ignore_leading_stop", False)
+        if not isinstance(ignore_leading_stop, bool):
+            raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
+                           "x_colibri_ignore_leading_stop", "invalid_value")
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
@@ -1547,7 +1570,7 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
-                stop_filter = StopFilter(stop_sequences, output.append)
+                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
@@ -1671,7 +1694,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
-                stop_filter = StopFilter(stop_sequences, emit_tools)
+                stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
@@ -1690,7 +1713,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (splitter.feed if splitter else emit)(chunk)
-                stop_filter = StopFilter(stop_sequences, emit_plain)
+                stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)

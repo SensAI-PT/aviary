@@ -140,6 +140,32 @@ class StopFilterTest(unittest.TestCase):
         stop_filter.finish()
         self.assertEqual("".join(output), "answer ST")
 
+    def test_optional_patient_mode_ignores_only_leading_matches(self):
+        output = []
+        stop_filter = StopFilter(("<|user|>",), output.append, ignore_leading=True)
+        for chunk in ("<|us", "er|>answer", "<|user|>ignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer")
+        self.assertEqual(stop_filter.matched, "<|user|>")
+        self.assertEqual(stop_filter.leading_matches_ignored, 1)
+
+    def test_patient_mode_preserves_remainder_after_same_chunk_leading_match(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append, ignore_leading=True)
+        stop_filter.feed("STOPuseful STOPdiscarded")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "useful ")
+        self.assertEqual(stop_filter.matched, "STOP")
+
+    def test_strict_mode_still_stops_on_a_leading_match(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append)
+        stop_filter.feed("STOPignored")
+        stop_filter.finish()
+        self.assertEqual(output, [])
+        self.assertEqual(stop_filter.matched, "STOP")
+
 
 class ProtocolTest(unittest.TestCase):
     def test_reads_payload_and_extended_status(self):
@@ -589,6 +615,24 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "H")
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(self.engine.stop_requests, before + 1)
+
+    def test_patient_stop_extension_ignores_a_leading_match(self):
+        before = self.engine.stop_requests
+        with self.request("/v1/chat/completions", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stop": "H", "x_colibri_ignore_leading_stop": True,
+        }) as response:
+            body = json.load(response)
+        self.assertEqual(body["choices"][0]["message"]["content"], "éllo")
+        self.assertEqual(self.engine.stop_requests, before)
+
+    def test_patient_stop_extension_requires_a_boolean(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "stop": "H", "x_colibri_ignore_leading_stop": "yes",
+            })
+        self.assertEqual(caught.exception.code, 400)
 
     def test_rejects_invalid_cache_slot(self):
         with self.assertRaises(HTTPError) as caught:
