@@ -19,13 +19,23 @@ comment): the engine tells fmt=7 (this tool's output) apart from fmt=1 (plain
 int8) ONLY by scale-array geometry -- per-row for fmt=1, per-128x128-block for
 fmt=7. This tool must therefore emit .qs sidecars whose byte count is EXACTLY
 ceil(O/128)*ceil(I/128)*4, never anything that could coincide with O*4 by
-accident for the shapes it targets (see _check_geometry below, which refuses
-rather than silently emitting a container the engine might misread). At I=98
-specifically, a single-block fp8 tensor's raw weight-byte count ALSO coincides
-with a genuine fmt=6 (E8/IQ3) tensor's -- see qt_resolve_fmt's "SECOND DESIGN
-LANDMINE" comment; this tool does not target I=98 shapes in practice (Z.ai's
-real projections don't land there), but the engine's read-side refusal covers
-it regardless.
+accident for the shapes it targets -- ENFORCED, not just asserted, by
+_check_geometry below (maintainer review, #528): it refuses to repack any
+[O,I] where nblkO*nblkI==O, the exact shape where this tool's own block-scale
+byte count would coincide with a per-row int8 scale byte count. This is not
+hypothetical: GLM-5.2's own self_attn.o_proj.weight ([6144,16384]) is a real
+instance (nblkO=48, nblkI=128, product=6144==O). It matters more now than it
+used to, because the engine's UNSTAMPED read-side collision policy resolves an
+ambiguous shape to fmt=1 rather than refusing (see qt_resolve_fmt's
+INVERSION) -- so an fmt=7 container this tool emitted at such a shape would be
+silently read back as plain int8, not caught by a read-side refusal. Avoiding
+the collision at write time is therefore load-bearing, not a redundant
+belt-and-braces check. At I=98 specifically, a single-block fp8 tensor's raw
+weight-byte count ALSO coincides with a genuine fmt=6 (E8/IQ3) tensor's -- see
+qt_resolve_fmt's "SECOND DESIGN LANDMINE" comment; this tool does not target
+I=98 shapes in practice (Z.ai's real projections don't land there), and that
+narrower collision is unchanged by this PR (still an unconditional read-side
+refusal), so _check_geometry does not additionally guard against it here.
 
 SCALE ENCODING: this tool always emits f32 block scales (4 bytes/block, the
 `.to(torch.float32)` below) -- the ENCODING this build implements. It never
@@ -112,13 +122,32 @@ def _check_geometry(name, O, I, nblkO, nblkI):
     doesn't match what qt_resolve_fmt expects for [O,I] -- the same "untrusted
     container" discipline the C side applies on read, applied here on write so a
     malformed source checkpoint is caught at repack time, not at load time three
-    steps later with a confusing engine-side refusal."""
+    steps later with a confusing engine-side refusal.
+
+    WRITER-SIDE REFUSAL (maintainer review, #528): also refuses at the AMBIGUOUS
+    shape THE DESIGN LANDMINE describes (qt_resolve_fmt in colibri.c) -- where
+    O == ceil(O/128)*ceil(I/128), i.e. this tensor's block-scale byte count
+    (nblkO*nblkI*4) exactly equals a per-row int8 scale byte count (O*4). GLM-5.2's
+    own self_attn.o_proj.weight ([6144,16384]) is a REAL, non-hypothetical instance
+    of this shape. The engine's reader now resolves an unstamped collision to fmt=1
+    (the incumbent, decodable format) rather than refusing -- which makes it load
+    bearing that THIS tool never emits an fmt=7 container at such a shape: this
+    docstring's own opening promise ("never anything that could coincide with O*4
+    by accident") is enforced here, not just asserted."""
     exp_nblkO, exp_nblkI = _nblk(O), _nblk(I)
     if (nblkO, nblkI) != (exp_nblkO, exp_nblkI):
         raise ValueError(
             f"{name}: scale_inv block shape ({nblkO},{nblkI}) != expected "
             f"({exp_nblkO},{exp_nblkI}) for [{O},{I}] -- refusing to repack a shape "
             f"the engine's qt_resolve_fmt would either refuse or (worse) misread")
+    if nblkO * nblkI == O:
+        raise ValueError(
+            f"{name}: [{O},{I}] is an AMBIGUOUS fp8-e4m3-b128 shape -- its "
+            f"block-scale byte count (nblkO*nblkI*4={nblkO*nblkI*4}) exactly "
+            f"coincides with a per-row int8 scale byte count (O*4={O*4}) for the "
+            f"same [O,I]; refusing to emit an fmt=7 container the engine's "
+            f"qt_resolve_fmt collision policy would resolve to fmt=1 (int8-row), "
+            f"not fmt=7, on an unstamped read (THE DESIGN LANDMINE, colibri.c)")
 
 
 def shard_inventory(path, n_layers):

@@ -14,18 +14,32 @@
  * The two are told apart ONLY by the scale array's byte count (per-row O*4 for
  * fmt=1, per-128x128-block ceil(O/128)*ceil(I/128)*4 for fmt=7, THIS build's
  * implemented f32 scale encoding). For some shapes those two counts coincide
- * exactly -- qt_resolve_fmt must REFUSE (exit(1)) rather than guess. Refusal
- * is tested via fork()+waitpid(), mirroring tests/test_st_pread.c's
- * established convention for exit(1)-terminated paths.
+ * exactly -- INVERSION (maintainer review, #528): qt_resolve_fmt used to
+ * REFUSE (exit(1)) this ambiguous case; it now resolves to fmt=1 (the
+ * incumbent, already-on-disk, decodable format) instead, because the
+ * collision is not hypothetical (GLM-5.2's own self_attn.o_proj.weight hits
+ * it, see qt_resolve_fmt's own "REVIEW FINDING"/"INVERSION" comment) and the
+ * writer side (repack_fp8_passthrough.py's _check_geometry) now refuses to
+ * ever EMIT an fmt=7 container at this same shape, so an unstamped ambiguous
+ * tensor reaching this function is never a genuine fmt=7 candidate. The
+ * former refusal-testing convention (fork()+waitpid(), mirroring
+ * tests/test_st_pread.c's exit(1)-path idiom) is kept for the OTHER
+ * refusing cases below (Part A2's fmt=6 collision, Part A3's UE8M0
+ * recognized-not-implemented refusal, and the generic garbage-byte-count
+ * refusal) -- only the is_row&&is_blk collision in this Part flipped from
+ * expect_refuse to expect_fmt(...,1,...).
  *
  * Part A2: fmt=6 (E8/IQ3, upstream #465) vs fmt=7 collision at [O<=128 or
- * O in a 128-block-count range, I=98] -- SECOND DESIGN LANDMINE.
+ * O in a 128-block-count range, I=98] -- SECOND DESIGN LANDMINE. Unchanged by
+ * the #528 inversion above (a different collision predicate, still refused).
  *
  * Part A3: fmt=7's scale ENCODING is a declared property, not a hardcoded
  * constant -- f32 (Part A/A2 above) is what this build implements. A UE8M0
  * (1 byte/block) encoding is a REAL, distinct byte signature (the DeepSeek-V4
  * checkpoint format for this identical weight geometry) this build recognizes
- * and refuses BY NAME rather than misreading.
+ * and refuses BY NAME rather than misreading. Unchanged by the #528
+ * inversion (a stamp confirms the WEIGHT format, never a decoder this build
+ * doesn't have -- see qt_resolve_fmt's own comment).
  *
  * Part B: qt_from_disk loader-seam -- writes a real single-shard .safetensors
  * file containing an fmt=7 tensor (U8 weight + per-block F32 .qs) next to an
@@ -34,12 +48,18 @@
  * fmt=1 correctly and the loaded weights dequantize identically to a reference.
  * Mirrors tests/test_int3_load.c's structure for fmt=5.
  *
- * Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=7.
+ * Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=7, plus
+ * qt_wire_split() -- the shared weight/scale byte-range split qt_wire_mmap
+ * and qt_unwire_mmap both now call (maintainer review, #528: qt_scale_bytes()
+ * existed correctly but neither call site actually used it, a defect only
+ * -Wno-unused-function's suppression let compile clean).
  *
  * This build has NO container metadata stamp (see qt_resolve_fmt's own header
- * comment) -- every ambiguous/unimplemented-encoding shape below refuses
- * unconditionally; stamp-resolves-ambiguity behavior is a separate, follow-up
- * PR (registry + metadata stamp), not exercised here. */
+ * comment) -- every ambiguous/unimplemented-encoding shape below EXCEPT the
+ * is_row&&is_blk collision (now resolved to fmt=1, see Part A above) refuses
+ * unconditionally; stamp-resolves-ambiguity behavior for the OTHER
+ * collisions is a separate, follow-up PR (registry + metadata stamp), not
+ * exercised here. */
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
@@ -123,21 +143,46 @@ static void test_disambiguation(void){
     CHECK(expect_fmt(2048,6144,(int64_t)2048*6144,16LL*48*4,7,"fp8 2048x6144 (spec example)"));
     CHECK(expect_fmt(384,6144,(int64_t)384*6144,3LL*48*4,7,"fp8 384x6144 non-square block grid"));
 
+    /* --- REGRESSION (maintainer review, #528): GLM-5.2's own
+     * self_attn.o_proj.weight, [D,H*v_head]=[6144,16384]. nblkO=ceil(6144/128)=48,
+     * nblkI=ceil(16384/128)=128, product=6144==O -- this shape hits the
+     * is_row&&is_blk collision below on every GLM-5.2 checkpoint, and is a
+     * REAL, pre-existing, valid int8-row tensor, not a hypothetical. Confirmed
+     * against this repo's own v1 container header (o_proj weight U8
+     * 100,663,296 B == 6144*16384; .qs scale blob 24,576 B == 6144*4 ==
+     * 48*128*4, both at once) -- see the CENSUS SCAN
+     * (tools/fp8_collision_census.py) for the full enumerated family. An
+     * earlier revision of qt_resolve_fmt refused this shape unconditionally
+     * (exit(1) at load time on an ordinary model); the INVERSION resolves it
+     * to fmt=1 instead -- this is that non-refusal, asserted directly. */
+    CHECK(expect_fmt(6144,16384,(int64_t)6144*16384,6144LL*4,1,
+        "GLM-5.2 o_proj shape [6144,16384]: valid int8-row, ambiguous-by-byte-count, resolves fmt=1 (NOT a refusal)"));
+
     /* --- degenerate shapes: O<=128 makes nblkO==1, so ns_blk==nblkI*4 can
      * equal ns_row==O*4 whenever nblkI==O. Exhaustive-in-spirit sweep of the
-     * boundary the design landmine describes. --- */
-    CHECK(expect_refuse(1,1,      1,        4,  "degenerate O=1 I=1 (nblkI=1=O)"));
-    CHECK(expect_refuse(1,128,    128,      4,  "degenerate O=1 I=128 (nblkI=1=O, I at block edge)"));
-    CHECK(expect_refuse(2,256,    2LL*256,  8,  "degenerate O=2 I=256 (nblkI=2=O)"));
-    CHECK(expect_refuse(6,768,    6LL*768,  24, "degenerate O=6 I=768 (nblkI=6=O)"));
-    CHECK(expect_refuse(128,16384,128LL*16384, 512, "degenerate O=128 I=16384 (nblkO=1,nblkI=128=O)"));
+     * boundary the design landmine describes. INVERSION (maintainer review,
+     * #528): every one of these used to be an expect_refuse (exit(1)) -- the
+     * general family this collision predicate describes (any int8 tensor
+     * where O==ceil(O/128)*ceil(I/128)) includes real, valid, pre-existing
+     * tensors (see the o_proj case just above), so refusing was the wrong
+     * call across the board, not just for the three shapes the maintainer's
+     * review named explicitly ([128,16384],[256,16384],[384,16384] below) --
+     * every case in this sweep hits the exact same is_row&&is_blk branch and
+     * is flipped here for the same reason. --- */
+    CHECK(expect_fmt(1,1,      1,        4,  1, "degenerate O=1 I=1 (nblkI=1=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(1,128,    128,      4,  1, "degenerate O=1 I=128 (nblkI=1=O, I at block edge) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(2,256,    2LL*256,  8,  1, "degenerate O=2 I=256 (nblkI=2=O) -> fmt=1, was refuse"));
+    CHECK(expect_fmt(6,768,    6LL*768,  24, 1, "degenerate O=6 I=768 (nblkI=6=O) -> fmt=1, was refuse"));
+    /* the three shapes the maintainer's review named explicitly (his exact expect_refuse
+     * calls, O=128/256/384 at I=16384) -- FLIPPED to assert fmt=1. */
+    CHECK(expect_fmt(128,16384,128LL*16384, 512, 1, "degenerate O=128 I=16384 (nblkO=1,nblkI=128=O) -> fmt=1, was refuse"));
     /* O>128 degenerate case: nblkO=2, need nblkI=O/2 -- O=256,I=16384 -> nblkI=128, 2*128=256=O */
-    CHECK(expect_refuse(256,16384,256LL*16384, 1024, "degenerate O=256 I=16384 (nblkO=2,nblkI=128, product=O)"));
+    CHECK(expect_fmt(256,16384,256LL*16384, 1024, 1, "degenerate O=256 I=16384 (nblkO=2,nblkI=128, product=O) -> fmt=1, was refuse"));
     /* k=3: the ambiguity isn't a one-off O=256 coincidence -- it's structural for ANY
      * O that's a multiple of 128 (nblkO=k), since nblkI==128 (I in (16256,16384]) always
      * makes nblkO*nblkI == k*128 == O. One more multiple (O=384=3*128) confirms the
      * condition generalizes past the k=2 worked example, not just a re-derivation. */
-    CHECK(expect_refuse(384,16384,384LL*16384, 1536, "degenerate O=384 I=16384 (nblkO=3,nblkI=128, k=3, product=O)"));
+    CHECK(expect_fmt(384,16384,384LL*16384, 1536, 1, "degenerate O=384 I=16384 (nblkO=3,nblkI=128, k=3, product=O) -> fmt=1, was refuse"));
 
     /* --- boundary-ADJACENT non-degenerate cases: one step past each
      * degenerate case above, both interpretations now legitimately resolve. --- */

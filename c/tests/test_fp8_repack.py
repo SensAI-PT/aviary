@@ -11,10 +11,14 @@ layout that convert_fp8_to_int4.py's dequant() reads) -- no real Z.ai shard is
 read or written by this suite, per the build's hard constraint. Covers:
 selection (resident kinds byte-preserved, routed experts / io / f32 excluded),
 byte-for-byte preservation of the fp8 weight and the .qs scale rename, the
-scale-geometry refusal path (THE DESIGN LANDMINE's write-side twin: a
-malformed source shard must be refused, not silently repacked into a
-container the engine's qt_resolve_fmt would then misread), --dry-run writing
-nothing, and the #383-class resume/params-guard behavior.
+scale-geometry refusal path in TWO forms (THE DESIGN LANDMINE's write-side
+twin) -- a malformed source shard (.qs shape doesn't match ceil(O/128)x
+ceil(I/128) for its weight) must be refused, AND a well-formed-but-AMBIGUOUS
+shape (nblkO*nblkI==O, where this tensor's block-scale byte count would
+coincide with a per-row int8 scale byte count) must ALSO be refused
+(maintainer review, #528: this is not hypothetical, GLM-5.2's own
+self_attn.o_proj.weight is a real instance) -- --dry-run writing nothing, and
+the #383-class resume/params-guard behavior.
 """
 import glob, json, os, struct, sys, tempfile, unittest
 
@@ -152,6 +156,34 @@ class SelectionTest(unittest.TestCase):
             rp.repack_shard(bad_path, n_layers=5)
         with self.assertRaises(ValueError):
             rp.shard_inventory(bad_path, n_layers=5)
+
+    def test_geometry_refusal_on_ambiguous_shape(self):
+        """WRITER-SIDE REFUSAL (maintainer review, #528): a WELL-FORMED .qs sidecar
+        (correct nblkOxnblkI shape for [O,I], unlike the malformed case above) must
+        still be refused when nblkO*nblkI==O -- the exact shape where this tensor's
+        block-scale byte count (nblkO*nblkI*4) would coincide with a per-row int8
+        scale byte count (O*4). Not hypothetical: GLM-5.2's own
+        self_attn.o_proj.weight ([6144,16384], nblkO=48 nblkI=128 product=6144==O)
+        is a real instance of this exact family; O=2,I=256 here is the smallest
+        realistic analog (nblkO=1, nblkI=2, product=2==O), the same degenerate
+        shape family c/tests/test_fp8_load.c's test_disambiguation() sweeps. The
+        engine's qt_resolve_fmt reader resolves an unstamped collision at this
+        shape to fmt=1 (int8-row) rather than refusing (see colibri.c's
+        INVERSION) -- so this tool refusing to ever EMIT an fmt=7 container here
+        is what keeps that reader-side resolution correct: an fmt=7 tensor this
+        tool produced at this shape would be silently read back as plain int8."""
+        amb_path = os.path.join(self.tmp.name, "ambiguous.safetensors")
+        O, I_ = 2, 256
+        w = torch.randn(O, I_).to(torch.float8_e4m3fn)
+        nblkO, nblkI = (O + 127) // 128, (I_ + 127) // 128
+        self.assertEqual(nblkO * nblkI, O, "fixture must actually hit the collision")
+        scale = torch.ones(nblkO, nblkI, dtype=torch.float32)   # WELL-FORMED for [O,I] -- passes the first check
+        save_file({"model.layers.0.self_attn.o_proj.weight": w,
+                  "model.layers.0.self_attn.o_proj.weight_scale_inv": scale}, amb_path)
+        with self.assertRaises(ValueError):
+            rp.repack_shard(amb_path, n_layers=5)
+        with self.assertRaises(ValueError):
+            rp.shard_inventory(amb_path, n_layers=5)
 
 
 class ResumeAndParamsGuardTest(unittest.TestCase):

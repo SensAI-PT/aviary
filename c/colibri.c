@@ -1324,11 +1324,34 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * unambiguous. But for small O (<=128) and/or small I, ceil(O/128)*
      * ceil(I/128) can equal O exactly (e.g. O=1,I<=128 -> 1*1=1=O; O=2,I in
      * [129,256] -> 1*2=2=O; O=256,I in (16256,16384] -> 2*128=256=O) -- a
-     * tensor whose scale array satisfies BOTH conventions at once. Guessing
-     * either way risks silently reading a genuine per-row-int8 tensor as
-     * block-scaled FP8 (or vice versa), which would corrupt every weight
-     * without any error. Refuse instead (same "untrusted container"
-     * discipline as the rest of this function).
+     * tensor whose scale array satisfies BOTH conventions at once.
+     *
+     * REVIEW FINDING (maintainer, #528): this collision is not a theoretical
+     * corner case. GLM-5.2's own self_attn.o_proj.weight loads as
+     * [D,H*v_head] = [6144,16384]: nblkO=ceil(6144/128)=48,
+     * nblkI=ceil(16384/128)=128, nblkO*nblkI=6144==O -- a real, pre-existing,
+     * VALID int8-row o_proj tensor hits this exact byte-count collision on
+     * every GLM-5.2 checkpoint this engine has ever loaded. The general
+     * family is any int8 tensor where O==ceil(O/128)*ceil(I/128) (see the
+     * CENSUS SCAN, tools/fp8_collision_census.py, for the complete
+     * enumerated set over this repo's own containers). An earlier revision
+     * of this function refused unconditionally here -- exit(1) at load time
+     * on an ordinary, already-shipping, valid model -- which is a strictly
+     * worse failure mode than the misread it was guarding against.
+     *
+     * INVERSION: an ambiguous shape resolves to fmt=1 -- the incumbent,
+     * already-on-disk, decodable format -- instead of refusing. This is sound
+     * because the WRITER side (tools/repack_fp8_passthrough.py's
+     * _check_geometry) now refuses to EMIT an fmt=7 container at any shape
+     * satisfying this same collision predicate: no genuine fmt=7 tensor this
+     * engine's own tooling can produce will ever reach this branch, so
+     * resolving to fmt=1 here is not a guess against a live fmt=7 candidate --
+     * it is the only remaining candidate for an UNSTAMPED container. A
+     * self-describing __metadata__ stamp that lets a THIRD-PARTY fmt=7
+     * container resolve at this same colliding shape is a separate mechanism
+     * (see qt_verify_fmt_stamp / the stamped build of this function) -- this
+     * (unstamped) function has no stamp to consult and always commits to the
+     * incumbent format.
      *
      * SCALE ENCODING IS A DECLARED PROPERTY, not a hardcoded constant: f32 (4
      * bytes/block, above) is what THIS build implements, but it is not the
@@ -1362,12 +1385,16 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
         int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
         int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4, ns_blk_ue8m0=nblkO*nblkI;
         int is_row=(ns==ns_row), is_blk=(ns==ns_blk), is_blk_ue8m0=(ns==ns_blk_ue8m0);
-        if(is_row && is_blk){
-            fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
-                "int8 (fmt=1) and per-128x128-block FP8 (fmt=7) scale geometry; refusing "
-                "rather than guessing (untrusted container, THE DESIGN LANDMINE)\n",
-                name,O,I,(long long)ns); exit(1);
-        }
+        /* THE DESIGN LANDMINE, INVERTED (maintainer review, #528): is_row&&is_blk
+         * used to exit(1) here unconditionally -- see the comment above this
+         * function's "REVIEW FINDING"/"INVERSION" paragraphs for why that was
+         * wrong. No explicit branch is needed to resolve it to fmt=1: `fmt` is
+         * already 1 at this point (this whole `if(fmt==1)` block only runs when
+         * nb==exp_i8, which is what set fmt=1 above), and the `is_blk && !is_row`
+         * check further down evaluates false whenever is_row is true -- so an
+         * is_row&&is_blk shape simply falls through unchanged to fmt=1. This
+         * comment exists so a future reader doesn't mistake the missing branch
+         * for an oversight. */
         if(is_blk_ue8m0){
             fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
                 "implemented; only f32 block scales are supported in this build (nb=%lld "
