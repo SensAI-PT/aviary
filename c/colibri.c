@@ -2877,14 +2877,20 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
      * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s].
-     * fmt!=7 guards (q_a/q_b/kv_a/o): coli_metal_attn_decode's WP_() macro and the
-     * mm_gemv shader it dispatches through (bind_gemv) have no fmt=7 case in this
-     * build -- an fp8-passthrough tensor reaching here would be silently misread as
-     * f32 by the shader's default branch. Fail closed to the CPU path below instead
-     * (matmul_qt_ex there dispatches fmt=7 correctly via matmul_fp8). kv_b is already
-     * pinned to fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
-     * these four checks are the same discipline extended to the tensors that flow
-     * through the generic per-fmt shader. */
+     * fmt!=7 guards (q_a/q_b/kv_a/o): STALE-COMMENT FIX -- this PR's own mm_gemv
+     * Metal shader (backend_metal.mm) DOES have a real fmt==7 branch (fp8-e4m3
+     * decode + per-128x128-block scale); the shader is not the gap. The actual
+     * blocker is the WP_() macro two lines below: it picks q8 only for fmt==1,
+     * else q4 -- and q4 is NULL/unallocated for fmt=7 (same convention as fmt=1,
+     * see the QT struct comment), so an fmt=7 tensor reaching
+     * coli_metal_attn_decode would hand the kernel a NULL weight pointer, not a
+     * misread-as-f32 shader. Fail closed to the CPU path below instead
+     * (matmul_qt_ex there dispatches fmt=7 correctly via matmul_fp8); fixing
+     * WP_() and actually wiring fmt=7 through bind_gemv/coli_metal_attn_decode is
+     * a deferred follow-up (see this PR's GPU-path note), not done in this
+     * round. kv_b is already pinned to fmt==2 above for an unrelated reason (its
+     * absorb kernel is int4-only); these four checks are the same discipline
+     * extended to the tensors that flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
@@ -5096,9 +5102,14 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows.
      * fmt!=7 guards (q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): same fail-closed discipline
      * as attention_rows, extended to the shared-expert MLP this fused kernel also
-     * covers -- none of these seven bind_gemv-routed tensors has fmt=7 support in this
-     * build's mm_gemv shader, so any of them carrying fmt=7 must skip the whole fused
-     * path (CPU below dispatches fmt=7 correctly via matmul_qt_ex/matmul_fp8). */
+     * covers. STALE-COMMENT FIX -- the mm_gemv shader these bind_gemv calls dispatch
+     * through DOES have a real fmt==7 branch (this PR's own Metal kernel commit); the
+     * actual gap is the WP_() macro below, which picks q8 only for fmt==1 and q4
+     * (NULL/unallocated for fmt=7) otherwise, so none of these seven bind_gemv-routed
+     * tensors can safely carry fmt=7 through this fused path yet -- CPU below
+     * dispatches fmt=7 correctly via matmul_qt_ex/matmul_fp8. Fixing WP_() and wiring
+     * fmt=7 through bind_gemv is the same deferred follow-up noted in attention_rows,
+     * not done in this round. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
