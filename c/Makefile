@@ -290,7 +290,9 @@ endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
 # for resident expert tensors. Independent of CUDA/HIP: works on GPUs ROCm doesn't
-# support (Polaris/RX 580) and measured ~35% faster than ROCm on RDNA4 for int4 experts.
+# support (Polaris/RX 580); the VRAM-resident int4 expert-group PRIMITIVE measured ~35%
+# faster than the ROCm/HIP one on an RX 9070 (per-call incl. readback — end-to-end tok/s
+# depends on what else bounds the box; see docs/vulkan.md, benchmarking notes included).
 # Needs libvulkan + glslc (shaderc). Default build unchanged (all colibri.c hooks under
 # #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at runtime from
 # COLI_VK_SHADERS (default: alongside the binary / ./shaders).

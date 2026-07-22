@@ -364,6 +364,33 @@ int coli_vk_init(const char *spv_path) {
     G.memtype = (uint32_t)mt;
     G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
 
+    /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
+     * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
+     * ~256 MB BAR window (or not at all), so tier allocations silently land in system
+     * RAM and every access crosses PCIe — measurably SLOWER than the CPU path, while
+     * the resident-experts log still reports an apparently healthy VRAM tier. Compare
+     * the chosen type's heap against the largest DEVICE_LOCAL heap and say so up front. */
+    {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+        VkDeviceSize dl_max = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+            if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
+        VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
+        VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
+        if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
+                    "will live in system RAM and every access crosses PCIe (expect slower than "
+                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS.\n");
+        else if (dl_max && hv_dl * 4 < dl_max)
+            fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
+                    "appears disabled) — allocations beyond the %llu MB window fall back to system "
+                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.\n",
+                    (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
+                    (unsigned long long)(hv_dl >> 20));
+    }
+
     G.shader = load_spv(G.dev, spv_path);
     if (!G.shader) return 0;
     if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
