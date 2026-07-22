@@ -1341,14 +1341,19 @@ static const char *qt_name_by_fmt(int fmt){
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
  * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/6/8) e scrive *gs.
- * No container-level format stamp is consulted INSIDE this function yet in
- * this commit -- qt_verify_fmt_stamp (below) checks one AFTER the fact, a
- * pure post-hoc cross-check that cannot yet resolve a genuine byte-collision
- * below (every ambiguous shape this function can see still refuses
- * unconditionally here). A follow-up commit threads a `stamped_name`
- * parameter into this function itself so a stamp can resolve those
- * collisions instead of merely confirming an already-unambiguous result. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+ * `stamped_name`: the tensor's __metadata__ format-NAME stamp if the caller
+ * looked one up (st_fmt_stamp, st.h), else NULL -- used ONLY to break a
+ * genuine byte-count collision (see THE DESIGN LANDMINE and the SECOND
+ * DESIGN LANDMINE below); every other decision in this function is
+ * byte-arithmetic alone, unchanged by whether a stamp is present. A stamp
+ * can never grant this build a decoder it doesn't have: the UE8M0
+ * scale-encoding refusals below stay refusals even when a stamp names
+ * "fp8-e4m3-b128" correctly, because that name confirms the WEIGHT format,
+ * not a scale encoding this build can read. Routed-expert callers
+ * (expert_load_impl and friends) always pass NULL: this branch's repack
+ * tool never stamps routed experts, so there is nothing for those paths to
+ * consult. */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs, const char *stamped_name){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
@@ -1371,24 +1376,36 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      *     with UE8M0, just against fmt=6's tag instead of fmt=1's per-row
      *     count; see that landmine's own comment for the general shape.
      *   - at O==1 specifically, fmt=1's own per-row tag (O*4) is also 4.
-     * Refuse unconditionally when any of these coincide with the E8/IQ3 tag --
-     * this build has no stamp to break the tie (see the function's own header
-     * comment) -- rather than let dev's own unconditional `return 6` silently
-     * misread an fp8-e4m3-b128 (or, at O==1, plain int8) tensor as E8/IQ3-
-     * lattice-decoded garbage with no error. No real GLM tensor has these
-     * shapes; the discipline exists for untrusted containers. */
+     * A stamp naming exactly one live candidate resolves the ambiguity --
+     * EXCEPT a "fp8-e4m3-b128" stamp on the UE8M0-shaped candidate: the stamp
+     * confirms the WEIGHT format, not a scale encoding this build can decode,
+     * so that specific case still refuses (same "recognized but not
+     * implemented" discipline as the landmine below). Everything else
+     * (unstamped, or a stamp that doesn't resolve) refuses rather than let
+     * dev's own unconditional `return 6` silently misread an fp8-e4m3-b128
+     * (or, at O==1, plain int8) tensor as E8/IQ3-lattice-decoded garbage with
+     * no error. No real GLM tensor has these shapes; the discipline exists
+     * for untrusted containers. */
     if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){
         int fp8_blk_f32_also   = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==1);
         int fp8_blk_ue8m0_also = (nb==(int64_t)O*I) && (fp8_nblk(O)*fp8_nblk(I)==4);
         int i8_row_also        = (nb==(int64_t)O*I) && (O==1);   /* ns==O*4==4 iff O==1 */
         if(fp8_blk_f32_also || fp8_blk_ue8m0_also || i8_row_also){
+            int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+            if(sf==6){ *gs=0; return 6; }
+            if(sf==8 && fp8_blk_f32_also){ *gs=0; return 8; }
+            if(sf==1 && i8_row_also){ *gs=0; return 1; }
+            /* sf==8 with only fp8_blk_ue8m0_also true falls through here too --
+             * see the comment above this block. */
             fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
                 "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
-                "container, fmt=6 collision at I=98)\n",
+                "container, fmt=6 collision at I=98)%s\n",
                 name,O,I,(long long)nb,(long long)ns,
                 fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=8, single block)" : "",
                 fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks, recognized-not-implemented)" : "",
-                i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "");
+                i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "",
+                stamped_name ? " -- metadata stamp present but names a format/encoding that doesn't resolve the ambiguity"
+                             : "");
             exit(1);
         }
         *gs=0; return 6;
@@ -1427,19 +1444,24 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * on an ordinary, already-shipping, valid model -- which is a strictly
      * worse failure mode than the misread it was guarding against.
      *
-     * INVERSION: an ambiguous shape resolves to fmt=1 -- the incumbent,
-     * already-on-disk, decodable format -- instead of refusing. This is sound
-     * because the WRITER side (tools/repack_fp8_passthrough.py's
-     * _check_geometry) now refuses to EMIT an fmt=8 container at any shape
-     * satisfying this same collision predicate: no genuine fmt=8 tensor this
-     * engine's own tooling can produce will ever reach this branch, so
-     * resolving to fmt=1 here is not a guess against a live fmt=8 candidate --
-     * it is the only remaining candidate for an UNSTAMPED container. A
-     * self-describing __metadata__ stamp that lets a THIRD-PARTY fmt=8
-     * container resolve at this same colliding shape is a separate mechanism
-     * (see qt_verify_fmt_stamp / the stamped build of this function) -- this
-     * (unstamped) function has no stamp to consult and always commits to the
-     * incumbent format.
+     * INVERSION, governing the UNSTAMPED case: an ambiguous shape with no
+     * resolving stamp resolves to fmt=1 -- the incumbent, already-on-disk,
+     * decodable format -- instead of refusing. This is sound because the
+     * WRITER side (tools/repack_fp8_passthrough.py's _check_geometry) now
+     * refuses to EMIT an fmt=8 container at any shape satisfying this same
+     * collision predicate: no genuine fmt=8 tensor this engine's own tooling
+     * can produce will ever reach this branch unstamped, so resolving to
+     * fmt=1 here is not a guess against a live fmt=8 candidate -- it is the
+     * only remaining candidate. THE STAMPED CASE IS UNCHANGED by this
+     * inversion: a metadata stamp present and naming exactly one of the two
+     * colliding candidates (int8-row or fp8-e4m3-b128) still resolves via
+     * that stamp through the existing TRUST-VERIFY-REFUSE path below (the
+     * maintainer verified that path is sound on #524/#529) -- a THIRD-PARTY
+     * fmt=8 container can still declare itself at this same colliding shape
+     * and be believed, exactly as before. A stamp naming anything else
+     * (unrecognized, or a format that isn't one of the two candidates) does
+     * NOT resolve the ambiguity and refuses, same as it did before this
+     * inversion -- the inversion changes ONLY what an absent stamp does here.
      *
      * SCALE ENCODING IS A DECLARED PROPERTY, not a hardcoded constant: f32 (4
      * bytes/block, above) is what THIS build implements, but it is not the
@@ -1464,35 +1486,60 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * small-O regime that makes the fmt=1-vs-fmt=8-f32 collision above
      * possible also makes a fmt=1-vs-fmt=8-ue8m0 collision possible (e.g.
      * O=1, I in (384,512]: nblkO=1, nblkI=4, ue8m0 ns=4=O*4=fmt=1's own
-     * per-row count) -- handled below by refusing whenever the ue8m0
-     * signature matches, noting the row collision too when it also applies.
-     * No real GLM tensor has these shapes; see also the SECOND DESIGN
-     * LANDMINE above for the analogous ue8m0-vs-fmt=6 corner this same
-     * signature can hit. */
+     * per-row count). A stamp naming "int8-row" resolves that specific
+     * corner to fmt=1 (the stamp confirms it really is plain int8, a format
+     * this build CAN decode); a stamp naming "fp8-e4m3-b128" does NOT resolve
+     * it, for the same "recognized but not implemented" reason the clean
+     * (non-colliding) ue8m0 case below refuses regardless of any stamp. No
+     * real GLM tensor has these shapes; see also the SECOND DESIGN LANDMINE
+     * above for the analogous ue8m0-vs-fmt=6 corner this same signature can
+     * hit. */
     if(fmt==1){
         int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
         int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4, ns_blk_ue8m0=nblkO*nblkI;
         int is_row=(ns==ns_row), is_blk=(ns==ns_blk), is_blk_ue8m0=(ns==ns_blk_ue8m0);
-        /* THE DESIGN LANDMINE, INVERTED (maintainer review, #528): is_row&&is_blk
-         * used to exit(1) here unconditionally -- see the comment above this
-         * function's "REVIEW FINDING"/"INVERSION" paragraphs for why that was
-         * wrong. No explicit branch is needed to resolve it to fmt=1: `fmt` is
-         * already 1 at this point (this whole `if(fmt==1)` block only runs when
-         * nb==exp_i8, which is what set fmt=1 above), and the `is_blk && !is_row`
-         * check further down evaluates false whenever is_row is true -- so an
-         * is_row&&is_blk shape simply falls through unchanged to fmt=1. This
-         * comment exists so a future reader doesn't mistake the missing branch
-         * for an oversight. */
-        if(is_blk_ue8m0){
-            fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
-                "implemented; only f32 block scales are supported in this build (nb=%lld "
-                "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
-                "1 byte/block)%s\n",
-                name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
-                is_row ? " -- scale array ALSO matches per-row int8 (fmt=1); refusing either way (untrusted container)" : "");
-            exit(1);
-        }
-        if(is_blk && !is_row) fmt=8;
+        int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
+        /* THE DESIGN LANDMINE, INVERTED for the UNSTAMPED case (maintainer
+         * review, #528): is_row&&is_blk with no resolving stamp used to
+         * exit(1) unconditionally -- see this function's "REVIEW
+         * FINDING"/"INVERSION" comment above for why that was wrong. The
+         * STAMPED sub-case (sf==1 || sf==8) is untouched by the inversion:
+         * it already resolved via TRUST-VERIFY-REFUSE before this revision
+         * and still does. Only the "no stamp, or a stamp that names neither
+         * candidate" branch changes: it used to exit(1); it now falls
+         * through to fmt=1 (already the value coming into this block, so no
+         * explicit assignment is needed -- the `is_blk && !is_row` check
+         * further down evaluates false whenever is_row is true). A stamp
+         * that names some OTHER, unrelated format still refuses -- the
+         * inversion applies only to the genuinely stamp-less case. */
+        if(is_row && is_blk){
+            if(sf==1 || sf==8){
+                fmt = sf;
+            } else if(stamped_name){
+                fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                    "int8 (fmt=1) and per-128x128-block FP8 (fmt=8) scale geometry; refusing "
+                    "rather than guessing (untrusted container, THE DESIGN LANDMINE) -- metadata "
+                    "stamp present but names a format that doesn't resolve the ambiguity\n",
+                    name,O,I,(long long)ns);
+                exit(1);
+            }
+            /* else (no stamp at all): falls through to fmt=1, the INVERSION. */
+        } else if(is_blk_ue8m0){
+            if(sf==1 && is_row){
+                fmt = 1;   /* stamp confirms this is genuinely plain int8, not an
+                            * unimplemented-encoding fp8 tensor -- safe to resolve. */
+            } else {
+                fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
+                    "implemented; only f32 block scales are supported in this build (nb=%lld "
+                    "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
+                    "1 byte/block)%s%s\n",
+                    name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
+                    is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
+                    stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"
+                                 : "");
+                exit(1);
+            }
+        } else if(is_blk && !is_row) fmt=8;
     }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
                       : (fmt==5)? (int64_t)O*i3_groups(I)
@@ -1558,8 +1605,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
         int gs=0;
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
         const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped);
         qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
@@ -2121,7 +2168,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -2290,7 +2337,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -2484,7 +2531,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
          * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
