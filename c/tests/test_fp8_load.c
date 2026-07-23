@@ -897,7 +897,7 @@ static int expect_stamp_refuse(const char *dir, const char *tag){
         _exit(42);                             /* reaching here is the bug */
     }
     close(pipefd[1]);
-    char err[1024]={0}; ssize_t n=read(pipefd[0],err,sizeof(err)-1); (void)n;
+    char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
     close(pipefd[0]);
     int status=0; waitpid(pid,&status,0);
     int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
@@ -1049,7 +1049,7 @@ static void test_stamp_map_cap_exceeded(void){
             _exit(42);              /* reaching here is the bug */
         } else if(pid > 0){
             close(pipefd[1]);
-            char err[1024]={0}; ssize_t n=read(pipefd[0],err,sizeof(err)-1); (void)n;
+            char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
             close(pipefd[0]);
             int status=0; waitpid(pid,&status,0);
             int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
