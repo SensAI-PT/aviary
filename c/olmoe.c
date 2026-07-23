@@ -13,6 +13,7 @@
  *   WIDE=N        : prefetch top-K*N candidates (default 1, try 2 or 3)
  *   SMOOTH=F      : EMA coefficient for routing momentum (default 0.3, range 0.0-0.95)
  *   CONF_LIMIT=F  : cumulative gate probability threshold for prefetch cutoff (default 0.92)
+ *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
