@@ -215,8 +215,9 @@ on-device across layers so the CPU expert loop runs uninterrupted; on Apple
 Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
 math on the unified-memory GPU; and a [Vulkan backend](docs/vulkan.md) brings
 the expert tier, dense projections, and the MLA attention core to any GPU with
-a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (measured faster than
-ROCm on RDNA4) and cards the vendor stacks no longer support.
+a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (the only backend for
+cards the vendor stacks no longer support, like the RX 580, and competitive
+with ROCm on RDNA4 — see [the benchmarking notes](docs/vulkan.md)).
 
 > **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
 > often a large win on drives with DRAM cache and bandwidth headroom (+34%
