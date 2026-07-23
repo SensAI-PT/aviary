@@ -832,6 +832,8 @@ GENERIC_JSON_GBNF = (
     'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
 )
 
+DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+
 
 def parse_stop_sequences(body):
     value = body.get("stop")
@@ -852,6 +854,21 @@ def parse_stop_sequences(body):
             raise APIError(400, "Each `stop` sequence must be a non-empty string.",
                            f"stop.{index}", "invalid_value")
     return tuple(sequences)
+
+
+def stop_policy(body, chat):
+    sequences = parse_stop_sequences(body)
+    ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
+    if not isinstance(ignore_leading, bool):
+        raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
+                       "x_colibri_ignore_leading_stop", "invalid_value")
+    if chat and not sequences:
+        # The chat template owns these role boundaries, so generic OpenAI
+        # clients should not need model-specific stop knowledge. Treat an
+        # occasional leading marker patiently; client-provided stops remain
+        # strict unless the extension is explicitly requested.
+        return DEFAULT_CHAT_STOP_SEQUENCES, True
+    return sequences, ignore_leading
 
 
 class StopFilter:
@@ -1533,17 +1550,14 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        maximum, temperature, top_p, grammar, stop_sequences = generation_options(
+        maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
         if grammar is not None and ARCH == "inkling":
             # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, "`response_format` grammars are not supported by the Inkling "
                                 "engine yet.", "response_format", "unsupported_parameter")
-        ignore_leading_stop = body.get("x_colibri_ignore_leading_stop", False)
-        if not isinstance(ignore_leading_stop, bool):
-            raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
-                           "x_colibri_ignore_leading_stop", "invalid_value")
+        stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls

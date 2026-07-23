@@ -10,9 +10,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from pathlib import Path
 
-from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
+from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+                           DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, StopFilter, _engine_error, generation_options,
-                           parse_tool_calls, read_engine_turn, render_chat, serve)
+                           parse_tool_calls, read_engine_turn, render_chat, serve, stop_policy)
 
 
 class FakeEngine:
@@ -121,6 +122,16 @@ class TemplateTest(unittest.TestCase):
         for value in ("", [], [""], ["1", "2", "3", "4", "5"], 7, ["ok", 7]):
             with self.subTest(value=value), self.assertRaises(APIError):
                 generation_options({"stop": value}, 8)
+
+    def test_chat_defaults_role_stops_without_changing_client_or_completion_policy(self):
+        self.assertEqual(stop_policy({}, True), (DEFAULT_CHAT_STOP_SEQUENCES, True))
+        self.assertEqual(stop_policy({}, False), ((), False))
+        self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
+        self.assertEqual(stop_policy({
+            "stop": "END", "x_colibri_ignore_leading_stop": True,
+        }, True), (("END",), True))
+        with self.assertRaises(APIError):
+            stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
 
 
 class StopFilterTest(unittest.TestCase):
