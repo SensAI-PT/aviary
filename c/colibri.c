@@ -592,6 +592,7 @@ static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded 
                                * lowest-gate-weight experts from the cross-position union. MoE-Spec
                                * (arXiv 2602.16052): top-32 of 64 capture 93% routing weight. */
 static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET across all layers */
+static int64_t g_budget_rescued=0; /* experts re-kept because a position would have been left with zero */
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -2985,21 +2986,55 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         /* build a lookup: for each expert id, is it kept? (reuse seen[]) */
         memset(seen,0,(size_t)E);
         for(int j=0;j<nu;j++) if(keep[j]) seen[uniq[j]]=1;
+        /* Nessuna posizione puo' restare a ZERO routed expert. keep[] parte da tutti
+         * i cache hit, quindi con nhits>=g_expert_budget il miss_budget e' 0 e una
+         * posizione il cui top-K e' fatto solo di miss viene compattata a w==0 (il
+         * guard `w>0` qui sotto lo ammette). Quel token riceverebbe solo lo shared
+         * expert, e lo stato nascosto sbagliato finisce nella KV cache avvelenando
+         * ogni token successivo — la stessa modalita' di guasto descritta sopra per
+         * il prefill (#292), raggiunta da un'altra direzione. Bastano S=2, K=1,
+         * EXPERT_BUDGET=1 e due miss diversi. Ripeschiamo il miss col peso di gate
+         * piu' alto della posizione e lo contiamo in STATS. */
+        for(int s=0;s<S;s++){
+            int alive=0;
+            for(int kk=0;kk<keff[s] && !alive;kk++) if(seen[idxs[(int64_t)s*K+kk]]) alive=1;
+            if(alive || keff[s]<=0) continue;
+            int be=-1; float bw=-1e30f;
+            for(int kk=0;kk<keff[s];kk++){
+                float wv=ws[(int64_t)s*K+kk];
+                if(wv>bw){ bw=wv; be=idxs[(int64_t)s*K+kk]; }
+            }
+            if(be<0) be=idxs[(int64_t)s*K];        /* pesi tutti non finiti: primo della lista */
+            seen[be]=1; g_budget_rescued++;
+            for(int j=0;j<nu;j++) if(uniq[j]==be && !keep[j]){ keep[j]=1; nkeep++; break; }
+        }
         int dropped=nu-nkeep; g_budget_dropped+=dropped;
         /* remove dropped experts from each position's routing list */
         for(int s=0;s<S;s++){
-            int w=0;
+            int w=0; float sold=0, snew=0;
             for(int kk=0;kk<keff[s];kk++){
-                int e=idxs[(int64_t)s*K+kk];
-                if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=ws[(int64_t)s*K+kk]; w++; }
+                int e=idxs[(int64_t)s*K+kk]; float wv=ws[(int64_t)s*K+kk];
+                sold+=wv;
+                if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=wv; snew+=wv; w++; }
             }
             if(w<keff[s]){
                 keff[s]=w;
                 /* renormalize remaining weights per position */
                 if(c->norm_topk && w>0){
+                    /* sm porta gia' routed_scale (applicato in FASE A): la divisione lo
+                     * cancella e il multiply qui sotto lo riapplica — non e' doppio scaling */
                     float sm=0; for(int kk=0;kk<w;kk++) sm+=ws[(int64_t)s*K+kk]; sm+=1e-20f;
                     for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]/=sm;
                     for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=c->routed_scale;
+                } else if(w>0 && snew>1e-20f && sold>snew){
+                    /* Senza norm_topk i pesi NON sono normalizzati: scartare expert
+                     * ridurrebbe la magnitudine del contributo routed di tutta la massa
+                     * di gate buttata via, cioe' il budget cambierebbe la matematica del
+                     * layer invece di risparmiare solo I/O. Riscaliamo per old/new (il
+                     * rapporto e' invariante a routed_scale) cosi' la magnitudine resta.
+                     * GLM-5.2 usa norm_topk=1, quindi questo tocca solo le altre config MoE. */
+                    float sc=sold/snew;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=sc;
                 }
             }
         }
@@ -4973,7 +5008,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
     if(g_cache_route) printf(" | CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f", g_route_j, g_route_m, g_route_p, g_route_alpha);
-    if(g_expert_budget) printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
+    if(g_expert_budget){
+        printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
+        if(g_budget_rescued) printf(" [%lld rescued: budget too tight, position would have had 0 routed experts]", (long long)g_budget_rescued);
+    }
     printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
