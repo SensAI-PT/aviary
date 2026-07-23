@@ -17,11 +17,19 @@ coordination alone.
 
 This registry (and the metadata stamp it documents) is PR 2 of a two-PR pair:
 PR 1 (`fmt7/fp8-passthrough`) shipped the CPU read path, repack tool, Metal
-kernel, and collision/refusal logic for `fmt=7` — refusing UNCONDITIONALLY at
-every ambiguous shape, since it carries no stamp. This PR stacks on top of it
-and adds the stamp (writer + reader) that lets those same collisions resolve
-instead of refuse, plus this registry document, as their own reviewable unit
-per the maintainer's request on
+kernel, and collision/refusal logic for `fmt=7`. **Post-INVERSION** (the
+#528 review round's fix, folded into PR 1 before this PR stacked on it): an
+UNSTAMPED tensor at the fmt=1-vs-fmt=7 ambiguous shape (THE DESIGN LANDMINE)
+no longer refuses — it resolves to `int8-row`, the incumbent,
+already-on-disk, decodable format, and the writer (`repack_fp8_passthrough.py`)
+refuses to ever EMIT an `fmt=7` container at that same ambiguous shape, so an
+unstamped collision is never silently misread either way. This PR stacks on
+top of that and adds the stamp (writer + reader): a stamp's role here is
+letting a genuinely-STAMPED `fmt=7` tensor at an ambiguous shape still be
+read as `fmt=7` (overriding the unstamped-case default) — and, for every
+tensor generally, confirming a stamped identity agrees with byte-arithmetic
+inference (TRUST-VERIFY-REFUSE) — plus this registry document, as their own
+reviewable unit per the maintainer's request on
 [#524](https://github.com/JustVugg/colibri/issues/524) to keep the convention
 discussion separate from the CPU+Metal implementation.
 
@@ -98,9 +106,13 @@ Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
   scale-array geometry, which is ambiguous for some small shapes) and the
   fmt=6 collision ("SECOND DESIGN LANDMINE") both live in `qt_resolve_fmt`
   (`c/colibri.c:1161`), which now also consults an optional `stamped_name`
-  parameter (this PR) to resolve them instead of refusing unconditionally
-  — see "The metadata stamp" below. FMT_NAMES table (name string <-> fmt
-  int): `c/colibri.c:1121`.
+  parameter (this PR): for the fmt=6 collision, a stamp resolves what an
+  absent stamp still refuses; for the fmt=1-vs-fmt=7 collision, an absent
+  stamp already resolves to `int8-row` since the #528 INVERSION, and a
+  stamp's role there is instead letting a genuinely-stamped `fmt=7` tensor
+  override that default — see "The metadata stamp" below for the exact
+  rule in both cases. FMT_NAMES table (name string <-> fmt int):
+  `c/colibri.c:1121`.
 
 ## Scale encoding is a declared property (fmt=7)
 
@@ -195,13 +207,21 @@ reference implementation of this proposal:
   this build doesn't recognize, is refused loudly — the tensor name and
   both identities (stamped vs. inferred) are printed and the process exits,
   matching `qt_resolve_fmt`'s existing "refuse rather than guess" posture
-  for untrusted containers. An absent stamp changes nothing: inference alone
+  for untrusted containers. An absent stamp changes nothing beyond what the
+  INVERSION already made the unstamped default (see above): inference alone
   decides, exactly as it does today for every container that predates this
-  feature. As a bonus, a stamp can also **resolve** a genuine byte-count
-  collision (the fmt=1-vs-fmt=7 and fmt=6-vs-fmt=7 cases above) instead of
-  the collision refusing unconditionally — see `qt_resolve_fmt`'s own
-  documentation for the exact rule, including the cases where even a
-  correct stamp still can't resolve one (the UE8M0 corners above).
+  feature. What a stamp adds differs by which collision it's breaking a tie
+  on: for the **fmt=6-vs-fmt=7** collision (SECOND DESIGN LANDMINE), an
+  unstamped tensor at that shape still refuses unconditionally — a stamp
+  naming the correct candidate **resolves** it instead, exactly as
+  originally designed. For the **fmt=1-vs-fmt=7** collision (THE DESIGN
+  LANDMINE), the INVERSION means an unstamped tensor at that shape no
+  longer refuses at all — a stamp's role there is letting a genuinely
+  stamped `fmt=7` tensor still be read as `fmt=7` (overriding the unstamped
+  default of `int8-row`), not resolving a refusal that no longer happens.
+  See `qt_resolve_fmt`'s own documentation for the exact rule in both
+  cases, including the cases where even a correct stamp still can't resolve
+  one (the UE8M0 corners above).
 
 ### Non-retroactivity
 

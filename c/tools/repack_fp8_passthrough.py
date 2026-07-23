@@ -86,12 +86,20 @@ stamp that agrees with the byte-arithmetic inference is a no-op (the tensor
 loads exactly as it would unstamped); a stamp that disagrees, or names a
 format this build doesn't recognize, is refused loudly (same "untrusted
 container" discipline as qt_resolve_fmt's own THE DESIGN LANDMINE refusal).
-As a bonus, a stamp can also RESOLVE a genuine byte-count collision (the
-fmt=1-vs-fmt=8 and fmt=6-vs-fmt=8 cases documented in qt_resolve_fmt) instead
-of the collision refusing unconditionally -- see qt_resolve_fmt's own
-documentation for the exact rule. Unstamped containers (any container from a
-tool that doesn't stamp) are unaffected: no stamp means inference alone
-decides, exactly as before this feature existed.
+What a stamp additionally lets resolve differs by collision (FIX ROUND 2:
+corrected a stale pre-INVERSION description here -- see qt_resolve_fmt's own
+documentation for the exact rule in both cases): for the fmt=6-vs-fmt=8
+collision, an unstamped tensor at that shape still refuses unconditionally --
+a stamp naming the correct candidate resolves it instead, as originally
+designed. For the fmt=1-vs-fmt=8 collision, the INVERSION (maintainer review,
+#528) means an unstamped tensor at that shape no longer refuses at all -- it
+resolves to int8-row by default -- so a stamp's role there is letting a
+genuinely-stamped fmt=8 tensor still be read as fmt=8 (overriding that
+default), not resolving a refusal that no longer happens. Unstamped
+containers (any container from a tool that doesn't stamp, including every
+container this tool itself has ever produced before this feature existed)
+are otherwise unaffected: no stamp means byte-arithmetic inference alone
+decides, exactly as it always has.
 
 HARD CONSTRAINT for this build: unit-tested on synthetic fixtures ONLY (see
 tests/test_fp8_repack.py, built with tools/glm_fp8_emit.py's exact real-
