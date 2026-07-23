@@ -2643,6 +2643,33 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 acc[base+k]+=cg*(float)((int)u-4); } }
         return; }
+    /* GUARD (fix round 2, engine defect -- clean-room conformance trial found a real
+     * SIGSEGV, reproduced): fmt 0/4/5 already returned above; everything below this
+     * point assumes a PER-ROW scale (t->s[row]) followed by fmt=1 (int8, explicit
+     * branch), fmt=2 (int4 packed, explicit branch), or the tail's own IMPLICIT fmt=3
+     * (int2 packed, the final unconditional block) -- there was no guard stopping any
+     * OTHER fmt from reaching here. fmt=6 (E8/IQ3): t->s is a FIXED 4-byte tag (ONE
+     * float total, qsalloc(1) in qt_from_disk), not O floats -- t->s[row] for row>0 is
+     * a heap OVERREAD, and the untouched fall-through then misreads t->q4's real E8
+     * lattice bytes as int2-packed data (same bug SHAPE as #298's CUDA absorb-kernel
+     * fix, and the same one this file's own fmt=4/5 branches above were added to
+     * dodge -- fmt=6 was simply missed). fmt=7 (fp8-e4m3-b128): t->s holds
+     * ceil(O/128)*ceil(I/128) per-block floats, not O -- t->s[row] overreads for
+     * row>=nblk (e.g. a [130,130] tensor has nblk=4, so every row past 3 already reads
+     * out of bounds), AND t->q4 is NULL for fmt=7 (raw bytes live in t->q8 instead,
+     * same convention as fmt=1 -- see the QT struct comment), so the fall-through's
+     * `t->q4+(int64_t)row*((I+3)/4)` dereferences NULL-plus-offset: SIGSEGV,
+     * reproduced (see the report's proof-of-bite transcript). Refuse loudly instead --
+     * this function has no byte-count context of its own to validate against (it only
+     * ever sees an already-resolved QT), so "unsupported fmt" is the only check
+     * available, same "refuse rather than misread" discipline qt_resolve_fmt applies
+     * at load time. */
+    if(t->fmt!=1 && t->fmt!=2 && t->fmt!=3){
+        fprintf(stderr,"qt_addrow: unsupported fmt=%d for the per-row-scale absorb path "
+            "(only fmt 1/2/3 reach this point; fmt 0/4/5 are handled above and return "
+            "before it) -- refusing rather than misread t->s[row]/t->q4\n", t->fmt);
+        exit(1);
+    }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
@@ -2689,8 +2716,21 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                     acc+=(float)((int)u-4)*x[base+k]; }
                 a+=(double)(acc*sr[g]); } }
-        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
+        /* fmt=3 (int2 packed, per-row scale) is the only fmt this final arm legitimately
+         * handles -- fmt 0/4/5 matched above, fmt 1/2 have their own explicit branches
+         * above too. Same GUARD and same reasoning as qt_addrow's (fix round 2, engine
+         * defect): fmt=6's t->s is a fixed 4-byte tag (t->s[row] overreads for row>0),
+         * fmt=7's t->s holds per-128x128-block floats (t->s[row] overreads for
+         * row>=nblk) and t->q4 is NULL for fmt=7 -- both would have silently misread or
+         * crashed here exactly like qt_addrow did before its own fix; refuse instead. */
+        else if(t->fmt==3){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+        else {
+            fprintf(stderr,"qt_matvec_rows: unsupported fmt=%d for the per-row-scale absorb "
+                "path (only fmt 0/1/2/3/4/5 are handled) -- refusing rather than misread "
+                "t->s[row]/t->q4\n", t->fmt);
+            exit(1);
+        }
         y[j]=(float)a;
     }
 }
