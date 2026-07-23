@@ -52,7 +52,15 @@
  * qt_wire_split() -- the shared weight/scale byte-range split qt_wire_mmap
  * and qt_unwire_mmap both now call (maintainer review, #528: qt_scale_bytes()
  * existed correctly but neither call site actually used it, a defect only
- * -Wno-unused-function's suppression let compile clean).
+ * -Wno-unused-function's suppression let compile clean). check_wire_split()
+ * exercises qt_wire_split() itself directly; test_wire_site_regression()
+ * (FIX ROUND, validator finding) additionally exercises the real
+ * qt_wire_mmap()/qt_unwire_mmap() call sites through a mem_wire()/munlock()
+ * observer seam (defined right below the #include below) -- a mutation that
+ * reverts ONLY those two call sites back to the old scale_b=(int64_t)t->O*4
+ * hardcode, leaving qt_wire_split() itself untouched, is invisible to
+ * check_wire_split() but fails test_wire_site_regression() (proven by
+ * actually running that exact mutation -- see the report).
  *
  * This build has NO container metadata stamp (see qt_resolve_fmt's own header
  * comment) -- every ambiguous/unimplemented-encoding shape below EXCEPT the
@@ -60,9 +68,41 @@
  * unconditionally; stamp-resolves-ambiguity behavior for the OTHER
  * collisions is a separate, follow-up PR (registry + metadata stamp), not
  * exercised here. */
+/* WIRE-SITE REGRESSION SEAM (FIX ROUND, validator finding). First attempt
+ * (superseded, kept as a note): renaming mem_wire() itself via macro does
+ * NOT work as an observer seam -- mem_wire is a real, internally-defined
+ * static function, so the SAME rename that frees up the name "mem_wire"
+ * for a shadow ALSO renames every CALL SITE (qt_wire_mmap's) to the new
+ * name, meaning qt_wire_mmap ends up calling the renamed-but-still-real
+ * function directly, bypassing any shadow defined under the old name
+ * entirely (confirmed by inspecting the preprocessed output -- caught
+ * before it could hide a broken test). The seam that actually works is one
+ * level lower: mlock()/munlock() themselves are EXTERNAL POSIX library
+ * functions with no body anywhere in this translation unit (only a
+ * declaration, via <sys/mman.h>, plus mem_wire's/qt_unwire_mmap's own call
+ * sites) -- renaming them redirects those call sites to a name THIS FILE
+ * provides its own (self-contained) definition for, with no real
+ * implementation being shadowed out of existence. This observes the EXACT
+ * (addr,len) qt_wire_mmap (via mem_wire) and qt_unwire_mmap actually pass
+ * down to the platform lock/unlock call -- not a reimplementation of what
+ * they SHOULD pass, and immune to a future mem_wire refactor since the
+ * seam sits at the syscall boundary, not the wrapper. #ifndef _WIN32:
+ * mlock/munlock are only called on this `#if defined(__APPLE__) ||
+ * defined(__linux__) || defined(__FreeBSD__)` arm; Windows uses
+ * compat_mlock/compat_munlock instead (untouched here, matching this
+ * file's existing POSIX-only test-seam convention -- the fork/pipe/waitpid
+ * refusal tests below skip analogously on Windows). */
+#ifndef _WIN32
+#define mlock test_mlock_seam
+#define munlock test_munlock_seam
+#endif
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
+#ifndef _WIN32
+#undef mlock
+#undef munlock
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -70,6 +110,38 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
+#endif
+
+/* Shadow definitions for the seam above -- must come after the #include so
+ * mem_wire's (unmodified, real) call to mlock() and qt_unwire_mmap's
+ * (unmodified, real) call to munlock() have already been renamed to these
+ * names by the #define above. Neither mlock() nor munlock() has a body
+ * anywhere in this translation unit (both are declared only, via
+ * <sys/mman.h>) -- these are the ONLY definitions the renamed call sites
+ * can resolve to, both self-contained: returning 0 (success) without
+ * actually locking/unlocking anything is fine for this test, since the
+ * buffer under test is never really mlocked in the first place (mirrors
+ * check_fp8_bytes'/check_wire_split's own stated reasoning that the real
+ * RLIMIT_MEMLOCK-gated syscall's success is environment-dependent and not
+ * what any of these tests need to prove). Non-static: both must match the
+ * extern linkage of the (renamed) declarations <sys/mman.h> already left in
+ * this translation unit -- a static definition here would conflict with
+ * that non-static declaration ("static declaration follows non-static
+ * declaration"). g_seam_wire_* observes mem_wire's (hence qt_wire_mmap's)
+ * calls; g_seam_unwire_* observes qt_unwire_mmap's direct calls. */
+#ifndef _WIN32
+static void *g_seam_wire_addr[4]; static size_t g_seam_wire_len[4]; static int g_seam_wire_n;
+int test_mlock_seam(const void *addr, size_t len){
+    if(g_seam_wire_n < 4){ g_seam_wire_addr[g_seam_wire_n]=(void*)addr; g_seam_wire_len[g_seam_wire_n]=len; }
+    g_seam_wire_n++;
+    return 0;
+}
+static void *g_seam_unwire_addr[4]; static size_t g_seam_unwire_len[4]; static int g_seam_unwire_n;
+int test_munlock_seam(const void *addr, size_t len){
+    if(g_seam_unwire_n < 4){ g_seam_unwire_addr[g_seam_unwire_n]=(void*)addr; g_seam_unwire_len[g_seam_unwire_n]=len; }
+    g_seam_unwire_n++;
+    return 0;
+}
 #endif
 
 static int fails = 0;
@@ -433,6 +505,89 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
         CHECK(got_scale != old_wrong_scale);
 }
 
+/* ---- Site-level wire regression (FIX ROUND, validator finding: mutation-
+ * proven gap). check_wire_split() above calls qt_wire_split() directly --
+ * it would NOT notice a mutation that reverts ONLY qt_wire_mmap's and
+ * qt_unwire_mmap's call sites back to the old inline
+ * `scale_b=(int64_t)t->O*4` hardcode, leaving qt_wire_split() itself
+ * intact (the two sites would simply stop CALLING the now-orphaned-again
+ * helper). This test calls the real qt_wire_mmap()/qt_unwire_mmap()
+ * functions and asserts, through the mlock()/munlock() observer seam
+ * defined above (right after the #include), that the (addr,len) each site
+ * ACTUALLY passed down to the platform lock call matches
+ * qt_scale_bytes()/qt_bytes() -- i.e. it observes the call sites' own
+ * behavior, not a reimplementation of it. Shape chosen so a reverted site
+ * is unmistakably wrong, not coincidentally right: O=2, I=16384 ->
+ * nblkO=1, nblkI=128, nblk=128, scale_b=512B; the old hardcode would
+ * compute O*4=8B instead, a 64x difference. Proven to bite: see the
+ * report's mutation output (the exact single-line revert, applied and
+ * reverted, with the resulting FAIL line pasted in). POSIX-only (like this
+ * file's fork-based refusal tests): the observer seam only intercepts the
+ * `#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)`
+ * arm both qt_wire_mmap (via mem_wire) and qt_unwire_mmap take -- Windows
+ * takes a different call (compat_mlock/compat_munlock) not intercepted
+ * here. */
+static void test_wire_site_regression(void){
+#ifndef _WIN32
+    g_seam_wire_n = 0; g_seam_unwire_n = 0;
+    enum { O=2, I=16384 };
+    enum { NBLKO = CDIV(O,128), NBLKI = CDIV(I,128), NBLK = NBLKO*NBLKI };
+    static uint8_t q7[O*I]; static float s7[NBLK];
+    for(int i=0;i<O*I;i++) q7[i]=rndbyte_nonan();
+    for(int i=0;i<NBLK;i++) s7[i]=0.01f+0.001f*(float)i;
+
+    QT t; memset(&t,0,sizeof t);
+    t.fmt=7; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q7; t.s=s7;
+
+    int64_t want_scale = qt_scale_bytes(&t);
+    int64_t want_weight = qt_bytes(&t) - want_scale;
+    /* sanity: this shape must actually distinguish the fix from the old bug,
+     * or the test below would pass either way and prove nothing. */
+    CHECK(want_scale != (int64_t)O*4);
+
+    /* qt_wire_mmap doesn't itself gate on g_mmap/mem_should_wire (its
+     * caller, pin_wire, does) -- calling it directly always attempts to
+     * wire, which is exactly what this test wants. */
+    int64_t wired=0; long failed=0;
+    qt_wire_mmap(&t, &wired, &failed);
+    if(g_seam_wire_n != 2)
+        printf("FAIL wire-site regression: qt_wire_mmap called mlock() %d times, expected 2\n", g_seam_wire_n);
+    CHECK(g_seam_wire_n == 2);
+    if(g_seam_wire_n >= 1 && (int64_t)g_seam_wire_len[0] != want_weight)
+        printf("FAIL wire-site regression: qt_wire_mmap's WEIGHT mlock() call got len=%lld want=%lld\n",
+               (long long)g_seam_wire_len[0], (long long)want_weight);
+    CHECK(g_seam_wire_n>=1 && (int64_t)g_seam_wire_len[0]==want_weight);
+    if(g_seam_wire_n >= 2 && (int64_t)g_seam_wire_len[1] != want_scale)
+        printf("FAIL wire-site regression: qt_wire_mmap's SCALE mlock() call got len=%lld want=%lld "
+               "(this is exactly what a reverted scale_b=O*4 hardcode breaks)\n",
+               (long long)g_seam_wire_len[1], (long long)want_scale);
+    CHECK(g_seam_wire_n>=2 && (int64_t)g_seam_wire_len[1]==want_scale);
+
+    /* qt_unwire_mmap early-returns unless g_mmap && mem_should_wire() are
+     * both true -- force both on for this call, then restore, so this test
+     * doesn't change global state for any test that runs after it. */
+    int saved_g_mmap = g_mmap, saved_g_mlock = g_mlock;
+    g_mmap = 1; g_mlock = 1;
+    qt_unwire_mmap(&t);
+    g_mmap = saved_g_mmap; g_mlock = saved_g_mlock;
+
+    if(g_seam_unwire_n != 2)
+        printf("FAIL wire-site regression: qt_unwire_mmap called munlock() %d times, expected 2\n", g_seam_unwire_n);
+    CHECK(g_seam_unwire_n == 2);
+    if(g_seam_unwire_n >= 1 && (int64_t)g_seam_unwire_len[0] != want_weight)
+        printf("FAIL wire-site regression: qt_unwire_mmap's WEIGHT munlock() call got len=%lld want=%lld\n",
+               (long long)g_seam_unwire_len[0], (long long)want_weight);
+    CHECK(g_seam_unwire_n>=1 && (int64_t)g_seam_unwire_len[0]==want_weight);
+    if(g_seam_unwire_n >= 2 && (int64_t)g_seam_unwire_len[1] != want_scale)
+        printf("FAIL wire-site regression: qt_unwire_mmap's SCALE munlock() call got len=%lld want=%lld "
+               "(this is exactly what a reverted scale_b=O*4 hardcode breaks)\n",
+               (long long)g_seam_unwire_len[1], (long long)want_scale);
+    CHECK(g_seam_unwire_n>=2 && (int64_t)g_seam_unwire_len[1]==want_scale);
+#else
+    printf("skipped on Windows (no mlock/munlock observer seam): wire-site regression\n");
+#endif
+}
+
 int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
@@ -447,6 +602,7 @@ int main(void){
     check_wire_split(5, 2048,6144, 0,  "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
     check_wire_split(7, 2,16384, 0,    "qt_wire_split fmt=7 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
     check_wire_split(7, 2048,6144, 0,  "qt_wire_split fmt=7 spec example: scale=3072B, NOT O*4=8192B");
+    test_wire_site_regression();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;
