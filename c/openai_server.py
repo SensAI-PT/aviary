@@ -862,10 +862,11 @@ def stop_policy(body, chat):
     if not isinstance(ignore_leading, bool):
         raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
                        "x_colibri_ignore_leading_stop", "invalid_value")
-    if chat and not sequences:
-        # The chat template owns these role boundaries, so generic OpenAI
-        # clients should not need model-specific stop knowledge. Treat an
-        # occasional leading marker patiently; client-provided stops remain
+    if chat and ARCH == "glm" and not sequences:
+        # The GLM chat template owns these role boundaries, so generic OpenAI
+        # clients should not need model-specific stop knowledge. Inkling has a
+        # different marker family and receives no implicit GLM stops. Treat an
+        # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
     return sequences, ignore_leading

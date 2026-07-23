@@ -12,8 +12,9 @@ from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           READY, Engine, StopFilter, _engine_error, generation_options,
-                           parse_tool_calls, read_engine_turn, render_chat, serve, stop_policy)
+                           READY, Engine, InklingStreamSplit, StopFilter, _engine_error,
+                           generation_options, parse_tool_calls, read_engine_turn, render_chat,
+                           serve, stop_policy)
 
 
 class FakeEngine:
@@ -123,18 +124,35 @@ class TemplateTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(APIError):
                 generation_options({"stop": value}, 8)
 
-    def test_chat_defaults_role_stops_without_changing_client_or_completion_policy(self):
-        self.assertEqual(stop_policy({}, True), (DEFAULT_CHAT_STOP_SEQUENCES, True))
-        self.assertEqual(stop_policy({}, False), ((), False))
-        self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
-        self.assertEqual(stop_policy({
-            "stop": "END", "x_colibri_ignore_leading_stop": True,
-        }, True), (("END",), True))
+    def test_glm_chat_defaults_role_stops_without_changing_other_policies(self):
+        with patch("openai_server.ARCH", "glm"):
+            self.assertEqual(stop_policy({}, True), (DEFAULT_CHAT_STOP_SEQUENCES, True))
+            self.assertEqual(stop_policy({}, False), ((), False))
+            self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
+            self.assertEqual(stop_policy({
+                "stop": "END", "x_colibri_ignore_leading_stop": True,
+            }, True), (("END",), True))
+        with patch("openai_server.ARCH", "inkling"):
+            self.assertEqual(stop_policy({}, True), ((), False))
+            self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
         with self.assertRaises(APIError):
             stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
 
 
 class StopFilterTest(unittest.TestCase):
+    def test_explicit_stop_composes_with_inkling_stream_split(self):
+        content = []
+        reasoning = []
+        splitter = InklingStreamSplit(content.append, reasoning.append)
+        stop_filter = StopFilter(("END",), splitter.feed)
+        for chunk in ("<|content_thinking|>why<|content_text|>answer EN", "Dignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        splitter.close()
+        self.assertEqual("".join(reasoning), "why")
+        self.assertEqual("".join(content), "answer ")
+        self.assertEqual(stop_filter.matched, "END")
+
     def test_hides_match_split_across_chunks(self):
         output = []
         stop_filter = StopFilter(("STOP",), output.append)

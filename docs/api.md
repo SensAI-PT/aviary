@@ -30,11 +30,12 @@ generation early in both JSON and streaming modes. The extension
 `x_colibri_ignore_leading_stop: true` discards leading stop sequences until
 the first non-whitespace response content, which is useful for local templates
 that occasionally emit a role marker before the answer; strict OpenAI stop
-behavior remains the default for client-provided sequences. Chat requests with
-no client `stop` automatically use the template's `<|user|>` and
+behavior remains the default for client-provided sequences. GLM chat requests
+with no client `stop` automatically use the template's `<|user|>` and
 `<|observation|>` role markers, patiently ignoring only leading markers; this
 prevents a model-completed turn from silently generating a new user or tool
-turn. Legacy completion requests receive no implicit stop sequences. The extension
+turn. Inkling chat and legacy completion requests receive no implicit GLM stop
+sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
