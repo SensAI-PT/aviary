@@ -58,11 +58,20 @@ kv_b_proj (kind "kvb") is ALSO deliberately excluded, despite being a resident
 tensor classify() would otherwise select: colibri.c's MLA-absorption CPU path
 (qt_addrow/qt_matvec_rows, called only on l->kv_b -- the always-available
 fallback whenever the Metal fused decode kernel isn't used) has no fmt==7
-case and would silently misread fp8 bytes as int2-packed data; the CUDA
-absorb kernels (coli_cuda_attention_absorb/_kvdev in backend_cuda.cu) are
-similarly int4-specific. Repacking kv_b_proj to fmt=7 needs that CPU+CUDA
-absorb-path work first -- out of scope for this build, so this tool refuses
-to produce a container the engine cannot safely read.
+support. FIX ROUND 2 update: an fmt=7 (or fmt=6) tensor reaching either
+function now refuses loudly (exit(1), naming the function and the fmt) --
+before that fix it was worse than "misread as int2": qt_addrow SIGSEGV'd
+outright (t->q4 is NULL for fmt=7; the untouched int2 fall-through
+dereferenced it), and only fmt=6 (t->q4 non-NULL, wrong per-row scale
+geometry) actually produced silently-wrong values. Either way, this tool
+still does not select kv_b_proj: refusing loudly at the absorb call site is
+not the same as SUPPORTING fmt=7 there (no dequant path exists, whether it
+now trips a controlled refusal or, before the fix, undefined behavior). The
+CUDA absorb kernels (coli_cuda_attention_absorb/_kvdev in backend_cuda.cu)
+are similarly int4-specific and unaffected by that fix. Repacking kv_b_proj
+to fmt=7 needs real fmt=7 CPU+CUDA absorb-path support first -- out of scope
+for this build, so this tool refuses to produce a container the engine
+cannot safely read.
 
 This tool does NOT write a container metadata stamp: __metadata__-based
 self-description (writer + qt_verify_fmt_stamp reader + docs/FORMATS.md
@@ -295,6 +304,21 @@ def main():
         print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
     print(f"[REPACK] {fresh} new output shard(s) written")
     _print_inventory_summary(all_inv, dry_run=False)
+    # FIX ROUND 2 (clean-room conformance trial, spec I6 -- loud failure, every
+    # refusal names its condition): a run that selects ZERO repack-target tensors
+    # across every shard under --indir (present run AND any prior resumed run --
+    # `done` has one entry per shard, "" meaning that shard has NEVER produced an
+    # output) used to exit 0 having emitted nothing -- a silent trap: an empty
+    # "container" (just the resume/params sidecars, no actual .safetensors output)
+    # that nobody asked for and no caller-side check would catch. Refuse loudly
+    # instead. --dry-run is NOT covered here: reporting "0 tensors selected" IS
+    # the loud, honest answer dry-run exists to give, not a silent no-op -- see
+    # the early `return` above, before any of this resume/write bookkeeping.
+    if all(v == "" for v in done.values()):
+        print(f"ERROR: no repack-target tensors found under {a.indir} (checked "
+              f"{len(shards)} shard(s), 0 selected) -- nothing emitted; refusing "
+              f"to exit 0 for an empty container nobody asked for", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

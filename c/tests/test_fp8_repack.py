@@ -18,9 +18,14 @@ shape (nblkO*nblkI==O, where this tensor's block-scale byte count would
 coincide with a per-row int8 scale byte count) must ALSO be refused
 (maintainer review, #528: this is not hypothetical, GLM-5.2's own
 self_attn.o_proj.weight is a real instance) -- --dry-run writing nothing, and
-the #383-class resume/params-guard behavior.
+the #383-class resume/params-guard behavior. FIX ROUND 2 (clean-room
+conformance trial, spec I6): a real (non-dry-run) run that selects ZERO
+repack-target tensors across --indir must refuse loudly (nonzero exit,
+stderr naming the condition), not exit 0 having emitted nothing -- an empty
+"container" nobody asked for; --dry-run's own "0 selected" report is
+unaffected (that IS the loud, honest answer dry-run exists to give).
 """
-import glob, json, os, struct, sys, tempfile, unittest
+import glob, json, os, struct, subprocess, sys, tempfile, unittest
 
 try:
     import torch
@@ -236,6 +241,59 @@ class ResumeAndParamsGuardTest(unittest.TestCase):
         # and the FIRST run's output must be untouched by the refused second run
         outs = glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors"))
         self.assertEqual(len(outs), 1)
+
+
+def _make_zero_target_fixture(path, D=256, I_=384):
+    """A shard with real FP8 tensors, but NONE matching a repack-target kind --
+    mirrors the trial's own scenario (a non-resident-named FP8 tensor selects
+    nothing): one routed expert (kind "x", explicitly excluded) and one f32
+    norm (never a repack candidate at all)."""
+    torch.manual_seed(2)
+    sd = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(I_, D) * 0.02,  # routed: EXCLUDE
+        "model.layers.0.input_layernorm.weight": torch.randn(D),                     # f32: EXCLUDE
+    }
+    save_fp8_safetensors(sd, path)
+
+
+class ZeroTargetRefusalTest(unittest.TestCase):
+    """FIX ROUND 2, item 3 (clean-room conformance trial, spec I6): a real
+    (non-dry-run) run whose --indir has FP8 tensors but none matching a
+    repack-target kind must refuse loudly, not exit 0 having written nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.indir = os.path.join(self.tmp.name, "fp8src")
+        os.makedirs(self.indir)
+        self.shard = os.path.join(self.indir, "model-00001-of-00001.safetensors")
+        _make_zero_target_fixture(self.shard)
+        self.outdir = os.path.join(self.tmp.name, "out")
+        self.tool = os.path.join(os.path.dirname(__file__), "..", "tools", "repack_fp8_passthrough.py")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, extra_args=()):
+        return subprocess.run(
+            [sys.executable, self.tool, "--indir", self.indir, "--outdir", self.outdir,
+             "--n-layers", "5", *extra_args],
+            capture_output=True, text=True)
+
+    def test_zero_targets_refuses_loudly(self):
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0, "zero repack-target tensors must refuse, not exit 0")
+        self.assertIn("no repack-target tensors", proc.stderr)
+        self.assertIn(self.indir, proc.stderr, "the refusal must name the --indir condition")
+        # confirmed empty: no output container was (or should be) produced
+        self.assertEqual(glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors")), [])
+
+    def test_zero_targets_dry_run_unaffected(self):
+        """--dry-run's own "0 tensor(s) selected" report is the loud, honest
+        answer dry-run exists to give -- not a silent no-op -- so it must NOT
+        be turned into a refusal by this fix."""
+        proc = self._run(["--dry-run"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("0 tensor(s) selected", proc.stdout)
 
 
 if __name__ == "__main__":
