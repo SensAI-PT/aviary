@@ -183,7 +183,7 @@ static int expect_refuse(int O, int I, int64_t nb, int64_t ns, const char *tag){
         _exit(42);                                  /* reaching here is the bug */
     }
     close(pipefd[1]);
-    char err[1024]={0}; ssize_t n=read(pipefd[0],err,sizeof(err)-1); (void)n;
+    char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF: a single read() can return SHORT on Linux pipes (glibc unbuffered stderr arrives in chunks) -- truncated the refusal message past the marker, CI-caught */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
     close(pipefd[0]);
     int status=0; waitpid(pid,&status,0);
     int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
