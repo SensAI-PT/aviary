@@ -2569,7 +2569,35 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             for(int s=0;s<S&&cuda_core;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;int pos=positions?positions[s]:pos_base+s;
                 int st0=ks->kv_start[layer],nt=pos+1-st0;
-                if(dnsel&&dnsel[s]>0){cuda_core=0;break;}
+                if(dnsel&&dnsel[s]>0){
+                    /* Sparse decode used to force the CPU path here: the CUDA
+                     * absorb kernel only scans contiguous rows and cannot take
+                     * the DSA gather list. COLI_DSA_GATHER=1: gather the
+                     * selected top-k rows into a compact staging pair and hand
+                     * the dense kernel that instead. Host KV stays canonical —
+                     * only ~index_topk rows cross PCIe per (layer, token), so
+                     * the device never needs the full context resident (the
+                     * first stone of KV tiering). Same row set as the CPU loop
+                     * below; results differ only by kernel-family FP order,
+                     * the same class of divergence the dense CUDA absorb
+                     * already has vs the CPU path (#510). Verified: with
+                     * DSA_FORCE=1 (identity selection) output is byte-identical
+                     * to the dense CUDA path. */
+                    static int dsag=-1;
+                    if(dsag<0) dsag=getenv("COLI_DSA_GATHER")?atoi(getenv("COLI_DSA_GATHER")):0;
+                    if(!dsag){cuda_core=0;break;}
+                    int ns=dnsel[s]; const int *tl=dsel+(int64_t)s*dtopk;
+                    float *gl=falloc((int64_t)ns*kvl), *gr=falloc((int64_t)ns*c->qk_rope);
+                    for(int jj=0;jj<ns;jj++){
+                        memcpy(gl+(int64_t)jj*kvl, coli_kv_row(ks->Lc[layer],tl[jj],kvl), (size_t)kvl*sizeof(float));
+                        memcpy(gr+(int64_t)jj*c->qk_rope, coli_kv_row(ks->Rc[layer],tl[jj],c->qk_rope), (size_t)c->qk_rope*sizeof(float));
+                    }
+                    cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
+                        Q+(int64_t)s*H*qh,gl,gr,H,c->qk_nope,c->qk_rope,vh,kvl,ns,c->attn_scale);
+                    free(gl);free(gr);
+                    if(!cuda_core)break;    /* CPU fallback recomputes every row: idempotent */
+                    continue;
+                }
                 cuda_core=0;
                 if(g_cuda_pipe&&ks==m->kv&&layer<c->n_layers&&kv_dev_sync(m,l,layer,pos+1))
                     cuda_core=coli_cuda_attention_absorb_kvdev(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
