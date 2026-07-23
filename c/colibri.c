@@ -208,21 +208,17 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
  * its own to split qt_bytes(t) into a weight half and a scale half. Hardcoding
  * scale_b=O*4 at those two call sites -- i.e. assuming PER-ROW scale for every
  * format -- is right for fmt 0/1/2/3 but wrong for fmt=4 (grouped,
- * O*ceil(I/gs) scales), fmt=5 (int3-g64, O*ceil(I/64) scales), and fmt=7
- * (per-128x128-block, ceil(O/128)*ceil(I/128) scales): any tensor in one of
- * those three formats reaching qt_wire_mmap/qt_unwire_mmap would mlock/munlock
- * the wrong byte ranges on BOTH halves (weight_b = qt_bytes(t)-scale_b shifts
- * too). fmt=6 (E8) is deliberately NOT covered here: its .qs is a fixed 4-byte
- * tag with no wire-mmap-relevant weight/scale split of its own (matches
- * qt_bytes' `+4` literal above), and t->fmt==6 tensors never reach
- * qt_wire_mmap/qt_unwire_mmap's mlock path in this build (int3-g64/E8 stay
- * CPU-side, see qt_cuda_upload -- MMAP wiring is a CUDA/Metal-adjacent memory
- * concern this build doesn't extend to them). This is not purely a dormant
- * fmt=7-only fix: fmt=4 is the routed-expert "int4-g64" format (qt_resolve_fmt
- * assigns it to ESlot g/u/d the same as any other tensor, see
- * expert_load_impl), so any COLI_MMAP + mem_should_wire() session pinning
- * fmt=4 experts mlocks the wrong ranges without this. UNVERIFIED at runtime
- * (no model run performed -- static/arithmetic fix only, see the report).
+ * O*ceil(I/gs) scales), fmt=5 (int3-g64, O*ceil(I/64) scales), fmt=6 (E8/IQ3,
+ * a FIXED 4-byte tag, see below), and fmt=7 (per-128x128-block,
+ * ceil(O/128)*ceil(I/128) scales): any tensor in one of those four formats
+ * reaching qt_wire_mmap/qt_unwire_mmap would mlock/munlock the wrong byte
+ * ranges on BOTH halves (weight_b = qt_bytes(t)-scale_b shifts too). This is
+ * not purely a dormant fmt=7-only fix: fmt=4 is the routed-expert
+ * "int4-g64" format (qt_resolve_fmt assigns it to ESlot g/u/d the same as
+ * any other tensor, see expert_load_impl), so any COLI_MMAP +
+ * mem_should_wire() session pinning fmt=4 experts mlocks the wrong ranges
+ * without this. UNVERIFIED at runtime (no model run performed -- static/
+ * arithmetic fix only, see the report).
  *
  * REVIEW FINDING (maintainer, #528): this function existed correctly (the
  * fmt=7 branch below is right) but neither qt_wire_mmap nor qt_unwire_mmap
@@ -231,14 +227,40 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
  * call site, and the resulting -Wunused-function warning on this then-dead
  * function was suppressed by -Wno-unused-function in CFLAGS rather than
  * caught. qt_wire_split() below is now the ONE place both call sites get
- * weight_b/scale_b from -- see it and its call sites for the actual fix. */
+ * weight_b/scale_b from -- see it and its call sites for the actual fix.
+ *
+ * FIX ROUND (audit finding, SHOULD-FIX): this comment used to ALSO claim
+ * fmt=6 (E8/IQ3) was "deliberately NOT covered" because "t->fmt==6 tensors
+ * never reach qt_wire_mmap/qt_unwire_mmap's mlock path in this build
+ * (int3-g64/E8 stay CPU-side, see qt_cuda_upload -- MMAP wiring is a
+ * CUDA/Metal-adjacent memory concern this build doesn't extend to them)" --
+ * that conflated two UNRELATED mechanisms: qt_cuda_upload decides GPU-VRAM
+ * upload eligibility (fmt=5/6 genuinely excluded there, no CUDA kernel for
+ * either -- see qt_cuda_upload's own `fmt==5||fmt==6` guard), while
+ * qt_wire_mmap/qt_unwire_mmap mlock HOST RAM pages under COLI_MMAP, an
+ * entirely CPU-side concern. Staying CPU-side (no CUDA kernel) is exactly
+ * what makes a tensor a CANDIDATE for RAM wiring, not exempt from it.
+ * expert_load_impl assigns fmt=6 to ESlot g/u/d exactly like fmt=4/5 (same
+ * qt_resolve_fmt call site, three lines above the fmt=4 comment), and
+ * pin_wire calls qt_wire_mmap/qt_unwire_mmap on every pinned ESlot's g/u/d
+ * unconditionally, with no format filter -- so a pinned E8/IQ3 expert under
+ * COLI_MMAP + mem_should_wire() DOES reach here. Before the fmt=6 branch
+ * below, the O*4 fallback would have returned a scale_b wildly larger than
+ * the tensor's real scale allocation (a FIXED 4 bytes, qsalloc(1) in
+ * qt_from_disk's fmt==6 branch -- confirmed against qt_bytes' own `+4`
+ * literal and qt_from_disk's st_read_f32_cap cardinality switch, both of
+ * which already treat fmt=6's scale as exactly 1 float, not O floats), then
+ * mlock/munlock'd that many bytes starting at t->s -- past the end of a
+ * 4-byte allocation. UNVERIFIED at runtime (same static/arithmetic-only
+ * caveat as the fmt=4/5/7 fix above -- no model run performed). */
 static int64_t qt_scale_bytes(const QT *t){
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
+    if(t->fmt==6) return 4;   /* E8/IQ3: FIXED 4-byte tag (qsalloc(1)), not O*4 -- see this
+                              * function's own header comment for why this is reachable and
+                              * load-bearing, not dead code. */
     if(t->fmt==7){ int64_t nblkO=((int64_t)t->O+127)/128, nblkI=((int64_t)t->I+127)/128; return nblkO*nblkI*4; }
-    return (int64_t)t->O*4;   /* fmt 0 (t->s NULL, guarded by callers)/1/2/3/6: per-row (or, for
-                              * fmt=6, the 4-byte tag -- callers of this function never see fmt=6,
-                              * see the comment above; the fallback is harmless dead code for it). */
+    return (int64_t)t->O*4;   /* fmt 0 (t->s NULL, guarded by callers)/1/2/3: per-row. */
 }
 /* qt_wire_mmap/qt_unwire_mmap's shared weight/scale byte-range split -- the ONE
  * place that computes it, so the two sites can never independently drift back

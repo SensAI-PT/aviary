@@ -481,8 +481,10 @@ static void check_fp8_bytes(int O, int I, const char *tag){
  * -Wno-unused-function suppressed the warning that should have caught it) --
  * fails here. Covers every format qt_wire_split's callers can see in practice
  * (fmt=1 per-row unaffected; fmt=4/5 grouped-scale formats qt_scale_bytes'
- * own comment names as previously-broken too; fmt=7 nblk>O, the shape this
- * review round is about). */
+ * own comment names as previously-broken too; fmt=6 (E8/IQ3, FIX ROUND,
+ * audit finding: a FIXED 4-byte tag, not O*4 -- see qt_scale_bytes' own
+ * comment for why this is reachable, not dead code); fmt=7 nblk>O, the
+ * shape this review round is about). */
 static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
     QT t; memset(&t,0,sizeof t); t.fmt=fmt; t.O=O; t.I=I; t.gs=gs;
     int64_t want_scale = qt_scale_bytes(&t);
@@ -497,12 +499,17 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
     CHECK(got_weight == want_weight);
     /* the regression this test exists to catch: a per-row-only scale_b==O*4
      * must NOT be what qt_wire_split returns for a format whose real scale
-     * cardinality differs from O (fmt=4/5/7 here) -- confirm the value has
+     * cardinality differs from O (fmt=4/5/6/7 here) -- confirm the value has
      * actually moved off that old constant, not just matched qt_scale_bytes()
      * by coincidence at a degenerate shape. */
     int64_t old_wrong_scale = (int64_t)O*4;
-    if((fmt==4 || fmt==5 || fmt==7) && want_scale != old_wrong_scale)
+    if((fmt==4 || fmt==5 || fmt==6 || fmt==7) && want_scale != old_wrong_scale)
         CHECK(got_scale != old_wrong_scale);
+    /* fmt=6's scale is a FIXED 4 bytes regardless of [O,I] -- assert the
+     * literal value directly too, not just "moved off O*4", since a future
+     * regression that made it O-dependent in some OTHER wrong way would
+     * still pass the generic check above. */
+    if(fmt==6) CHECK(want_scale == 4);
 }
 
 /* ---- Site-level wire regression (FIX ROUND, validator finding: mutation-
@@ -600,6 +607,8 @@ int main(void){
     check_wire_split(1, 4096,4096, 0,  "qt_wire_split fmt=1 plain int8 (per-row scale, unaffected by the fix)");
     check_wire_split(4, 2048,6144, 64, "qt_wire_split fmt=4 grouped int4 (O*ceil(I/gs) scale, not O*4)");
     check_wire_split(5, 2048,6144, 0,  "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
+    check_wire_split(6, 2048,6144, 0,  "qt_wire_split fmt=6 E8/IQ3 (FIXED 4-byte tag, not O*4=8192B)");
+    check_wire_split(6, 1,1,       0,  "qt_wire_split fmt=6 E8/IQ3 degenerate O=1 (O*4 would coincidentally also be 4 -- exercises the literal-4 assert, not just the moved-off-O*4 one)");
     check_wire_split(7, 2,16384, 0,    "qt_wire_split fmt=7 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
     check_wire_split(7, 2048,6144, 0,  "qt_wire_split fmt=7 spec example: scale=3072B, NOT O*4=8192B");
     test_wire_site_regression();
