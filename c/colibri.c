@@ -5611,7 +5611,13 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
     prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
-    int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
+    /* Clamp to the KV room WITHOUT flagging: length_limited must mean "the
+     * limit is what stopped us", not "the request asked for more than the
+     * context could ever hold" — clients that default max_tokens to the
+     * context size would otherwise see finish_reason=length on every
+     * naturally-completed generation. The flag is set at the actual
+     * emitted>=maximum stops below instead. */
+    int room=maxctx-sc->len-1; if(r->maximum>room) r->maximum=room;
     g_temp=r->temp; g_nuc=r->top_p;
     /* Single-slot speculation (#492/#358): with one KV slot there is no ragged
      * batch — the decode is a single contiguous sequence, exactly the regime
@@ -5625,11 +5631,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         return 1;
     }
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
-    if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    if(r->maximum<=0){ r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
+    if(next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
     if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
     mux_data(T,r->id,next);
-    if(r->emitted>=r->maximum) mux_done(m,sc,r);
+    if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
     return 1;
 }
 
@@ -5747,7 +5754,7 @@ static void run_serve_mux(Model *m, const char *snap){
                     r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
                     if(gd->on) gr_feed(gd,next);
                     mux_data(&T,r->id,next);
-                    if(r->emitted>=r->maximum){ mux_done(m,sc,r); done=1; break; }
+                    if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
                     if(j<k){
                         if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
                         gd->acc++;
@@ -5771,7 +5778,7 @@ static void run_serve_mux(Model *m, const char *snap){
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
             if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
             mux_data(&T,r->id,next);
-            if(r->emitted>=r->maximum) mux_done(m,sc,r);
+            if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
         }
         free(lo);
     }
