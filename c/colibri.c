@@ -5486,6 +5486,16 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"STOP ",5)){
+        unsigned long long id=0; char tail;
+        if(sscanf(line+5,"%llu %c",&id,&tail)!=1 || id==0){
+            printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0;
+        }
+        for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==id){
+            mux_done(m,&ctx[i],&req[i]); free(line); return 0;
+        }
+        printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
+    }
     if(!strncmp(line,"CANCEL ",7)){
         unsigned long long id=0; char tail;
         if(sscanf(line+7,"%llu %c",&id,&tail)!=1 || id==0){
