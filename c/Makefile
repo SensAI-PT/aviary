@@ -512,7 +512,7 @@ install: colibri$(EXE) olmoe$(EXE)
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
-	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
+	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 
 uninstall:

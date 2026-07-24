@@ -44,7 +44,18 @@ if sys.platform == "win32":
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from version import __version__ as _version
+# version.py sits next to this script in a source checkout, but an installed
+# layout puts the launcher in $(PREFIX)/bin while the support modules live in
+# $(PREFIX)/libexec/colibri — and a packager may strip it entirely (#575,
+# FreeBSD port). The launcher must never crash over a version string.
+try:
+    from version import __version__ as _version
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "libexec", "colibri"))
+    try:
+        from version import __version__ as _version
+    except ModuleNotFoundError:
+        _version = "unknown"
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, openai_server.py) and
