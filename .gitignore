@@ -68,3 +68,7 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+
+# planning docs — internal, not part of the project
+ai_plans/
+PR_DESCRIPTION.md

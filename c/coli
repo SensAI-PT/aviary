@@ -154,7 +154,8 @@ def cuda_binary():
     if sys.platform == "linux":
         try:
             linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-            return any("libcudart" in line and "not found" not in line
+            # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
+            return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                        for line in linked.stdout.splitlines())
         except (OSError,subprocess.SubprocessError): return False
     if sys.platform == "win32":
