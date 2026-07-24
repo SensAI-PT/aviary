@@ -10,6 +10,8 @@ Token-exact vs the CPU path.
 ```bash
 cd c
 make colibri METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+                              # any macOS SDK builds; the COLI_METAL_RESSET residency-set
+                              # path needs the macOS 15 SDK and is compiled out below it
 make metal-test           # standalone kernel/attention correctness vs CPU reference
 COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
 ```
