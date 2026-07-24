@@ -280,9 +280,17 @@ def _rowwise(fn, w, *args):
         qs.append(q); ss.append(s)
     return np.concatenate(qs), np.concatenate(ss)
 
+E8_JOBS = 1                                     # --jobs: parallel e8 encodes per shard
+
+def _e8_job(item):
+    name, w = item
+    q, s = quant_e8(w)
+    return name, q, s
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                   keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
     from safetensors import safe_open
+    e8_jobs = []                                # deferred: encoded in a pool after the scan
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
         for name in f.keys():
@@ -309,8 +317,11 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                     out_dict[name] = w.astype(np.float32); continue
                 if bits == E8:
                     # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
-                    # Already row-blocked inside iq3_pack.encode.
-                    q, s = quant_e8(w)
+                    # Already row-blocked inside iq3_pack.encode. The python codec is
+                    # slow (~5.5s per expert matrix), so encodes are deferred and run
+                    # across a process pool after the shard scan (--jobs).
+                    e8_jobs.append((name, w))
+                    continue
                 elif bits == 3:
                     # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
                     q, s = _rowwise(quant_int3_g64, w)
@@ -321,6 +332,16 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                                     quant_int4 if bits <= 4 else quant_int8, w, bits)
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
+    if e8_jobs:
+        if E8_JOBS > 1:
+            from multiprocessing import get_context
+            with get_context("spawn").Pool(E8_JOBS) as pool:   # spawn: safe after BLAS threads
+                for name, q, s in pool.imap(_e8_job, e8_jobs, chunksize=1):
+                    out_dict[name] = q; out_dict[name + ".qs"] = s
+        else:
+            for item in e8_jobs:
+                name, q, s = _e8_job(item)
+                out_dict[name] = q; out_dict[name + ".qs"] = s
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
@@ -419,6 +440,11 @@ def main():
                          "concurrently; the main process still writes and checkpoints in "
                          "shard order, so output and out-NNNNN numbering are identical. "
                          "No effect on the --repo disk-safe path.")
+    ap.add_argument("--jobs", type=int, default=1,
+        help="parallel worker processes for the e8 encode WITHIN a shard (the python codec "
+             "is ~5.5s per expert matrix single-threaded; other quant modes are fast and "
+             "stay serial). Works on both --indir and the --repo disk-safe path. "
+             "Untested in combination with --workers>1; use one or the other.")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-nvfp4", action="store_true",
         help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
@@ -430,6 +456,8 @@ def main():
              "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
              "Recommended: --ebits 8.")
     a = ap.parse_args()
+    global E8_JOBS
+    E8_JOBS = max(1, a.jobs)
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.

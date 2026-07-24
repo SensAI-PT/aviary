@@ -177,6 +177,60 @@ static int run_moe(const std::vector<int>& nrv, const char* name) {
   return pass?0:1;
 }
 
+// ---- fmt=6 (E8/IQ3) moe_block vs the engine's own scalar decoder ----
+// Mirrors the engine split exactly: the caller pre-rotates the staged gate/up input
+// (colibri.c metal_stage_rot_e8), the GPU rotates the down input (moe_fwht), and
+// matmul_e8/e8_rot_rows from quant.h are the reference for both.
+#define COLI_QUANT_TEST_ONLY 1
+#include "../quant.h"
+static int run_moe_e8(const std::vector<int>& nrv, const char* name) {
+  const int D=6144, I=1536, fmt=6;                     // I=1536 exercises the 512+1024 FWHT tiles
+  int64_t rbG=e8_rowbytes(D), rbD=e8_rowbytes(I); int nb=(int)nrv.size();
+  int R=0; std::vector<int> xoff(nb),nr(nrv); for(int e=0;e<nb;e++){ xoff[e]=R; R+=nrv[e]; }
+  srand(6666+nb);
+  std::vector<void*> slab(nb), fslab(nb);
+  std::vector<const void*> g(nb),u(nb),d(nb); std::vector<const float*> gs(nb),us(nb),ds(nb);
+  size_t wlen=roundpg((size_t)I*rbG*2 + (size_t)D*rbD), flen=roundpg(3*sizeof(float));
+  for(int e=0;e<nb;e++){
+    posix_memalign(&slab[e],16384,wlen); posix_memalign(&fslab[e],16384,flen);
+    uint8_t* sp=(uint8_t*)slab[e];
+    for(size_t i=0;i<(size_t)I*rbG*2+(size_t)D*rbD;i++) sp[i]=(uint8_t)(rand()&0xFF);
+    // clamp every block scale to a sane positive fp16 (random fp16 can be inf/nan)
+    for(size_t off=0; off+98<=(size_t)I*rbG*2+(size_t)D*rbD; off+=98){
+      uint16_t dh=(uint16_t)(0x2C00 | (rand()&0x3FF)); memcpy(sp+off+96,&dh,2); }
+    float* fp=(float*)fslab[e]; fp[0]=fp[1]=fp[2]=1.f;  // .qs tags: resolvable, unused
+    g[e]=sp; u[e]=sp+(size_t)I*rbG; d[e]=sp+(size_t)I*rbG*2;
+    gs[e]=fp; us[e]=fp+1; ds[e]=fp+2;
+    coli_metal_register(slab[e],wlen); coli_metal_register(fslab[e],flen);
+  }
+  std::vector<float> xg((size_t)R*D); for(auto&v:xg) v=((rand()%2000)-1000)/1000.f;
+  std::vector<int> rows(R); std::vector<float> rw(R);
+  for(int gr=0;gr<R;gr++){ rows[gr]=0; rw[gr]=0.1f+(rand()%100)/100.f; }
+  int S=1;
+  // CPU reference from the unrotated input, engine semantics
+  std::vector<float> refout((size_t)S*D,0.f), xrot(D), gg(I),uu(I),hh(D);
+  for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++){ int gr=xoff[e]+r;
+    memcpy(xrot.data(), &xg[(size_t)gr*D], D*sizeof(float)); e8_rot_rows(xrot.data(),1,D);
+    matmul_e8(gg.data(),xrot.data(),(const uint8_t*)g[e],NULL,1,D,I);
+    matmul_e8(uu.data(),xrot.data(),(const uint8_t*)u[e],NULL,1,D,I);
+    for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
+    e8_rot_rows(gg.data(),1,I);
+    matmul_e8(hh.data(),gg.data(),(const uint8_t*)d[e],NULL,1,I,D);
+    float* os=&refout[(size_t)rows[gr]*D]; for(int o=0;o<D;o++) os[o]+=rw[gr]*hh[o];
+  }
+  // GPU input: pre-rotated, as colibri.c stages it
+  std::vector<float> xg_gpu(xg);
+  for(int gr=0;gr<R;gr++) e8_rot_rows(&xg_gpu[(size_t)gr*D],1,D);
+  std::vector<float> gout((size_t)S*D,0.f);
+  int ok = coli_metal_moe_block(nb,D,I,fmt,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+                                xg_gpu.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
+  double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
+  double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
+  printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
+  for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
+  return pass?0:1;
+}
+
 // ---- fused decode attention vs a CPU reference replicating glm.c's exact math ----
 // GLM-5.2 dims (hardcoded in the backend): hidden=6144 H=64 q_lora=2048 kv_lora=512
 // nope=192 rope=64 vh=256; theta=10000 ascale=1/16 eps=1e-5.
@@ -466,6 +520,9 @@ int main(void) {
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
+  printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
+  fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
+  fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");
   printf("Metal large-batch gemm test:\n");
   { // registered int4 weights, S=64: coli_metal_gemm vs cpu_ref
     srand(77); int O=2048,I=6144,S=64,rb=(I+1)/2;

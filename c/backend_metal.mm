@@ -17,6 +17,43 @@ static const char *SHADER = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
+// fmt=6 E8/IQ3 magnitude grid — generated from quant.h e8_grid (must stay identical;
+// the metal-test oracle compares against the CPU decoder, so drift fails the build).
+constant uchar4 E8G[256] = {
+  uchar4(4,4,4,4),uchar4(20,4,4,4),uchar4(36,4,4,4),uchar4(12,12,4,4),uchar4(28,12,4,4),uchar4(62,12,4,4),uchar4(4,20,4,4),uchar4(20,20,4,4),
+  uchar4(12,28,4,4),uchar4(20,36,4,4),uchar4(28,62,4,4),uchar4(44,62,4,4),uchar4(12,4,12,4),uchar4(28,4,12,4),uchar4(4,12,12,4),uchar4(20,12,12,4),
+  uchar4(12,20,12,4),uchar4(44,20,12,4),uchar4(4,28,12,4),uchar4(20,28,12,4),uchar4(12,36,12,4),uchar4(36,44,12,4),uchar4(4,62,12,4),uchar4(4,4,20,4),
+  uchar4(20,4,20,4),uchar4(36,4,20,4),uchar4(12,12,20,4),uchar4(4,20,20,4),uchar4(20,20,20,4),uchar4(12,28,20,4),uchar4(28,28,20,4),uchar4(62,28,20,4),
+  uchar4(12,44,20,4),uchar4(62,44,20,4),uchar4(44,62,20,4),uchar4(12,4,28,4),uchar4(62,4,28,4),uchar4(4,12,28,4),uchar4(20,12,28,4),uchar4(44,20,28,4),
+  uchar4(4,62,28,4),uchar4(28,12,36,4),uchar4(62,28,36,4),uchar4(36,36,36,4),uchar4(62,44,36,4),uchar4(28,62,36,4),uchar4(44,62,36,4),uchar4(12,4,44,4),
+  uchar4(62,4,44,4),uchar4(20,28,44,4),uchar4(20,44,44,4),uchar4(44,28,52,4),uchar4(36,52,52,4),uchar4(4,12,62,4),uchar4(36,12,62,4),uchar4(52,12,62,4),
+  uchar4(28,36,62,4),uchar4(12,52,62,4),uchar4(12,4,4,12),uchar4(28,4,4,12),uchar4(4,12,4,12),uchar4(20,12,4,12),uchar4(12,20,4,12),uchar4(28,20,4,12),
+  uchar4(4,28,4,12),uchar4(20,28,4,12),uchar4(36,28,4,12),uchar4(62,36,4,12),uchar4(4,44,4,12),uchar4(4,4,12,12),uchar4(20,4,12,12),uchar4(12,12,12,12),
+  uchar4(4,20,12,12),uchar4(20,20,12,12),uchar4(12,4,20,12),uchar4(28,4,20,12),uchar4(4,12,20,12),uchar4(20,12,20,12),uchar4(12,20,20,12),uchar4(4,28,20,12),
+  uchar4(20,62,20,12),uchar4(4,4,28,12),uchar4(20,4,28,12),uchar4(4,20,28,12),uchar4(12,28,28,12),uchar4(52,36,28,12),uchar4(52,52,28,12),uchar4(12,4,36,12),
+  uchar4(44,4,36,12),uchar4(4,44,36,12),uchar4(4,20,44,12),uchar4(36,20,44,12),uchar4(52,36,44,12),uchar4(12,62,44,12),uchar4(44,4,52,12),uchar4(20,20,62,12),
+  uchar4(4,36,62,12),uchar4(4,4,4,20),uchar4(20,4,4,20),uchar4(12,12,4,20),uchar4(28,12,4,20),uchar4(4,20,4,20),uchar4(20,20,4,20),uchar4(52,20,4,20),
+  uchar4(12,28,4,20),uchar4(20,36,4,20),uchar4(12,4,12,20),uchar4(28,4,12,20),uchar4(44,4,12,20),uchar4(4,12,12,20),uchar4(20,12,12,20),uchar4(12,20,12,20),
+  uchar4(4,28,12,20),uchar4(28,52,12,20),uchar4(62,52,12,20),uchar4(4,62,12,20),uchar4(4,4,20,20),uchar4(20,4,20,20),uchar4(12,12,20,20),uchar4(62,12,20,20),
+  uchar4(4,20,20,20),uchar4(20,20,20,20),uchar4(62,28,20,20),uchar4(4,36,20,20),uchar4(44,44,20,20),uchar4(12,4,28,20),uchar4(4,12,28,20),uchar4(36,12,28,20),
+  uchar4(4,62,28,20),uchar4(36,62,28,20),uchar4(44,28,36,20),uchar4(28,44,36,20),uchar4(28,4,44,20),uchar4(62,20,44,20),uchar4(12,36,44,20),uchar4(36,62,44,20),
+  uchar4(12,4,62,20),uchar4(28,4,62,20),uchar4(52,12,62,20),uchar4(44,36,62,20),uchar4(12,4,4,28),uchar4(4,12,4,28),uchar4(20,12,4,28),uchar4(12,20,4,28),
+  uchar4(28,20,4,28),uchar4(4,44,4,28),uchar4(44,52,4,28),uchar4(20,62,4,28),uchar4(4,4,12,28),uchar4(20,4,12,28),uchar4(4,20,12,28),uchar4(12,28,12,28),
+  uchar4(36,36,12,28),uchar4(52,36,12,28),uchar4(12,4,20,28),uchar4(28,4,20,28),uchar4(4,12,20,28),uchar4(44,20,20,28),uchar4(20,44,20,28),uchar4(20,62,20,28),
+  uchar4(12,12,28,28),uchar4(28,28,28,28),uchar4(4,28,36,28),uchar4(62,36,36,28),uchar4(20,62,36,28),uchar4(4,4,44,28),uchar4(52,4,44,28),uchar4(20,20,44,28),
+  uchar4(44,44,44,28),uchar4(36,12,52,28),uchar4(52,28,52,28),uchar4(28,52,52,28),uchar4(28,28,62,28),uchar4(4,52,62,28),uchar4(36,4,4,36),uchar4(62,12,4,36),
+  uchar4(44,28,4,36),uchar4(62,28,4,36),uchar4(28,44,4,36),uchar4(62,44,4,36),uchar4(36,62,12,36),uchar4(4,20,20,36),uchar4(62,28,20,36),uchar4(4,36,20,36),
+  uchar4(4,52,20,36),uchar4(52,52,20,36),uchar4(62,4,28,36),uchar4(44,36,28,36),uchar4(36,4,36,36),uchar4(12,44,36,36),uchar4(36,52,36,36),uchar4(44,20,44,36),
+  uchar4(28,36,44,36),uchar4(4,62,44,36),uchar4(44,4,62,36),uchar4(4,12,62,36),uchar4(20,12,62,36),uchar4(4,28,62,36),uchar4(20,12,4,44),uchar4(12,36,4,44),
+  uchar4(4,62,4,44),uchar4(4,4,12,44),uchar4(52,4,12,44),uchar4(52,20,12,44),uchar4(44,44,12,44),uchar4(36,12,20,44),uchar4(20,28,20,44),uchar4(20,62,20,44),
+  uchar4(20,4,28,44),uchar4(28,44,28,44),uchar4(4,12,36,44),uchar4(28,20,36,44),uchar4(62,20,36,44),uchar4(20,62,36,44),uchar4(20,4,44,44),uchar4(12,28,44,44),
+  uchar4(4,44,52,44),uchar4(36,20,62,44),uchar4(20,36,62,44),uchar4(36,20,4,52),uchar4(36,36,4,52),uchar4(52,36,4,52),uchar4(36,52,4,52),uchar4(12,20,12,52),
+  uchar4(12,52,12,52),uchar4(62,12,20,52),uchar4(36,52,20,52),uchar4(4,28,28,52),uchar4(52,28,28,52),uchar4(36,36,36,52),uchar4(44,4,44,52),uchar4(20,44,44,52),
+  uchar4(28,28,52,52),uchar4(28,4,62,52),uchar4(12,20,62,52),uchar4(28,4,4,62),uchar4(44,4,4,62),uchar4(62,4,4,62),uchar4(4,12,4,62),uchar4(20,28,4,62),
+  uchar4(20,44,4,62),uchar4(52,20,12,62),uchar4(4,36,12,62),uchar4(20,12,20,62),uchar4(44,36,20,62),uchar4(20,44,20,62),uchar4(4,4,28,62),uchar4(44,12,28,62),
+  uchar4(28,28,28,62),uchar4(4,52,28,62),uchar4(12,20,36,62),uchar4(12,36,36,62),uchar4(4,4,44,62),uchar4(20,4,44,62),uchar4(36,20,44,62),uchar4(4,28,52,62)
+};
+
 kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight bytes
                     device const float* scale  [[buffer(1)]],   // [O] (fmt<4) or [O,ceil(I/gsz)] (fmt==4)
                     device const float* x      [[buffer(2)]],   // [S,I]
@@ -112,13 +149,59 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       float4 w1=float4(float(int(b.z&0xF)-8),float(int(b.z>>4)-8),float(int(b.w&0xF)-8),float(int(b.w>>4)-8));
       acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
+  } else if (fmt == 6) {                            // E8/IQ3: 98B per 256 weights, scales in-block
+    long rb=((long)(K+255)/256)*98;                 // host guards K%256==0 (GLM dims are)
+    device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    int nsub=K/32;                                  // one 32-weight sub-block per lane step
+    for(int s6=slane;s6<nsub;s6+=32){
+      int b=s6>>3, ib=s6&7; device const uchar* blk=w+(long)b*98;
+      uint word = uint(blk[64+ib*4]) | (uint(blk[65+ib*4])<<8)
+                | (uint(blk[66+ib*4])<<16) | (uint(blk[67+ib*4])<<24);
+      ushort dh = ushort(blk[96]) | (ushort(blk[97])<<8);
+      float db = float(as_type<half>(dh)) * (0.5f + float((word>>28)&0xFu)) * 0.5f;
+      device const uchar* idx = blk + ib*8;
+      device const float4* xs = (device const float4*)(xr + s6*32);
+      for(int l=0;l<4;l++){
+        uint sv=(word>>(7*l))&0x7Fu;
+        float4 m0=float4(E8G[idx[l*2+0]]), m1=float4(E8G[idx[l*2+1]]);
+        float4 sA=float4((sv&1u)?-1.0f:1.0f,(sv&2u)?-1.0f:1.0f,(sv&4u)?-1.0f:1.0f,(sv&8u)?-1.0f:1.0f);
+        float4 sB=float4((sv&16u)?-1.0f:1.0f,(sv&32u)?-1.0f:1.0f,(sv&64u)?-1.0f:1.0f,
+                         (popcount(sv)&1u)?-1.0f:1.0f);   // j=7 closes by odd parity
+        acc += (dot(m0*sA,xs[l*2]) + dot(m1*sB,xs[l*2+1])) * (0.5f*db);
+      }
+    }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row]=acc*sc[o];
+  if(slane==0) yout[row] = (fmt==6) ? acc : acc*sc[o];   // fmt=6: scales live in-block
+}
+
+// fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
+// tile per dispatch (block-diagonal tiling and sign stream match quant.h e8_rot_rows;
+// signs are regenerated host-side with e8_signs and passed in). One threadgroup per
+// row; tile fits threadgroup memory (n <= 4096).
+kernel void moe_fwht(device float* v [[buffer(0)]], device const uchar* signs [[buffer(1)]],
+                     constant int& dim [[buffer(2)]], constant int& off [[buffer(3)]],
+                     constant int& n [[buffer(4)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint t [[thread_position_in_threadgroup]],
+                     uint nt [[threads_per_threadgroup]]) {
+  threadgroup float sh[4096];
+  device float* row = v + (long)tg*dim + off;
+  for (int i=int(t);i<n;i+=int(nt)){ float x=row[i]; if((signs[i>>3]>>(i&7))&1u) x=-x; sh[i]=x; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int len=1;len<n;len<<=1){
+    for (int j=int(t);j<n/2;j+=int(nt)){
+      int blk=j/len, k=j%len, i0=blk*(len<<1)+k;
+      float a=sh[i0], b=sh[i0+len]; sh[i0]=a+b; sh[i0+len]=a-b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float s=rsqrt(float(n));
+  for (int i=int(t);i<n;i+=int(nt)) row[i]=sh[i]*s;
 }
 kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
@@ -309,7 +392,30 @@ struct ColiMetalTensor {
 
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
-static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
+static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_fwht;
+
+// fmt=6: sign-bit buffers for the GPU FWHT, one per tile size, cached forever (a
+// handful of sizes). The xorshift64* draw replicates quant.h e8_signs exactly —
+// the metal-test fmt=6 oracle compares end-to-end against quant.h, so any drift
+// between the two copies fails the build.
+static void e8_signs_local(uint8_t *bits, int n) {
+  uint64_t s = 417u + (uint64_t)n;
+  for (int i = 0; i < (n+7)/8; i++) {
+    s ^= s>>12; s ^= s<<25; s ^= s>>27;
+    bits[i] = (uint8_t)((s*2685821657736338717ULL)>>56);
+  }
+}
+static id<MTLBuffer> fwht_signs(int n) {
+  static std::mutex mtx; static std::vector<std::pair<int, id<MTLBuffer>>> cache;
+  std::lock_guard<std::mutex> lk(mtx);
+  for (auto &p : cache) if (p.first == n) return p.second;
+  std::vector<uint8_t> bits((n+7)/8);
+  e8_signs_local(bits.data(), n);
+  id<MTLBuffer> b = [g_dev newBufferWithBytes:bits.data() length:bits.size()
+                                      options:MTLResourceStorageModeShared];
+  cache.push_back({n, b});
+  return b;
+}
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
@@ -481,6 +587,7 @@ extern "C" int coli_metal_init(void) {
     g_gemv     = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_gemv"]   error:&err];
     g_moe_gemv = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_gemv"] error:&err];
     g_moe_silu = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_silu"] error:&err];
+    g_moe_fwht = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_fwht"] error:&err];
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
@@ -501,7 +608,7 @@ extern "C" int coli_metal_init(void) {
                         "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
       g_rtop8_par = 0;
     }
-    if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
+    if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_moe_fwht || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
     // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
@@ -995,7 +1102,17 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 6)) return nil;
+  if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
+                     * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
+    if ((D & 255) || (Iinter & 31)) return nil;
+    for (int off = 0; off < Iinter; ) {
+      int rem = Iinter - off, n = rem & (-rem);
+      while (n > 32768) n >>= 1;
+      if (n > 4096) return nil;
+      off += n;
+    }
+  }
   if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
     double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
   }
@@ -1047,6 +1164,23 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
   [e setBuffer:gg_buf offset:0 atIndex:0];[e setBuffer:uu_buf offset:0 atIndex:1];
   [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  if (fmt == 6) {   /* rotate the down-projection input in place: same block-diagonal
+                     * tiling as quant.h e8_rot_rows (largest power of two dividing the
+                     * remainder, capped at 4096 for threadgroup memory) */
+    int off = 0;
+    while (off < Iinter) {
+      int rem = Iinter - off, n = rem & (-rem);
+      while (n > 32768) n >>= 1;   /* CPU tiling rule (e8_rot_rows); sizes pre-validated above */
+      id<MTLBuffer> sb = fwht_signs(n);
+      [e setComputePipelineState:g_moe_fwht];
+      [e setBuffer:gg_buf offset:0 atIndex:0];[e setBuffer:sb offset:0 atIndex:1];
+      [e setBytes:&Iinter length:4 atIndex:2];[e setBytes:&off length:4 atIndex:3];
+      [e setBytes:&n length:4 atIndex:4];
+      [e dispatchThreadgroups:MTLSizeMake((size_t)R,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+      off += n;
+    }
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  }
   gemv(bad,bsd,gg_buf,hh_buf,D,Iinter,Iinter);                // down
   g_t_setup += mnow() - ts_start;
   [e endEncoding];[cb commit];
