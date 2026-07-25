@@ -1075,7 +1075,7 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
-    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
+    int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
     st_read_f32(&m->S,name,p,0); return p;
 }
@@ -1485,7 +1485,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
-        if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
+        if(!tw[k]||!tq[k]){ if(fatal) st_die_missing(&m->S,nm[k]);   /* #586: diagnose, don't just name it */
+                            fprintf(stderr,"missing %s\n",nm[k]); return -1; }
     }
     if(g_disk_split){ /* split load/byte per tipo layer; atomici: expert_load gira anche su OMP/pipe/pilot */
         int64_t tb=0; for(int k=0;k<3;k++) tb+=tw[k]->nbytes+tq[k]->nbytes;
