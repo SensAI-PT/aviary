@@ -41,6 +41,8 @@ class DoctorTest(unittest.TestCase):
         (self.model / "tokenizer.json").write_text("{}")
         write_shard(self.model / "model.safetensors", [
             ("model.embed_tokens.weight", 100),
+            ("model.norm.weight", 8),
+            ("lm_head.weight", 100),
             ("model.layers.0.self_attn.q_a_proj.weight", 200),
             ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
             ("model.layers.1.mlp.experts.0.up_proj.weight", 30),
@@ -79,6 +81,7 @@ class DoctorTest(unittest.TestCase):
         checks = self.checks_by_id(report)
 
         self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["mode"], "standard")
         self.assertEqual(report["status"], "ok")
         self.assertIsNotNone(report["plan"])
         self.assertEqual(checks["accelerator.cuda"]["status"], "skip")
@@ -168,6 +171,126 @@ class DoctorTest(unittest.TestCase):
         self.assertNotIn("\033", run.stdout)
         self.assertTrue(run.stdout.lstrip().startswith("{"))
         self.assertTrue(run.stdout.rstrip().endswith("}"))
+
+    def test_deep_check_validates_every_tensor_layout(self):
+        report = self.report(deep=True)
+        checks = self.checks_by_id(report)
+
+        self.assertEqual(report["mode"], "deep")
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.container"]["details"]["shards"], 1)
+        self.assertEqual(checks["model.container"]["details"]["tensors"], 8)
+        self.assertFalse(checks["model.container"]["details"]["payload_hashing"])
+        self.assertEqual(checks["model.shard_sequence"]["status"], "skip")
+        self.assertEqual(checks["model.required"]["status"], "pass")
+        self.assertEqual(checks["model.index"]["status"], "skip")
+        self.assertEqual(checks["storage.mirror"]["status"], "skip")
+
+    def test_deep_check_rejects_overlapping_tensor_ranges(self):
+        header = {
+            "first": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]},
+            "second": {"dtype": "U8", "shape": [4], "data_offsets": [2, 6]},
+        }
+        raw = json.dumps(header).encode()
+        shard = self.model / "model.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * 6)
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "fail")
+        self.assertIn("overlap", checks["model.container"]["summary"])
+
+    def test_deep_check_rejects_duplicate_tensor_names_across_shards(self):
+        write_shard(self.model / "second.safetensors", [
+            ("model.embed_tokens.weight", 1),
+        ])
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "fail")
+        self.assertIn("duplicate tensor", checks["model.container"]["summary"])
+
+    def test_deep_check_rejects_gap_in_converter_shard_sequence(self):
+        write_shard(self.model / "out-00000.safetensors", [("zero.weight", 1)])
+        write_shard(self.model / "out-00002.safetensors", [("two.weight", 1)])
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.shard_sequence"]["status"], "fail")
+        self.assertEqual(checks["model.shard_sequence"]["details"]["missing_shards"], 1)
+
+    def test_deep_check_rejects_missing_core_tensor(self):
+        write_shard(self.model / "model.safetensors", [
+            ("model.embed_tokens.weight", 1),
+        ])
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.required"]["status"], "fail")
+        self.assertEqual(checks["model.required"]["details"]["missing_tensors"], [
+            "model.norm.weight",
+            "lm_head.weight",
+        ])
+
+    def test_deep_check_reports_runtime_equivalent_partial_mirror(self):
+        mirror = self.root / "mirror"
+        mirror.mkdir()
+        primary = self.model / "model.safetensors"
+        (mirror / primary.name).write_bytes(primary.read_bytes())
+
+        checks = self.checks_by_id(self.report(deep=True, mirror_dir=mirror))
+        mirror_check = checks["storage.mirror"]
+
+        self.assertEqual(mirror_check["status"], "pass")
+        self.assertEqual(mirror_check["details"]["accepted_shards"], 1)
+        self.assertEqual(mirror_check["details"]["divergent_shards"], 0)
+        self.assertTrue(mirror_check["details"]["partial_mirror_allowed"])
+
+    def test_deep_check_warns_when_mirror_header_diverges(self):
+        mirror = self.root / "mirror"
+        mirror.mkdir()
+        write_shard(mirror / "model.safetensors", [("different.weight", 620)])
+
+        checks = self.checks_by_id(self.report(deep=True, mirror_dir=mirror))
+        mirror_check = checks["storage.mirror"]
+
+        self.assertEqual(mirror_check["status"], "warn")
+        self.assertEqual(mirror_check["details"]["accepted_shards"], 0)
+        self.assertEqual(mirror_check["details"]["divergent_shards"], 1)
+
+    def test_deep_check_validates_model_index(self):
+        tensors = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "model.layers.1.mlp.experts.0.gate_proj.weight",
+            "model.layers.1.mlp.experts.0.up_proj.weight",
+            "model.layers.1.mlp.experts.1.gate_proj.weight",
+            "model.layers.1.mlp.experts.1.up_proj.weight",
+        ]
+        (self.model / "model.safetensors.index.json").write_text(json.dumps({
+            "weight_map": {name: "model.safetensors" for name in tensors},
+        }))
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.index"]["status"], "pass")
+        self.assertEqual(checks["model.index"]["details"]["indexed_tensors"], len(tensors))
+
+    def test_cli_deep_json_is_machine_readable(self):
+        cli = Path(__file__).parents[1] / "coli"
+        run = subprocess.run([
+            sys.executable, str(cli), "doctor", "--model", str(self.model),
+            "--gpu", "none", "--ram", "16", "--ctx", "32", "--deep", "--json",
+        ], text=True, capture_output=True, check=False)
+
+        report = json.loads(run.stdout)
+        checks = self.checks_by_id(report)
+        self.assertEqual(report["mode"], "deep")
+        self.assertIn("model.container", checks)
 
 
 if __name__ == "__main__":
