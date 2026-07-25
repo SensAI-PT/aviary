@@ -377,6 +377,71 @@ static st_tensor *st_find(shards *S, const char *name) {
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 
+/* A missing CORE tensor is almost never an engine bug: the converter writes the final
+ * norm and lm_head into the LAST shards, so a transfer that stopped early indexes
+ * nearly everything and then dies on the first tensor from the gap. Bare "missing
+ * model.norm.weight" gave the user no way to tell that apart from a wrong --model or a
+ * real bug (#586, #583). Report what was actually found, and let the filenames say
+ * whether shards are absent: the HF layout declares the total in `-of-NNNNN`, the
+ * converter layout at least reveals a truncated tail. */
+static void st_die_missing(shards *S, const char *name) {
+    fprintf(stderr, "missing %s\n\n", name);
+    if (S->nfd == 0 || S->n == 0) {
+        fprintf(stderr, "  No safetensors tensors were indexed at all. --model must point AT the\n"
+                        "  container directory -- the one holding the *.safetensors shards.\n");
+        exit(1);
+    }
+    int lo = -1, hi = -1, declared = 0, numbered = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        const char *b = strrchr(S->paths[i], '/');
+#ifdef _WIN32
+        const char *b2 = strrchr(S->paths[i], '\\');
+        if (b2 && (!b || b2 > b)) b = b2;
+#endif
+        b = b ? b + 1 : S->paths[i];
+        int idx, tot;
+        if (sscanf(b, "model-%d-of-%d", &idx, &tot) == 2) declared = tot;
+        else if (sscanf(b, "out-%d", &idx) != 1) continue;   /* out-mtp-* etc: not numbered */
+        numbered++;
+        if (lo < 0 || idx < lo) lo = idx;
+        if (idx > hi) hi = idx;
+    }
+    int complete = declared > 0 && numbered >= declared;
+    fprintf(stderr, "  indexed %d tensors from %d shard file(s)\n", S->n, S->nfd);
+    if (declared > 0 && numbered < declared)
+        fprintf(stderr, "  shard filenames declare %d shards, but only %d are here -- %d MISSING\n",
+                declared, numbered, declared - numbered);
+    else if (declared > 0)
+        fprintf(stderr, "  shard filenames declare %d shards and %d are here\n", declared, numbered);
+    else if (numbered > 0)
+        fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
+                numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
+    /* Follow the evidence: telling someone who already has every declared shard to
+     * re-download sends them round a loop that cannot help them. */
+    if (complete) {
+        fprintf(stderr,
+            "\n  '%s' is a core tensor the engine cannot run without, and every shard the\n"
+            "  filenames declare is present -- so this is NOT the usual truncated download.\n"
+            "  Either the container was built without this tensor, or the engine is looking\n"
+            "  for the wrong name. Please report it with this output.\n", name);
+        exit(1);
+    }
+    /* The final norm and lm_head sit at the END of the model, so an interrupted transfer
+     * loses them first -- worth saying, but only where it's true. */
+    if (strstr(name, "model.norm") || strstr(name, "lm_head"))
+        fprintf(stderr, "\n  '%s' is written into one of the LAST shards, so a container whose tail\n"
+                        "  never arrived indexes almost everything and then fails exactly here.\n", name);
+    else
+        fprintf(stderr, "\n  '%s' is a core tensor: the engine cannot run without it.\n", name);
+    fprintf(stderr,
+        "  An incomplete transfer is far more likely than a corrupt engine. Re-running the\n"
+        "  download resumes only the missing shards; the HF xet backend is known to stall\n"
+        "  mid-transfer (#452), so disable it:\n"
+        "      HF_HUB_DISABLE_XET=1 hf download <repo> --local-dir <model-dir>\n"
+        "  If your shard count is already complete, that IS a bug worth reporting.\n");
+    exit(1);
+}
+
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
  * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
