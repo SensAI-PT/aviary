@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from doctor import exit_code, format_doctor, run_doctor
 from resource_plan import GB
@@ -220,6 +221,41 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["model.shard_sequence"]["status"], "fail")
         self.assertEqual(checks["model.shard_sequence"]["details"]["missing_shards"], 1)
 
+    def test_deep_check_rejects_converter_sequence_not_starting_at_zero(self):
+        write_shard(self.model / "out-00005.safetensors", [("five.weight", 1)])
+        write_shard(self.model / "out-00006.safetensors", [("six.weight", 1)])
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.shard_sequence"]["status"], "fail")
+        self.assertEqual(checks["model.shard_sequence"]["details"]["first_shard"], 5)
+        self.assertEqual(checks["model.shard_sequence"]["details"]["missing_shards"], 5)
+
+    def test_deep_check_handles_sparse_large_converter_index(self):
+        write_shard(self.model / "out-1000000000000.safetensors", [
+            ("sparse.weight", 1),
+        ])
+
+        checks = self.checks_by_id(self.report(deep=True))
+        sequence = checks["model.shard_sequence"]
+
+        self.assertEqual(sequence["status"], "fail")
+        self.assertEqual(sequence["details"]["last_shard"], 1_000_000_000_000)
+        self.assertEqual(sequence["details"]["missing_shards"], 1_000_000_000_000)
+
+    def test_deep_check_rejects_mixed_shard_filename_schemes(self):
+        write_shard(self.model / "model-00001-of-00001.safetensors", [
+            ("hf.weight", 1),
+        ])
+        write_shard(self.model / "out-00000.safetensors", [("out.weight", 1)])
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.shard_sequence"]["status"], "fail")
+        self.assertIn("mixes", checks["model.shard_sequence"]["summary"])
+
     def test_deep_check_rejects_missing_core_tensor(self):
         write_shard(self.model / "model.safetensors", [
             ("model.embed_tokens.weight", 1),
@@ -279,6 +315,25 @@ class DoctorTest(unittest.TestCase):
 
         self.assertEqual(checks["model.index"]["status"], "pass")
         self.assertEqual(checks["model.index"]["details"]["indexed_tensors"], len(tensors))
+
+    def test_deep_check_reports_non_object_model_index(self):
+        (self.model / "model.safetensors.index.json").write_text("[]")
+
+        checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.index"]["status"], "fail")
+        self.assertIn("not a JSON object", checks["model.index"]["summary"])
+
+    def test_deep_check_bounds_model_index_read(self):
+        (self.model / "model.safetensors.index.json").write_text("{}")
+
+        with mock.patch("doctor.MODEL_INDEX_MAX_BYTES", 1):
+            checks = self.checks_by_id(self.report(deep=True))
+
+        self.assertEqual(checks["model.container"]["status"], "pass")
+        self.assertEqual(checks["model.index"]["status"], "fail")
+        self.assertIn("exceeds 1 bytes", checks["model.index"]["summary"])
 
     def test_cli_deep_json_is_machine_readable(self):
         cli = Path(__file__).parents[1] / "coli"
