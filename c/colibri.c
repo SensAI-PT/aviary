@@ -5562,6 +5562,11 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         printf("ERROR %llu CONTEXT_EXCEEDED %d %d\n",sub.id,nt,maxctx-2);
         fflush(stdout); return 0;
     }
+    /* #597: the submission is valid (encoded, non-empty, fits the context). Announce it before
+     * prefill so the gateway commits the streaming 200 only now. Every failure above returned
+     * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
+     * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
+    printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
     int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
