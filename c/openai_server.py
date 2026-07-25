@@ -614,11 +614,14 @@ class ThinkingStreamSplit:
     """Split GLM's reasoning marker without leaking markers across stream chunks."""
     MARKERS = (THINK_OPEN, THINK_CLOSE)
 
-    def __init__(self, on_thinking, on_text, on_thinking_end=None):
+    def __init__(self, on_thinking, on_text, on_thinking_end=None, initial_thinking=True):
         self.on_thinking = on_thinking
         self.on_text = on_text
         self.on_thinking_end = on_thinking_end
-        self.thinking = True
+        # #597: GLM emits reasoning only when the prompt opened <think> (thinking on);
+        # with thinking off the prompt already closed it, so output is pure answer and
+        # the splitter must start in text mode or it would file the whole answer as reasoning.
+        self.thinking = initial_thinking
         self.buf = ""
 
     def _emit(self, text):
@@ -654,11 +657,13 @@ class ThinkingStreamSplit:
         self._emit(self.buf)
         self.buf = ""
 
+    close = finish        # interface parity with InklingStreamSplit in the streaming path
 
-def split_thinking_reply(text):
+
+def split_thinking_reply(text, enable_thinking=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append)
+    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=enable_thinking)
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -1546,7 +1551,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return error_object(error)
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
-    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None):
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
+                   enable_thinking=False):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -1600,6 +1606,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
+                elif chat:
+                    # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
+                    # reasoning to reasoning_content instead of dumping it (or the raw </think>)
+                    # into the visible answer / tool-call parser.
+                    reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
@@ -1694,6 +1705,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
                         if ARCH == "inkling" else None)
+            # #597 item 4: GLM (chat) streams reasoning then </think> then the answer. Split the
+            # reasoning into reasoning_content deltas instead of leaking it — and the raw </think> —
+            # into visible content or the tool-call buffer.
+            glm_think = chat and ARCH != "inkling"
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
@@ -1704,10 +1719,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 sp = {"buf": "", "tool": False}
                 hold = len(BOX_START) - 1
                 raw = []
-                def emit_tools(chunk):
+                def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
-                    if dbg_echo:
-                        sys.stderr.write(chunk); sys.stderr.flush()
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -1722,11 +1735,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
+                # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
+                # to reasoning_content and passes only the answer text on to feed_content/parser.
+                think = (ThinkingStreamSplit(emit_reasoning, feed_content,
+                                             initial_thinking=enable_thinking)
+                         if glm_think else None)
+                def emit_tools(chunk):
+                    if dbg_echo:
+                        sys.stderr.write(chunk); sys.stderr.flush()
+                    (think.feed if think else feed_content)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
                 stop_filter.finish()
+                if think:
+                    think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_tool_calls("".join(raw), tools)
@@ -1737,17 +1761,24 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             else:
+                if splitter is not None:                   # inkling content/marker splitter
+                    content_split = splitter
+                elif glm_think:                            # GLM <think> reasoning → reasoning_content
+                    content_split = ThinkingStreamSplit(emit_reasoning, emit,
+                                                        initial_thinking=enable_thinking)
+                else:
+                    content_split = None
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    (splitter.feed if splitter else emit)(chunk)
+                    (content_split.feed if content_split else emit)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
                 stop_filter.finish()
-                if splitter:
-                    splitter.close()
+                if content_split:
+                    content_split.close()
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
@@ -1803,7 +1834,8 @@ class APIHandler(BaseHTTPRequestHandler):
         renderer = render_chat_inkling if ARCH == "inkling" else render_chat
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
-        self.generation(body, prompt, request_id, True, tools, tool_choice)
+        self.generation(body, prompt, request_id, True, tools, tool_choice,
+                        enable_thinking=enable_thinking)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
