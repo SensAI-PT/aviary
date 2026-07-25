@@ -39,6 +39,12 @@
 #endif
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>                                /* Required for GetProcessMemoryInfo */
 #endif
 #ifdef __linux__
 #include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
