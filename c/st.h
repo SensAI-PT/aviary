@@ -331,7 +331,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
-            if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
+            if (S->n == S->cap) {
+                S->cap *= 2;
+                st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
+                if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
+                S->t = nt;
+            }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
