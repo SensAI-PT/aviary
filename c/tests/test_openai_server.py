@@ -13,9 +13,9 @@ from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           READY, Engine, InklingStreamSplit, StopFilter, _engine_error,
-                           generation_options, parse_tool_calls, read_engine_turn, render_chat,
-                           serve, stop_policy)
+                           READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
+                           _engine_error, generation_options, parse_tool_calls, read_engine_turn,
+                           render_chat, serve, split_thinking_reply, stop_policy)
 
 
 class FakeEngine:
@@ -1003,6 +1003,146 @@ class AllowedHostsTest(unittest.TestCase):
     def test_untrusted_host_still_rejected_with_allowlist(self):
         server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
         self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+
+class ThinkingSplitUnitTest(unittest.TestCase):
+    """#597 item 4: the GLM reasoning splitter, incl. mkelcb's cross-chunk cases."""
+
+    def test_single_chunk(self):
+        self.assertEqual(split_thinking_reply("abc</think>def"), ("abc", "def"))
+
+    def test_close_tag_split_across_chunks(self):
+        thinking, answer = [], []
+        s = ThinkingStreamSplit(thinking.append, answer.append)
+        s.feed("abc</thi"); s.feed("nk>def"); s.finish()
+        self.assertEqual(("".join(thinking), "".join(answer)), ("abc", "def"))
+
+    def test_open_tag_split_and_stray_open_marker(self):
+        thinking, answer = [], []
+        s = ThinkingStreamSplit(thinking.append, answer.append)
+        s.feed("abc<thi"); s.feed("nk>def</think>ghi"); s.finish()
+        self.assertEqual(("".join(thinking), "".join(answer)), ("abcdef", "ghi"))
+
+    def test_thinking_disabled_is_all_answer(self):
+        # initial_thinking=False: a pure answer with no markers must not be filed as reasoning
+        self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
+                         ("", "plain answer"))
+
+    def test_missing_close_tag_surfaces_reasoning(self):
+        self.assertEqual(split_thinking_reply("thought with no end"),
+                         ("thought with no end", ""))
+
+
+class _ChunkEngine(FakeEngine):
+    """Engine that emits a caller-supplied chunk sequence, to exercise the streaming
+    reasoning splitter across arbitrary chunk boundaries."""
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = list(chunks)
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        for chunk in self.chunks:
+            on_text(chunk)
+            if stopped and stopped():
+                self.stop_requests += 1
+                break
+        return {"prompt_tokens": 7, "completion_tokens": len(self.chunks), "length_limited": False}
+
+
+class GlmReasoningStreamTest(unittest.TestCase):
+    """#597 item 4 end-to-end: GLM reasoning streams as reasoning_content, the answer as
+    content, no <think>/</think> leaks, cross-chunk-safe, and reasoning never contaminates
+    the tool-call buffer."""
+
+    def _server(self, chunks):
+        server = APIServer(("127.0.0.1", 0), _ChunkEngine(chunks), "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def _post(self, base, body):
+        req = Request(base + "/v1/chat/completions",
+                      data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            return response.read().decode()
+
+    def _deltas(self, raw):
+        reasoning, content, tool_calls = [], [], []
+        for line in raw.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            for choice in json.loads(line[6:])["choices"]:
+                delta = choice.get("delta") or {}
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
+                if delta.get("content"):
+                    content.append(delta["content"])
+                if delta.get("tool_calls"):
+                    tool_calls.extend(delta["tool_calls"])
+        return "".join(reasoning), "".join(content), tool_calls
+
+    def test_streaming_splits_reasoning_from_answer(self):
+        base = self._server(["I think ", "42", "</think>", "The answer ", "is 42"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "2+2?"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "I think 42")
+        self.assertEqual(content, "The answer is 42")
+        self.assertNotIn("<think>", raw)
+        self.assertNotIn("</think>", raw)
+
+    def test_streaming_close_tag_split_across_chunks(self):
+        base = self._server(["reason</thi", "nk>ans", "wer"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "x"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(content, "answer")
+        self.assertNotIn("think>", raw)
+
+    def test_streaming_thinking_off_is_all_content(self):
+        base = self._server(["Just ", "the answer"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": False,
+                                "messages": [{"role": "user", "content": "x"}]})
+        reasoning, content, _ = self._deltas(raw)
+        self.assertEqual(reasoning, "")
+        self.assertEqual(content, "Just the answer")
+
+    def test_streaming_reasoning_stays_out_of_tool_call(self):
+        base = self._server(["deciding to call", "</think>",
+                             "<tool_call>get_weather<arg_key>city</arg_key>"
+                             "<arg_value>Paris</arg_value></tool_call>"])
+        raw = self._post(base, {"model": "test-model", "stream": True, "enable_thinking": True,
+                                "messages": [{"role": "user", "content": "weather?"}],
+                                "tools": [{"type": "function", "function": {
+                                    "name": "get_weather", "parameters": {"type": "object",
+                                    "properties": {"city": {"type": "string"}}}}}]})
+        reasoning, content, tool_calls = self._deltas(raw)
+        self.assertEqual(reasoning, "deciding to call")
+        self.assertTrue(tool_calls, "expected a parsed tool call")
+        args = tool_calls[0]["function"]["arguments"]
+        self.assertIn("Paris", args)
+        self.assertNotIn("deciding", args)     # reasoning must not leak into the tool arguments
+        self.assertNotIn("deciding", content)  # nor into the visible answer
+
+    def test_nonstreaming_splits_reasoning(self):
+        base = self._server(["mulling ", "it over", "</think>", "final ", "answer"])
+        req = Request(base + "/v1/chat/completions",
+                      data=json.dumps({"model": "test-model", "enable_thinking": True,
+                        "messages": [{"role": "user", "content": "x"}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as response:
+            body = json.load(response)
+        message = body["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "mulling it over")
+        self.assertEqual(message["content"], "final answer")
 
 
 if __name__ == "__main__":
