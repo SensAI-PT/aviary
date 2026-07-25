@@ -134,6 +134,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
             float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
             for (int i = 0; i < I; i++) acc += xs[i] * w[i];
             y[(int64_t)s * O + o] = acc;
         }
@@ -207,6 +208,7 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
         float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
     }
