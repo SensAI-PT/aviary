@@ -90,7 +90,7 @@ jobs:
           # link of the test binary below covers the single-source claim, and
           # the engine link is exercised on real ROCm hardware (GPU_BACKENDS.md).
           docker run --rm -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:6.2 bash -c '
-            apt-get update && apt-get install -y --no-install-recommends make gcc g++ &&
+            apt-get update && apt-get install -y --no-install-recommends make gcc g++ rocwmma-dev &&
             make -C c gpu-compile HIP=1 HIP_ARCH=gfx1100'
           echo "HIP syntax check passed"
 
