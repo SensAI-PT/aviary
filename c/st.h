@@ -438,7 +438,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (t->numel > cap) {
+    if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
     return st_read_f32(S, name, out, drop);
