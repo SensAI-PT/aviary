@@ -1163,6 +1163,15 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "ACCEPT" and len(fields) >= 3:
+                    # #597: the engine validated the submission (fits context) before prefill.
+                    # Keep it pending — DATA/DONE still follow — and let generate() commit the
+                    # HTTP stream only now, so an earlier CONTEXT_EXCEEDED stays a clean 400.
+                    request_id = fields[1]
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("accept", {"prompt_tokens": int(fields[2])}))
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
@@ -1215,7 +1224,7 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -1258,9 +1267,27 @@ class Engine:
 
         cancel_sent = False
         stop_sent = False
+        accepted = False
+
+        def _accept(info):
+            # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
+            # ACCEPT before any output, so on_accept fires before prefill and a preceding
+            # CONTEXT_EXCEEDED never reaches here (it propagates as a 400 with nothing committed).
+            # An older engine that never sends ACCEPT still commits on its first DATA/DONE.
+            nonlocal accepted
+            if not accepted:
+                accepted = True
+                if on_accept is not None:
+                    on_accept(info)
+
         while True:
             kind, value = events.get()
-            if kind == "data":
+            if kind == "accept":
+                if accepted:
+                    raise RuntimeError("engine sent a duplicate ACCEPT frame")
+                _accept(value)
+            elif kind == "data":
+                _accept({"prompt_tokens": None})
                 if not cancel_sent and not stop_sent:
                     decode(value)
                     if stopped and stopped():
@@ -1274,6 +1301,7 @@ class Engine:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
             elif kind == "done":
+                _accept({"prompt_tokens": None})
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -1634,22 +1662,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
 
             stream_object = "chat.completion.chunk" if chat else object_name
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("x-request-id", request_id)
-            for name, value in queue_headers.items(): self.send_header(name, value)
-            self.send_cors_headers()
-            self.end_headers()
-            connected = True
+            # #597 item 6: DO NOT commit the 200 yet. The engine validates the prompt against the
+            # context AFTER we would have sent headers, so an oversized prompt used to be a
+            # CONTEXT_EXCEEDED discovered too late to send a clean 400. Defer the SSE headers into
+            # start_stream(), fired on the engine's ACCEPT frame (before prefill); an ERROR that
+            # arrives before ACCEPT propagates as an APIError with nothing committed -> proper 400.
+            connected = False
+            stream_started = [False]
+            ka_thread = [None]
             # KEEPALIVE: engine.generate() blocks SILENTLY during the (minutes-long) cold
             # prefill, and the client drops the socket after its idle timeout. A background pump
-            # emits a reasoning_content "." delta (the channel that reliably resets the client's
-            # timer and lands in the thinking panel, so answer content stays clean) whenever no
-            # event has been written for KA_GAP seconds. All wfile writes share ka_lock so the
-            # pump and event() never interleave; last_write gates the pump so it stays quiet
-            # while real tokens are flowing (e.g. during decode).
+            # emits a keepalive delta whenever no event has been written for KA_GAP seconds. All
+            # wfile writes share ka_lock so the pump and event() never interleave; last_write
+            # gates the pump so it stays quiet while real tokens are flowing (e.g. during decode).
             ka_lock = threading.Lock()
             last_write = [time.time()]
             ka_stop = threading.Event()
@@ -1689,10 +1714,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     if time.time() - last_write[0] >= KA_GAP:
                         event(ping)
 
-            if chat:
-                event([{"index": 0, "delta": {"role": "assistant", "content": ""},
-                        "logprobs": None, "finish_reason": None}])
-
             def emit(text):
                 choice = ({"index": 0, "delta": {"content": text}, "logprobs": None,
                            "finish_reason": None} if chat else
@@ -1710,8 +1731,29 @@ class APIHandler(BaseHTTPRequestHandler):
             # into visible content or the tool-call buffer.
             glm_think = chat and ARCH != "inkling"
 
-            ka_thread = threading.Thread(target=_keepalive, daemon=True)
-            ka_thread.start()
+            def start_stream(_accept_info=None):
+                # #597 item 6: commit the streaming 200 (and start the keepalive) exactly once,
+                # only after the engine ACCEPTs the prompt. Idempotent: generate() also calls this
+                # on the first DATA/DONE so an older engine with no ACCEPT frame still streams.
+                nonlocal connected
+                if stream_started[0]:
+                    return
+                stream_started[0] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("x-request-id", request_id)
+                for name, value in queue_headers.items(): self.send_header(name, value)
+                self.send_cors_headers()
+                self.end_headers()
+                connected = True
+                last_write[0] = time.time()
+                if chat:
+                    event([{"index": 0, "delta": {"role": "assistant", "content": ""},
+                            "logprobs": None, "finish_reason": None}])
+                ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
+                ka_thread[0].start()
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -1747,7 +1789,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
+                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    on_accept=start_stream)
                 stop_filter.finish()
                 if think:
                     think.finish()
@@ -1775,13 +1818,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped)
+                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    on_accept=start_stream)
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
                 finish = "length" if stats["length_limited"] else "stop"
+            # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
+            start_stream()
             ka_stop.set()                          # generation done: stop the keepalive pump
-            ka_thread.join(timeout=2)
+            if ka_thread[0] is not None:
+                ka_thread[0].join(timeout=2)
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
                                           "finish_reason": finish})

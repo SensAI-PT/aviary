@@ -24,8 +24,10 @@ class FakeEngine:
         self.stop_requests = 0
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
+            on_accept({"prompt_tokens": 7})
         for chunk in ("Hé", "llo"):
             on_text(chunk)
             if stopped and stopped():
@@ -41,11 +43,11 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
-                                cancelled, grammar, stopped)
+                                cancelled, grammar, stopped, on_accept)
 
 
 class TemplateTest(unittest.TestCase):
@@ -1041,8 +1043,10 @@ class _ChunkEngine(FakeEngine):
         self.chunks = list(chunks)
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
+            on_accept({"prompt_tokens": 7})
         for chunk in self.chunks:
             on_text(chunk)
             if stopped and stopped():
@@ -1143,6 +1147,104 @@ class GlmReasoningStreamTest(unittest.TestCase):
         message = body["choices"][0]["message"]
         self.assertEqual(message["reasoning_content"], "mulling it over")
         self.assertEqual(message["content"], "final answer")
+
+
+class AcceptFrameTest(unittest.TestCase):
+    """#597 item 6: the engine's ACCEPT frame gates the HTTP commit, and its invariants."""
+
+    def _engine(self, respond):
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            return Engine("glm", "model")
+
+    def test_accept_fires_before_any_data(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + rid + b" 42\n")
+            process.stdout.feed(b"DATA " + rid + b" 3\nHi!\n")
+            process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+        engine = self._engine(respond)
+        seen = []
+        engine.generate("hi", 8, 0.7, 0.9, lambda t: seen.append(("text", t)),
+                        on_accept=lambda info: seen.append(("accept", info)))
+        engine.close()
+        self.assertEqual(seen[0], ("accept", {"prompt_tokens": 42}))
+        self.assertEqual("".join(t for k, t in seen if k == "text"), "Hi!")
+
+    def test_error_before_accept_never_commits(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ERROR " + rid + b" CONTEXT_EXCEEDED 5000 4094\n")
+        engine = self._engine(respond)
+        accepts = []
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 8, 0.7, 0.9, lambda _: None,
+                            on_accept=lambda info: accepts.append(info))
+        engine.close()
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "context_length_exceeded")
+        self.assertEqual(accepts, [])          # nothing committed -> HTTP layer can send a clean 400
+
+    def test_data_before_accept_still_commits_for_old_engine(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"DATA " + rid + b" 3\nHey\n")
+            process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+        engine = self._engine(respond)
+        accepts, chunks = [], []
+        engine.generate("hi", 8, 0.7, 0.9, chunks.append,
+                        on_accept=lambda info: accepts.append(info))
+        engine.close()
+        self.assertEqual("".join(chunks), "Hey")
+        self.assertEqual(len(accepts), 1)      # first DATA implies acceptance (no ACCEPT frame)
+        self.assertIsNone(accepts[0]["prompt_tokens"])
+
+    def test_duplicate_accept_is_a_protocol_error(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
+            process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
+        engine = self._engine(respond)
+        with self.assertRaisesRegex(RuntimeError, "duplicate ACCEPT"):
+            engine.generate("hi", 8, 0.7, 0.9, lambda _: None, on_accept=lambda _: None)
+        engine.close()
+
+
+class _ContextExceededEngine(FakeEngine):
+    """Engine that rejects the prompt before ACCEPT — on_accept is never called."""
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        raise APIError(400, "This model's maximum context length is 4094 tokens.",
+                       "messages", "context_length_exceeded")
+
+
+class StreamingContextRejectTest(unittest.TestCase):
+    """#597 item 6: an oversized prompt on a *streaming* request must return a clean HTTP 400,
+    not a committed 200 SSE stream that only later discovers the overflow."""
+
+    def setUp(self):
+        self.server = APIServer(("127.0.0.1", 0), _ContextExceededEngine(), "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_streaming_context_exceeded_is_clean_400(self):
+        req = Request(self.base + "/v1/chat/completions",
+                      data=json.dumps({"model": "test-model", "stream": True,
+                        "messages": [{"role": "user", "content": "x" * 100}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
+        body = json.load(caught.exception)
+        self.assertEqual(body["error"]["code"], "context_length_exceeded")
+        self.assertEqual(body["error"]["param"], "messages")
 
 
 if __name__ == "__main__":
