@@ -1247,5 +1247,183 @@ class StreamingContextRejectTest(unittest.TestCase):
         self.assertEqual(body["error"]["param"], "messages")
 
 
+class _ExplodingEngine(FakeEngine):
+    """ACCEPTs the prompt (committing the streaming 200), then dies mid-generation."""
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 7})
+        on_text("partial")
+        raise RuntimeError("engine died mid-stream")
+
+
+class KeepAliveFramingTest(unittest.TestCase):
+    """#597 item 3: HTTP/1.1 persistence must not desynchronise.
+
+    The report was `Bad request syntax ('{...json body...}POST /v1/chat/completions HTTP/1.1')`
+    -- a previous body being parsed as the next request line. Two independent causes: an early
+    rejection returning before the body is read, and a streaming 200 that neither announced
+    close-framing nor stopped offering the socket for reuse when generation failed."""
+
+    CHAT = {"model": "test-model", "messages": [{"role": "user", "content": "x"}]}
+
+    def _server(self, engine=None, **kw):
+        server = APIServer(("127.0.0.1", 0), engine or FakeEngine(), "test-model", **kw)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def _conn(self, server):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _post(self, conn, body=None, headers=None, path="/v1/chat/completions"):
+        payload = json.dumps(self.CHAT if body is None else body)
+        head = {"Content-Type": "application/json"}
+        head.update(headers or {})
+        conn.request("POST", path, body=payload, headers=head)
+        response = conn.getresponse()
+        return response.status, response.read()
+
+    def _raw(self, server, request_bytes, read=4096):
+        """Byte-level exchange, for assertions about framing that a client library hides."""
+        sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=3)
+        self.addCleanup(sock.close)
+        sock.sendall(request_bytes)
+        chunks = []
+        try:
+            while True:
+                chunk = sock.recv(read)
+                if not chunk:
+                    break                      # server closed: the SSE message boundary
+                chunks.append(chunk)
+        except socket.timeout:
+            chunks.append(b"<STILL-OPEN>")     # no EOF: the connection was left reusable
+        return b"".join(chunks).decode("utf-8", "replace")
+
+    def _request_bytes(self, body, host="127.0.0.1"):
+        payload = json.dumps(body)
+        return (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+                f"\r\n{payload}").encode()
+
+    # --- an early rejection must not leave its body in the socket -------------------------
+
+    def test_rejected_host_does_not_desync_the_next_request(self):
+        server = self._server()
+        conn = self._conn(server)
+        status, _ = self._post(conn, headers={"Host": "evil.example.com"})
+        self.assertEqual(status, 403)
+        status, payload = self._post(conn)                  # same connection, valid request
+        self.assertEqual(status, 200, "the 403's unread body desynchronised the connection")
+        self.assertEqual(json.loads(payload)["object"], "chat.completion")
+
+    def test_rejected_auth_does_not_desync_the_next_request(self):
+        server = self._server(api_key="secret")
+        conn = self._conn(server)
+        status, _ = self._post(conn)                        # no Authorization header
+        self.assertEqual(status, 401)
+        status, payload = self._post(conn, headers={"Authorization": "Bearer secret"})
+        self.assertEqual(status, 200, "the 401's unread body desynchronised the connection")
+        self.assertEqual(json.loads(payload)["object"], "chat.completion")
+
+    def test_unknown_model_does_not_desync_the_next_request(self):
+        server = self._server()
+        conn = self._conn(server)
+        status, _ = self._post(conn, body=dict(self.CHAT, model="nope"))
+        self.assertEqual(status, 404)
+        status, _ = self._post(conn)
+        self.assertEqual(status, 200)
+
+    def test_each_body_is_consumed_exactly_once_across_reused_requests(self):
+        """The engine sees one prompt per request, with no body bytes bleeding between them."""
+        engine = FakeEngine()
+        server = self._server(engine)
+        conn = self._conn(server)
+        for index in range(4):
+            body = {"model": "test-model",
+                    "messages": [{"role": "user", "content": f"question-{index}"}]}
+            status, _ = self._post(conn, body=body)
+            self.assertEqual(status, 200)
+        self.assertEqual(len(engine.calls), 4)
+        for index, call in enumerate(engine.calls):
+            self.assertIn(f"question-{index}", call[0])
+            self.assertNotIn("question-", call[0].split(f"question-{index}")[1],
+                             "a later body leaked into an earlier prompt")
+
+    def test_interleaved_rejections_and_successes_stay_in_sync(self):
+        server = self._server(api_key="secret")
+        conn = self._conn(server)
+        good = {"Authorization": "Bearer secret"}
+        for _ in range(3):
+            self.assertEqual(self._post(conn)[0], 401)
+            self.assertEqual(self._post(conn, headers={"Host": "evil.example.com", **good})[0], 403)
+            self.assertEqual(self._post(conn, headers=good)[0], 200)
+
+    # --- bodies we refuse to swallow must close rather than desynchronise -----------------
+
+    def test_oversized_content_length_closes_instead_of_desyncing(self):
+        server = self._server()
+        raw = self._raw(server, (b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: 99999999\r\n\r\n{}"))
+        self.assertIn(" 400 ", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw,
+                         "an over-limit body must close the connection, not keep it alive")
+
+    def test_unparseable_content_length_closes_instead_of_desyncing(self):
+        server = self._server()
+        raw = self._raw(server, (b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: abc\r\n\r\n{}"))
+        self.assertIn("400", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    # --- a streaming 200 is close-framed, and says so ------------------------------------
+
+    def test_streaming_response_announces_close_framing(self):
+        server = self._server()
+        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        headers = raw.split("\r\n\r\n", 1)[0].lower()
+        self.assertIn("content-type: text/event-stream", headers)
+        self.assertIn("connection: close", headers,
+                      "SSE has no Content-Length, so the close IS the boundary and must be declared")
+        self.assertIn("data: [DONE]", raw)
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_anthropic_stream_announces_close_framing(self):
+        server = self._server()
+        payload = json.dumps({"model": "test-model", "stream": True, "max_tokens": 16,
+                              "messages": [{"role": "user", "content": "x"}]})
+        raw = self._raw(server, (f"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                 f"Content-Type: application/json\r\n"
+                                 f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode())
+        self.assertIn("connection: close", raw.split("\r\n\r\n", 1)[0].lower())
+        self.assertIn("event: message_stop", raw)
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
+        """Once the 200 is out, a 500 status line would land inside the event stream."""
+        server = self._server(_ExplodingEngine())
+        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        self.assertEqual(raw.count("HTTP/1."), 1,
+                         "a second HTTP response was spliced into the committed SSE stream")
+        self.assertIn("partial", raw)            # the events sent before the failure survive
+        self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_non_streaming_response_still_reuses_the_connection(self):
+        """The fix must not turn every response into a close: plain JSON stays persistent."""
+        server = self._server()
+        conn = self._conn(server)
+        self.assertEqual(self._post(conn)[0], 200)
+        self.assertEqual(self._post(conn)[0], 200)
+        self.assertIsNotNone(conn.sock, "the JSON path should keep the connection open")
+
+
 if __name__ == "__main__":
     unittest.main()

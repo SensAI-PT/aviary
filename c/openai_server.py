@@ -1359,9 +1359,58 @@ class APIHandler(BaseHTTPRequestHandler):
     timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
                    # request line/body can't pin a worker thread (and a slot) forever
     server_version = "colibri"
+    _committed = False    # status line already on the wire; reset per request below
+    _body_read = False    # request body fully consumed, so nothing is left to drain
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
+
+    def handle_one_request(self):
+        """Per-request bookkeeping for HTTP/1.1 persistence (#597 item 3).
+
+        One handler instance serves every request on a keep-alive connection, so both flags
+        reset here rather than in do_POST. The drain afterwards is the whole fix for the
+        reported `Bad request syntax ('{...json...}POST /v1/...')`: any early rejection --
+        403 Host, 401 auth, a bad or oversized Content-Length -- returns before read_json(),
+        leaving the body in the socket, where the next readline() eats it as a request line.
+        Draining once at the request boundary covers every such path, present and future,
+        instead of asking each early return to remember."""
+        self._committed = False
+        self._body_read = False
+        super().handle_one_request()
+        if not self.close_connection:
+            self._drain_request_body()
+
+    def send_response(self, code, message=None):
+        """Single choke point for "the status line is out". Overriding here rather than
+        tracking it at each call site means no responder can forget (#597 item 3)."""
+        self._committed = True
+        super().send_response(code, message)
+
+    def _drain_request_body(self):
+        """Consume any unread request body so the next request line is at the head of the
+        stream. Where the body can't be swallowed safely, close instead: an unreusable
+        connection is correct, a desynchronised one is not."""
+        if self._body_read:
+            return
+        self._body_read = True
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True   # not framed by Content-Length; we don't de-chunk
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True   # unparseable framing: the body length is unknown
+            return
+        if remaining < 0 or remaining > MAX_BODY:
+            self.close_connection = True   # don't burn bandwidth just to keep a socket warm
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
 
     def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
@@ -1436,8 +1485,12 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Invalid Content-Length header.")
         if length < 1 or length > MAX_BODY:
             raise APIError(400, f"Request body must be between 1 and {MAX_BODY} bytes.")
+        raw = self.rfile.read(length)
+        # Only a full read leaves nothing to drain; a short read means the peer went away
+        # mid-body, and the drain will notice the EOF and close (#597 item 3).
+        self._body_read = len(raw) == length
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
         if not isinstance(body, dict):
@@ -1559,19 +1612,28 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, self.error_body(error), request_id, error.headers)
+            self._fail(error, request_id)
         except ClientCancelled:
             pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as error:
             self.log_error("request failed: %s", error)
-            api_error = APIError(500, "The colibri engine failed to process the request.",
-                                 None, "engine_error", "server_error")
             try:
-                self.send_json(500, self.error_body(api_error), request_id)
+                self._fail(APIError(500, "The colibri engine failed to process the request.",
+                                    None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+
+    def _fail(self, error, request_id):
+        """Report an error, unless the response is already on the wire. Once a streaming 200
+        is committed, a second status line would be framed as SSE body -- clients saw a whole
+        `HTTP/1.1 500` spliced into the event stream. All we can still do is stop talking; the
+        stream ends at the close, which the 200 already announced (#597 item 3)."""
+        if self._committed:
+            self.close_connection = True
+            return
+        self.send_json(error.status, self.error_body(error), request_id, error.headers)
 
     def error_body(self, error):
         """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
@@ -1743,6 +1805,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Accel-Buffering", "no")
+                # An SSE body has neither Content-Length nor chunked framing, so end-of-message
+                # IS the close -- HTTP/1.1 requires us to say so, or the client waits for a
+                # length that never comes and then tries to reuse a socket we are about to drop.
+                # Set close_connection HERE, not after the last event: if generation raises once
+                # the 200 is out, the connection must still not be offered for reuse (#597 item 3).
+                self.send_header("Connection", "close")
+                self.close_connection = True
                 self.send_header("x-request-id", request_id)
                 for name, value in queue_headers.items(): self.send_header(name, value)
                 self.send_cors_headers()
@@ -1842,7 +1911,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except OSError:
                         pass
-            self.close_connection = True
+            # close_connection was already set when the 200 was committed (#597 item 3).
 
     def client_disconnected(self):
         try:
@@ -1976,6 +2045,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")   # see the OpenAI path: SSE is close-framed
+            self.close_connection = True
             self.send_header("x-request-id", request_id)
             for name, value in queue_headers.items():
                 self.send_header(name, value)
@@ -2107,7 +2178,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                 "usage": {"output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
-            self.close_connection = True
+            # close_connection was already set when the 200 was committed (#597 item 3).
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
