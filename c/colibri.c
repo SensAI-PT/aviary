@@ -349,12 +349,29 @@ static int parse_cuda_devices(const char *list, int *out){
     return n;
 }
 #endif
-static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
-static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
+static double now_s(void){
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9;
+#endif
+}
+static double rss_gb(void){
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0}; pmc.cb = sizeof(pmc);
+    if(GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
+        return pmc.WorkingSetSize / (1024.0 * 1024.0 * 1024.0);
+    return 0;
+#else
+    struct rusage r; getrusage(RUSAGE_SELF,&r);
 #ifdef __APPLE__
     return r.ru_maxrss/(1024.0*1024.0*1024.0);   /* macOS: ru_maxrss in BYTE */
 #else
     return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
+#endif
 #endif
 }
 /* ---- PROF=1: opt-in performance profile ----------------------------------
