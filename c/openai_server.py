@@ -1304,7 +1304,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1):
+                 kv_slots=1, allowed_hosts=()):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -1313,6 +1313,11 @@ class APIServer(ThreadingHTTPServer):
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
+        # Extra Host header values trusted past the DNS-rebinding guard, for a
+        # reverse proxy / MagicDNS in front of the loopback bind (#597). Explicit
+        # opt-in only: no wildcard, default stays loopback + bind address.
+        self.allowed_hosts = tuple(
+            h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
 
 
@@ -1383,6 +1388,7 @@ class APIHandler(BaseHTTPRequestHandler):
             name = host                                            # bare host / bracketless ipv6
         name = name.strip().lower()
         allowed = set(self.LOOPBACK_HOSTS)
+        allowed.update(self.server.allowed_hosts)          # #597: operator-trusted reverse-proxy names
         try:
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
@@ -1657,7 +1663,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         connected = False
 
             def _keepalive():
-                ping = [{"index": 0, "delta": ({"reasoning_content": "."} if chat else {"content": ""}),
+                # #597: an empty delta already resets the client's idle timer without
+                # painting hundreds of dots in the reasoning panel during a minutes-long
+                # cold prefill. COLI_VISIBLE_KEEPALIVE=1 restores the old visible "." for
+                # diagnosing whether keepalives are being delivered at all.
+                visible = os.environ.get("COLI_VISIBLE_KEEPALIVE") == "1"
+                ping = [{"index": 0,
+                         "delta": ({"reasoning_content": "." if visible else ""} if chat
+                                   else {"content": ""}),
                          "logprobs": None, "finish_reason": None}]
                 while not ka_stop.wait(1.0):
                     if not connected:
@@ -2028,7 +2041,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
     if engine is None:
         engine = default_engine()
     if not 1 <= max_tokens:
@@ -2055,7 +2068,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots)
+                       max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
@@ -2090,6 +2103,11 @@ def main():
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
+    parser.add_argument("--allowed-host", action="append",
+        default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
+        help="additional Host header value accepted by the DNS-rebinding guard "
+             "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
+             "or set COLI_ALLOWED_HOSTS as a comma-separated list")
     args = parser.parse_args()
     global ARCH
     ARCH = args.arch
@@ -2103,7 +2121,8 @@ def main():
         args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
-          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
+          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
+          allowed_hosts=args.allowed_host)
 
 
 if __name__ == "__main__":
