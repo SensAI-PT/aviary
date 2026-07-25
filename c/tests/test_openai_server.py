@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import math
@@ -955,6 +956,53 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+
+class AllowedHostsTest(unittest.TestCase):
+    """#597: the DNS-rebinding guard must accept operator-trusted reverse-proxy
+    Host values, while still rejecting everything else by default."""
+
+    def _make_server(self, allowed_hosts=()):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
+                           allowed_hosts=allowed_hosts)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def _get_models(self, port, host_header):
+        # http.client lets us set an arbitrary Host header (urlopen forces its own).
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", host_header)
+            conn.endheaders()
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_allowlist_wiring_normalises_and_filters(self):
+        server = self._make_server(allowed_hosts=("  Proxy.Example.TS.net ", "", "   "))
+        self.assertEqual(server.allowed_hosts, ("proxy.example.ts.net",))
+
+    def test_trusted_reverse_proxy_host_is_accepted(self):
+        server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
+        port = server.server_port
+        # trusted name (with a port suffix, case-insensitive) passes the guard
+        self.assertEqual(self._get_models(port, "Proxy.Example.TS.net:8000"), 200)
+        # loopback still works, unaffected by the allowlist
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_untrusted_host_is_rejected_by_default(self):
+        server = self._make_server()               # no allowlist: loopback/bind only
+        self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+    def test_untrusted_host_still_rejected_with_allowlist(self):
+        server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
+        self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
 
 
 if __name__ == "__main__":
