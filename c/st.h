@@ -467,7 +467,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
-    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
