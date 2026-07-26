@@ -63,13 +63,54 @@ def _nearest(mag4):
     return out
 
 
+_LIB = False        # False = not tried yet, None = unavailable
+
+def _native():
+    """iq3_encode.c built as a shared library, if it is next to this file.
+
+    Optional by design: without it everything still works through numpy, just
+    ~25x slower. IQ3_NATIVE=0 forces the numpy path (used to A/B the two).
+    """
+    global _LIB
+    if _LIB is not False:
+        return _LIB
+    _LIB = None
+    want = os.environ.get("IQ3_NATIVE", "1") != "0"
+    if want:
+        import ctypes, ctypes.util
+        for name in ("libiq3.so", "libiq3.dylib", "iq3.dll"):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+            if not os.path.exists(path):
+                continue
+            try:
+                lib = ctypes.CDLL(path)
+                if lib.iq3_encode_abi() != 1:
+                    break                       # stale build: fall back rather than corrupt
+                lib.iq3_encode.restype = None
+                lib.iq3_encode.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                                           ctypes.c_void_p, ctypes.c_void_p]
+                _LIB = lib
+            except (OSError, AttributeError):
+                pass
+            break
+    if _LIB is None and want:
+        # Once per process, and only when an E8 encode is actually about to run:
+        # the numpy path is correct but ~15x slower, which on a large model is the
+        # difference between hours and days. Silence here would just cost the user
+        # that time without telling them why.
+        import sys as _sys
+        print("[iq3] native encoder not built - using the numpy path (~15x slower). "
+              "Build it with:  make iq3", file=_sys.stderr, flush=True)
+    return _LIB
+
+
 def encode(x):
     """float32 [..., K] (K % 256 == 0) -> packed uint8 [..., K//256 * 98].
 
-    Rows encode independently, so they are processed in cache-sized blocks: the
-    search keeps a [rows*8, 256] score array live per sub-block, and letting that
-    grow to a whole expert tensor turns the argmin memory-bound (measured 2.4x
-    over the naive loop at 2048 rows against 5.6x at 256).
+    Uses the native encoder when available (see _native); otherwise falls back to
+    the numpy path, which processes rows in cache-sized blocks — the search keeps
+    a [rows*8, 256] score array live per sub-block, and letting that grow to a
+    whole expert tensor turns the argmin memory-bound.
     """
     x = np.ascontiguousarray(x, dtype=np.float32)
     K = x.shape[-1]
@@ -78,6 +119,11 @@ def encode(x):
     rows = x.reshape(-1, K)
     nsb = K // QK
     out = np.empty((len(rows), nsb * BLOCK_BYTES), dtype=np.uint8)
+    lib = _native()
+    if lib is not None:
+        g = np.ascontiguousarray(grid(), dtype=np.float32)
+        lib.iq3_encode(rows.ctypes.data, rows.shape[0], K, g.ctypes.data, out.ctypes.data)
+        return out.reshape(*x.shape[:-1], nsb * BLOCK_BYTES)
     rc = max(1, ROW_CHUNK)
     for r0 in range(0, len(rows), rc):
         _encode_rows(rows[r0:r0 + rc], out[r0:r0 + rc], nsb)
