@@ -1989,6 +1989,10 @@ class APIHandler(BaseHTTPRequestHandler):
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
+        # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
+        # request, and anthropic_messages() has already refused a client `stop_sequences`,
+        # so this resolves to the implicit GLM role boundaries.
+        stop_sequences, ignore_leading_stop = stop_policy(body, True)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -2028,9 +2032,11 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
+                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot,
-                    self.client_disconnected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                stop_filter.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats)
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
@@ -2147,9 +2153,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw.append(chunk)
                 (split.feed if split else emit_answer)(chunk)
 
+            stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
             stats = self.server.engine.generate(
-                prompt, maximum, temperature, top_p, on_text, cache_slot,
-                lambda: not connected[0], grammar=grammar)
+                prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
+            stop_filter.finish()
             if split:
                 split.finish()
                 close_thinking()               # budget exhaustion before </think>
