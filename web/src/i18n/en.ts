@@ -3,6 +3,7 @@ const en: Record<string, string> = {
   "nav.chat": "Chat",
   "nav.brain": "Brain",
   "nav.profiling": "Profiling",
+  "nav.cluster": "Cluster",
 
   // brand
   "brand.tagline": "local giant, tiny footprint",
@@ -115,6 +116,16 @@ const en: Record<string, string> = {
   "profile.turnsLabel": "{{n}} turns · oldest → newest",
   "profile.oneTurn": "1 turn",
   "profile.diskNote": "Disk service is time spent reading experts on I/O threads; it overlaps with compute, so only the I/O wait the compute thread felt counts inside the wall-time stack. With multiple KV sessions the shares describe the whole engine over the turn's window.",
+
+  // cluster
+  "cluster.connectFirst": "Connect to an Aviary master to view the cluster.",
+  "cluster.notMaster": "This endpoint is not an Aviary master (missing /cluster/nodes).",
+  "cluster.nodes": "{{n}} nodes",
+  "cluster.healthy": "{{n}} healthy",
+  "cluster.inflight": "{{n}} in flight",
+  "cluster.uptime": "up {{s}}s",
+  "cluster.heartbeat": "heartbeat {{s}}s ago",
+  "cluster.unknown": "unknown",
 
   // error boundary
   "error.title": "colibrì UI hit an error",

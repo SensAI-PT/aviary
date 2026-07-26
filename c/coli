@@ -1041,6 +1041,20 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
+def cmd_master(a):
+    from aviary.master import run_master
+    run_master(a.host, a.port, a.control_port, a.api_key, a.cors_origin)
+
+def cmd_agent(a):
+    need_model(a.model)
+    eng=engine_for(a.model)
+    from openai_server import default_model_id
+    model_id=a.model_id or os.environ.get("COLI_MODEL_ID") or default_model_id(a.model)
+    from aviary.agent import run_agent
+    run_agent(a.model, a.master, a.host, a.port, model_id, a.api_key,
+              a.control_port, a.advertise_host, a.cap, a.ngen, env_for(a),
+              a.max_queue, a.queue_timeout, a.kv_slots, eng)
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -1209,6 +1223,24 @@ def main():
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pm=sub.add_parser("master", help="Aviary cluster master (scheduler + dashboard)")
+    pm.add_argument("--host", default="0.0.0.0")
+    pm.add_argument("--port", type=int, default=9000)
+    pm.add_argument("--control-port", type=int, default=int(os.environ.get("AVIARY_CONTROL_PORT", "9002")))
+    pm.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pm.add_argument("--cors-origin", action="append", default=None)
+    pa=sub.add_parser("agent", parents=[common], help="Aviary cluster worker agent")
+    pa.add_argument("--master", required=True, help="master URL, e.g. http://127.0.0.1:9000")
+    pa.add_argument("--host", default="127.0.0.1")
+    pa.add_argument("--port", type=int, default=8001)
+    pa.add_argument("--control-port", type=int, default=int(os.environ.get("AVIARY_CONTROL_PORT", "9002")))
+    pa.add_argument("--advertise-host", default=None, help="address master uses to proxy (auto-detected if omitted)")
+    pa.add_argument("--model-id", default=None)
+    pa.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pa.add_argument("--cors-origin", action="append", default=None)
+    pa.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
+    pa.add_argument("--queue-timeout", type=float, default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
+    pa.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
@@ -1232,7 +1264,8 @@ def main():
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"rocm-plan":cmd_rocm_plan,"doctor":cmd_doctor,
-             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
+             "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"master":cmd_master,"agent":cmd_agent,
+             "stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
     if handler: sys.exit(handler(a) or 0)
     banner(); print(__doc__)

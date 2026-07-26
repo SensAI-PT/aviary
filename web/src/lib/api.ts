@@ -47,6 +47,31 @@ export interface HealthResponse {
   kv_slots?: number
   tiers?: TiersHealth
   hwinfo?: HwinfoHealth
+  cluster?: boolean
+}
+
+export interface ClusterNode {
+  node_id: string
+  endpoint: string
+  host: string
+  http_port: number
+  model_id: string
+  model_path: string
+  status: string
+  inflight: number
+  uptime_sec: number
+  last_heartbeat_age_sec: number
+  hwinfo?: HwinfoHealth
+  tiers?: TiersHealth
+  emap?: { rows: number; cols: number; map: string }
+  hits?: string
+  hits_seq?: number
+}
+
+export interface ClusterNodesResponse {
+  nodes: ClusterNode[]
+  healthy: number
+  total: number
 }
 
 export interface ProfileTurn {
@@ -121,6 +146,12 @@ export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSig
   const response = await fetch(serverEndpoint(baseUrl, "profile"), { headers: headers(apiKey), signal })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ProfileResponse
+}
+
+export async function getClusterNodes(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ClusterNodesResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/nodes"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterNodesResponse
 }
 
 export function extractSSE(buffer: string) {

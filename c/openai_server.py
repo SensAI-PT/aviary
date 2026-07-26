@@ -1011,11 +1011,8 @@ class Engine:
             argv = [str(executable), str(cap), "4", "8"]
         else:
             argv = [str(executable), str(cap)]
-        # hy3.c has no run_serve_mux/step_decode_batch (those symbols live only in glm.c) --
-        # it silently ignores SERVE_BATCH and always runs the old single-sequence run_serve(),
-        # which speaks \x02PROMPT/END, not SUBMIT/DATA/DONE. Fall back to that protocol for Hy3
-        # so the SUBMIT header text isn't mistaken for a literal chat message.
-        self.protocol = "single" if fam == "hy_v3" else "mux"
+        # hy3.c supports run_serve_mux with SERVE_BATCH=1 (same SUBMIT/DATA/DONE as colibri).
+        self.protocol = "mux"
         self.process = subprocess.Popen(
             argv, env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,

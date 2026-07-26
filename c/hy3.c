@@ -26,6 +26,9 @@
 #if defined(__linux__) && defined(COLI_IOURING)
 #include <liburing.h>
 #endif
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/select.h>
+#endif
 #include "st.h"
 #include "json.h"
 #include "compat.h"
@@ -171,6 +174,9 @@ typedef struct {
     uint8_t *attn_vis;                           /* TREE_DRAFT: mask [S][max_t] flattened */
     int attn_vis_s;
 } Model;
+
+#include "telemetry.h"
+#include "decode_batch.h"
 
 static void perf_report(Model *m);
 
@@ -1263,6 +1269,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int kk=0;kk<Ke;kk++){
             if(m->eusage[layer]) m->eusage[layer][idx[kk]]++;
             if(m->eheat[layer]&&m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
+            ehit_mark(m,layer,idx[kk]);
         }
         if(c->route_norm){ float sm=1e-20f; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->router_scale;
@@ -1707,28 +1714,6 @@ static double mem_available_gb(void){
 #endif
 }
 
-static int64_t tbytes(int O,int I,int bits){
-    if(bits>=16) return (int64_t)O*I*4;
-    if(bits>=5) return (int64_t)O*I+(int64_t)O*4;
-    return (int64_t)O*((I+1)/2)+(int64_t)O*4;
-}
-static int64_t expert_bytes_probe(Model *m, int ebits){
-    Cfg *c=&m->c; int64_t eb=0; char nm[256];
-    int layer=c->first_dense<c->n_layers?c->first_dense:c->n_layers-1;
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",layer);
-    if(st_nbytes(&m->S,nm)>0){
-        const char *suf[3]={"gate_proj","up_proj","down_proj"};
-        for(int k=0;k<3;k++){
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",layer,suf[k]);
-            eb+=st_nbytes(&m->S,nm);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",layer,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
-        }
-    }
-    if(eb<=0) eb=tbytes(c->moe_inter,c->hidden,ebits)*2+tbytes(c->hidden,c->moe_inter,ebits);
-    return eb;
-}
-
 static double kv_pool_bytes(Model *m, int max_ctx){
     Cfg *c=&m->c;
     int nl=c->n_layers+(m->has_mtp?1:0);
@@ -1960,27 +1945,6 @@ static void perf_report(Model *m){
         100.0*m->t_emm/total, 100.0*m->t_head/total);
 }
 
-static char g_usage_path[2100]="";
-static void stats_dump_q(Model *m, const char *path, int quiet){
-    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
-    Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<c->n_layers;i++){ if(!m->eusage[i]) continue;
-        for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){
-            fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selections / %lld experts -> %s\n",(long long)tot,(long long)nz,path);
-}
-static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
-static int64_t usage_load(Model *m, const char *path){
-    FILE *f=fopen(path,"r"); if(!f) return 0;
-    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
-    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
-    fclose(f); return tot;
-}
-static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
-
 /* log-likelihood scoring (SCORE=requests.txt): one forward per line, teacher-forcing */
 static double logprob_target(const float *lo, int V, int target, int *am){
     float mx=lo[0]; int best=0; for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];best=i;} }
@@ -2110,6 +2074,7 @@ static void run_serve(Model *m, const char *snap){
     kv_alloc(m,maxctx);
     printf("\x01\x01" "READY" "\x01\x01\n");
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    hwinfo_emit(m); tiers_emit(m); emap_emit(m);
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0&&line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; kv_alloc(m,4096);
@@ -2125,6 +2090,7 @@ static void run_serve(Model *m, const char *snap){
             double decode_tps=prod>0&&decode_t>1e-6?prod/decode_t:0.0;
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
+            hwinfo_emit(m); tiers_emit(m); emap_emit(m); hits_emit(m);
             printf("STAT %d %.2f %.1f %.2f 0 0 %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
                 rss_gb(),decode_tps);
             fflush(stdout); usage_save(m); repin_pass(m); continue;
@@ -2188,12 +2154,231 @@ static void run_serve(Model *m, const char *snap){
         double decode_tps=prod>0&&decode_t>1e-6?prod/decode_t:0.0;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
         printf("%s\x01\x01" "END" "\x01\x01\n",raw_mode?"":"\n");
+        hwinfo_emit(m); tiers_emit(m); emap_emit(m); hits_emit(m);
         printf("STAT %d %.2f %.1f %.2f %d %d %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
             rss_gb(),prompt_tokens,prod>=cur,decode_tps);
         fflush(stdout); usage_save(m); repin_pass(m);
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
     }
     free(line); free(buf); free(hist); usage_save(m);
+}
+
+/* ---- multiplexed serve (SERVE_BATCH=1): SUBMIT/DATA/DONE wire protocol ---- */
+typedef struct {
+    float **K, **V; int8_t **Kq, **Vq; float **Kscale, **Vscale;
+    int *kv_start; int max_t;
+} SlotKV;
+
+typedef struct { SlotKV kv; int *hist, len; } ServeCtx;
+
+typedef struct {
+    int active, pending, emitted, maximum, prompt_tokens, length_limited;
+    unsigned long long id;
+    float temp, top_p;
+    double started;
+    uint64_t hits0, miss0;
+} ServeReq;
+
+static void slot_kv_alloc(Model *m, SlotKV *sk, int max_t){
+    Cfg *c=&m->c; int NR=c->n_layers+(m->has_mtp?1:0);
+    sk->max_t=max_t;
+    sk->kv_start=calloc(NR,sizeof(int));
+    int64_t slot=(int64_t)c->n_kv_heads*max_t*c->head_dim;
+    int64_t sc_slot=(int64_t)c->n_kv_heads*max_t;
+    if(g_kv_i8){
+        sk->Kq=calloc(NR,sizeof(int8_t*)); sk->Vq=calloc(NR,sizeof(int8_t*));
+        sk->Kscale=calloc(NR,sizeof(float*)); sk->Vscale=calloc(NR,sizeof(float*));
+        sk->K=sk->V=NULL;
+        for(int i=0;i<NR;i++){
+            sk->Kq[i]=malloc((size_t)slot); sk->Vq[i]=malloc((size_t)slot);
+            sk->Kscale[i]=falloc(sc_slot); sk->Vscale[i]=falloc(sc_slot);
+            if(!sk->Kq[i]||!sk->Vq[i]){fprintf(stderr,"OOM slot kv i8\n");exit(1);}
+            sk->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+        }
+    } else {
+        sk->K=calloc(NR,sizeof(float*)); sk->V=calloc(NR,sizeof(float*));
+        sk->Kq=NULL; sk->Vq=NULL; sk->Kscale=NULL; sk->Vscale=NULL;
+        for(int i=0;i<NR;i++){
+            sk->K[i]=falloc(slot); sk->V[i]=falloc(slot);
+            sk->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+        }
+    }
+}
+
+static void slot_kv_free(SlotKV *sk, Model *m){
+    Cfg *c=&m->c; int NR=c->n_layers+(m->has_mtp?1:0);
+    if(sk->K){ for(int i=0;i<NR;i++){ free(sk->K[i]); free(sk->V[i]); } free(sk->K); free(sk->V); }
+    if(sk->Kq){ for(int i=0;i<NR;i++){ free(sk->Kq[i]); free(sk->Vq[i]); free(sk->Kscale[i]); free(sk->Vscale[i]); }
+        free(sk->Kq); free(sk->Vq); free(sk->Kscale); free(sk->Vscale); }
+    free(sk->kv_start);
+    memset(sk,0,sizeof(*sk));
+}
+
+static void kv_bind_slot(Model *m, SlotKV *sk){
+    m->K=sk->K; m->V=sk->V; m->Kq=sk->Kq; m->Vq=sk->Vq;
+    m->Kscale=sk->Kscale; m->Vscale=sk->Vscale;
+    m->kv_start=sk->kv_start; m->max_t=sk->max_t;
+}
+
+static void serve_ctx_init(Model *m, ServeCtx *sc, int maxctx){
+    slot_kv_alloc(m,&sc->kv,maxctx);
+    sc->hist=malloc(maxctx*sizeof(int));
+    if(!sc->hist){ fprintf(stderr,"OOM serve_ctx_init hist\n"); exit(1); }
+    sc->len=0;
+}
+
+static void serve_ctx_free(Model *m, ServeCtx *sc){
+    slot_kv_free(&sc->kv,m); free(sc->hist); sc->hist=NULL; sc->len=0;
+}
+
+static void mux_data(Tok *T, unsigned long long id, int token){
+    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    printf("DATA %llu %d\n",id,n); if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    fflush(stdout);
+}
+
+static int mux_token_done(Model *m, int tok, int eos){
+    return tok==eos || is_stop(&m->c,tok);
+}
+
+static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
+    double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
+    double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
+    hwinfo_emit(m); usage_save(m); tiers_emit(m); emap_emit(m); hits_emit(m);
+    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
+           r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
+           r->prompt_tokens,r->length_limited);
+    fflush(stdout);
+    r->active=0;
+}
+
+static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, int maxctx, int eos){
+    char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
+    if(nr<0){ free(line); return -1; }
+    if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"CANCEL ",7)){
+        unsigned long long id=0; char tail;
+        if(sscanf(line+7,"%llu %c",&id,&tail)!=1 || id==0){
+            printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0;
+        }
+        for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==id){
+            req[i].active=0;
+            printf("ERROR %llu CANCELLED\n",id); fflush(stdout); free(line); return 0;
+        }
+        printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
+    }
+    ColiSubmit sub; int valid=coli_submit_parse(line,&sub);
+    if(!valid){ printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0; }
+    char *raw=malloc((size_t)sub.bytes+1);
+    if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
+    if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
+    int delim=fgetc(stdin);
+    if(delim!='\n'){
+        printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+        free(raw); free(line); return -1;
+    }
+    raw[sub.bytes]=0;
+    if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
+        printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    if(req[sub.slot].active){
+        printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
+        printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
+    }
+    ServeCtx *sc=&ctx[sub.slot];
+    kv_bind_slot(m,&sc->kv);
+    int *tmp=malloc(maxctx*sizeof(int));
+    if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
+    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
+    free(raw); free(line);
+    if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
+    if(nt>maxctx-2){
+        free(tmp);
+        printf("ERROR %llu CONTEXT_EXCEEDED %d %d\n",sub.id,nt,maxctx-2);
+        fflush(stdout); return 0;
+    }
+    int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1; }
+    int add=nt-sc->len;
+    if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
+    fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
+    free(tmp);
+    float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
+                         : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    sc->len+=add;
+    ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
+    r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
+    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    int room=maxctx-sc->len-1; if(r->maximum>room){ r->maximum=room; r->length_limited=1; }
+    g_temp=r->temp; g_nuc=r->top_p;
+    int next=pick_tok(logit,m->c.vocab,-1); free(logit);
+    if(r->maximum<=0 || mux_token_done(m,next,eos)){ mux_done(m,sc,r); return 1; }
+    r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    mux_data(T,r->id,next);
+    if(r->emitted>=r->maximum) mux_done(m,sc,r);
+    return 1;
+}
+
+static void run_serve_mux(Model *m, const char *snap){
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp);
+    int eos=tok_id_of(&T,"<|endoftext|>");
+    if(eos<0) eos=tok_id_of(&T,"<|end|>");
+    g_draft=0; /* MTP is not mux-safe on Hy3 v1 */
+    int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
+    if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); exit(2); }
+    ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
+    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],maxctx);
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+    setvbuf(stdin,NULL,_IONBF,0);
+    printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
+    hwinfo_emit(m); tiers_emit(m); emap_emit(m);
+    int eof=0;
+    for(;;){
+        int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+        int ready=0;
+        if(!eof){
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+            fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+            struct timeval tv={0,0}, *ptv=active?&tv:NULL;
+            ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
+            if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds))
+#elif defined(_WIN32)
+            HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
+            DWORD avail=0;
+            if(!active) ready=1;
+            else ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
+            if(ready)
+#endif
+                if(mux_submit(m,&T,ctx,req,nctx,maxctx,eos)<0) eof=1;
+        }
+        active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+        if(!active){ if(eof) break; continue; }
+        for(int i=0;i<nctx;i++){
+            if(!req[i].active) continue;
+            ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
+            kv_bind_slot(m,&sc->kv);
+            float *logit=step(m,sc->hist+sc->len-1,1,sc->len-1);
+            m->n_fw++;
+            sc->len++;
+            g_temp=r->temp; g_nuc=r->top_p;
+            int next=pick_tok(logit,m->c.vocab,-1); free(logit);
+            if(mux_token_done(m,next,eos)){ mux_done(m,sc,r); continue; }
+            r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
+            mux_data(&T,r->id,next);
+            if(r->emitted>=r->maximum) mux_done(m,sc,r);
+        }
+    }
+    usage_save(m);
+    for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]);
+    free(ctx); free(req);
 }
 
 static void run_prompt_ids(Model *m, int ngen){
@@ -2307,7 +2492,13 @@ int main(int argc, char **argv){
     const char *stats=getenv("STATS");
     if(getenv("SCORE")){ run_score(&m,getenv("SCORE")); if(stats) stats_dump(&m,stats); usage_save(&m); return 0; }
 
-    if(getenv("SERVE")){ run_serve(&m,snap); if(stats) stats_dump(&m,stats); usage_save(&m); return 0; }
+    if(getenv("SERVE")){
+        if(getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH")))
+            run_serve_mux(&m,snap);
+        else
+            run_serve(&m,snap);
+        if(stats) stats_dump(&m,stats); usage_save(&m); return 0;
+    }
     if(getenv("PROMPT")){
         if(getenv("IDS")) run_prompt_ids(&m,getenv("NGEN")?atoi(getenv("NGEN")):32);
         else run_text(&m,snap,getenv("PROMPT"),getenv("NGEN")?atoi(getenv("NGEN")):32);

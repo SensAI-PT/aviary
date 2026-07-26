@@ -5,7 +5,6 @@ import { endpoint } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
-interface AtlasEntry { affinity: Record<string, number>; entropy: number; top: string; label: string }
 
 const TIER_KEYS = ["tier.disk", "tier.ram", "tier.vram"] as const
 const TIER_RGB: [number, number, number][] = [[58, 71, 80], [90, 155, 216], [78, 214, 165]]
@@ -20,7 +19,12 @@ function depthRoleKey(row: number, rows: number, isMtp: boolean): string {
   return "brain.final"
 }
 
-export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey: string; connected: boolean }) {
+export function Brain({ baseUrl, apiKey, connected, staticData }: {
+  baseUrl: string
+  apiKey: string
+  connected: boolean
+  staticData?: ExpertMap | null
+}) {
   const { t } = useLocale()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -51,8 +55,13 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     return () => ro.disconnect()
   }, [])
 
-  // poll /experts
+  // poll /experts (skipped when static cluster data is supplied)
   useEffect(() => {
+    if (staticData) {
+      setData(staticData)
+      setProbeErr(false)
+      return
+    }
     if (!connected) return
     let disposed = false
     const base = baseUrl.replace(/\/v1\/?$/, "")
@@ -79,7 +88,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     void poll()
     const t = window.setInterval(() => void poll(), 1500)
     return () => { disposed = true; window.clearInterval(t) }
-  }, [baseUrl, apiKey, connected])
+  }, [baseUrl, apiKey, connected, staticData])
 
   // render loop: grid + decaying pulses
   useEffect(() => {
