@@ -341,7 +341,7 @@ int main(int argc, char **argv) {
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */
-    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], tensor4[64];
+    uint8_t w4[32*32/2]; float ws4[32], gx4[64], scalar4[64], async4[64], tensor4[64];
     for(int i=0;i<(int)sizeof(w4);i++){
         int lo=((i%15)-7)&15,hi=(((i*3)%15)-7)&15;
         w4[i]=(uint8_t)(lo|(hi<<4));
@@ -354,6 +354,14 @@ int main(int argc, char **argv) {
        !coli_cuda_tensor_upload_g(&d4,w4,ws4,2,32,32,d0,0))return 1;
     ColiCudaTensor *gg4[2]={g4,g4},*ug4[2]={u4,u4},*dg4[2]={d4,d4};
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,scalar4,gx4))return 1;
+    if(!coli_cuda_expert_group_issue(gg4,ug4,dg4,group_rows,2,gx4))return 1;
+    const float *async_result=coli_cuda_expert_group_take(d0);
+    if(!async_result)return 1;
+    std::memcpy(async4,async_result,sizeof(async4));
+    if(std::memcmp(async4,scalar4,sizeof(async4))){
+        std::fprintf(stderr,"async packed-s4 group differs from sync path\n");
+        return 1;
+    }
     setenv("COLI_CUDA_TC_INT4","1",1);
     setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
@@ -363,7 +371,7 @@ int main(int argc, char **argv) {
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;
+    if(group_calls!=4||group_experts!=8||group_total_rows!=8) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {
