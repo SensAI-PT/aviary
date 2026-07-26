@@ -271,7 +271,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 ndir, nf, snap_dir, c0);
     }
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
+        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; snprintf(tmp, sizeof(tmp), "%s", files[a]); snprintf(files[a], 1024, "%s", files[b]); snprintf(files[b], 1024, "%s", tmp); }
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
@@ -331,7 +331,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
-            if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
+            if (S->n == S->cap) {
+                S->cap *= 2;
+                st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
+                if (!nt) { fprintf(stderr, "OOM reallocating shard tensor array\n"); exit(1); }
+                S->t = nt;
+            }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
@@ -498,7 +503,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (t->numel > cap) {
+    if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
     return st_read_f32(S, name, out, drop);
@@ -527,7 +532,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
-    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
