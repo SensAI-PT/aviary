@@ -296,8 +296,10 @@ static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
 }
+static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int qt_cuda_upload(QT *t){
-    if(t->fmt==5||t->fmt==6) return 0;   /* int3-g64 / E8: no CUDA kernel yet — tensor stays CPU-side */
+    if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
+    if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -3157,6 +3159,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
+    /* Materialise xe on first use. Every site that feeds a routed expert's gate/up
+     * input — CPU, the per-expert GPU call, and all three group packing paths —
+     * must go through here: doing the transform per expert instead of per layer
+     * costs ~11 ms against ~1.4 ms on GLM dims (#452). */
+    #define E8_XE(e) ((e)->g.fmt==6 ? (xe ? xe : (xe=falloc((int64_t)S*D), \
+        memcpy(xe,x,(size_t)S*D*sizeof(float)), e8_rot_rows(xe,S,D), xe)) : x)
     int *rows=xalloc((size_t)S*sizeof(int),"moe rows"); float *rw=xalloc((size_t)S*sizeof(float),"moe rw");
 #ifdef COLI_CUDA
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
@@ -3339,8 +3347,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                             int nc=pd_nc[di]++; ESlot *e=pg_e[q];
                             pd_g[di][nc]=e->g.cuda; pd_u[di][nc]=e->u.cuda; pd_d[di][nc]=e->d.cuda;
                             pd_rows[di][nc]=pg_n[q]; pd_which[di][nc]=q;
+                            const float *xsrc=E8_XE(e);      /* fmt=6 feeds the rotated copy */
                             for(int r=0;r<pg_n[q];r++) memcpy(group_x+(int64_t)(pd_off[di]+cursor+r)*D,
-                                x+(int64_t)prow[q][r]*D,D*sizeof(float));
+                                xsrc+(int64_t)prow[q][r]*D,D*sizeof(float));
                             cursor+=pg_n[q];
                         }
                     }
@@ -3469,11 +3478,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ngroup++; continue;
             }
 #endif
-            const float *xsrc=x;
-            if(e->g.fmt==6){
-                if(!xe){ xe=falloc((int64_t)S*D); memcpy(xe,x,(size_t)S*D*sizeof(float)); e8_rot_rows(xe,S,D); }
-                xsrc=xe;
-            }
+            const float *xsrc=E8_XE(e);
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, xsrc+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
@@ -3542,8 +3547,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 int nc=dev_nc[di]++; ESlot *e=group_e[q];
                 dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
                 dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
+                const float *xsrc=E8_XE(e);                  /* fmt=6 feeds the rotated copy */
                 for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(dev_off[di]+cursor+r)*D,
-                    x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
+                    xsrc+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
                 cursor+=group_n[q];
             }
         }
@@ -3611,12 +3617,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int q=0;q<dev_nc[di];q++){
                 int gi=dev_which[di][q],nr=group_n[gi]; ESlot *e=group_e[gi];
                 if(!dev_ok[di]){
-                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
+                    const float *xsrc=E8_XE(e);          /* fmt=6 feeds the rotated copy */
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,xsrc+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     double tc=g_prof?now_s():0;
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                         for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input, as on the main CPU path */
                         matmul_qt(hh,gg,&e->d,nr);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                             m->cpu_expert_rows+=(uint64_t)nr;}
@@ -3678,6 +3686,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
+    #undef E8_XE
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
@@ -6817,6 +6826,10 @@ int main(int argc, char **argv){
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        /* fmt=6 decodes against quant.h's codebook; publish it to every device so
+         * the backend never keeps a second copy that could drift (#452). An older
+         * DLL without the symbol leaves this 0 and fmt=6 tensors stay CPU-side. */
+        g_cuda_e8_ready=coli_cuda_e8_set_grid(e8_grid);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
