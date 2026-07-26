@@ -124,7 +124,7 @@ A pre-converted **GLM-5.2 int4** model is on Hugging Face. **Use the version
 with the int8 MTP heads** (the plain int4 heads disable speculative decoding —
 see [#8](https://github.com/JustVugg/colibri/issues/8)):
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
 Download it into a folder on a fast disk, e.g. `/nvme/glm52_i4` (Linux/macOS) or
 `D:\glm52_i4` (Windows). It is about **372 GB**, so make sure you have the space.
