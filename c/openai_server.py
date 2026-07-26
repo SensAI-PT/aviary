@@ -1534,7 +1534,16 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
-    WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+    # The dashboard ships in two layouts and the old single path only knew one:
+    # a source checkout puts this file in c/ (so web/dist is one level UP), while
+    # a release archive and an installed tree put it next to web/dist. Probing for
+    # index.html rather than the directory keeps an empty leftover web/dist from
+    # shadowing a real one.
+    WEB_DIST = next(
+        (c for c in (Path(__file__).resolve().parent / "web" / "dist",
+                     Path(__file__).resolve().parent.parent / "web" / "dist")
+         if (c / "index.html").is_file()),
+        Path(__file__).resolve().parent.parent / "web" / "dist")
 
     def serve_static(self, path):
         """Serve the built web UI (web/dist) so `coli web` is one process.
