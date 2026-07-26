@@ -5,6 +5,7 @@ import argparse
 import codecs
 import collections
 import contextlib
+import hashlib
 import json
 import math
 import mimetypes
@@ -861,6 +862,37 @@ def parse_stop_sequences(body):
     return tuple(sequences)
 
 
+def conversation_cache_slot(messages, kv_slots):
+    """Stable KV slot for a conversation so its turns reuse the same cached prefix.
+
+    The chat APIs are stateless: every turn resends the whole history, and the engine
+    caches each KV slot's prefix. When the client does not pin a `cache_slot`, the
+    scheduler falls back to `min(free_slots)`, which is blind to which slot already
+    holds this conversation. Under any interleaving of clients a turn can then land on
+    another conversation's slot and force a full re-prefill (#634, Defect 1). Hashing a
+    key that stays constant across a conversation's turns — the leading system messages
+    plus the first user message, which never change once the conversation has started —
+    routes every turn of one conversation to the same slot. Distinct conversations
+    spread across slots; when there are more live conversations than slots, colliding
+    ones degrade to the old re-prefill behaviour rather than to anything worse.
+
+    Returns a slot in [0, kv_slots). Falls back to 0 when there is nothing to key on.
+    """
+    if kv_slots <= 1 or not isinstance(messages, list) or not messages:
+        return 0
+    prefix = []
+    for message in messages:
+        prefix.append(message)
+        if isinstance(message, dict) and message.get("role") == "user":
+            break                 # first user turn reached: the key is now stable for the whole conversation
+    try:
+        key = json.dumps(prefix, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        key = repr(prefix)
+    digest = hashlib.sha1(key.encode("utf-8", "replace")).digest()
+    return int.from_bytes(digest[:8], "big") % kv_slots
+
+
 def stop_policy(body, chat):
     sequences = parse_stop_sequences(body)
     ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
@@ -1670,6 +1702,13 @@ class APIHandler(BaseHTTPRequestHandler):
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
+        if cache_slot is None and self.server.kv_slots > 1:
+            # #634: pin each conversation to a stable KV slot so multi-turn reuses its
+            # cached prefix instead of re-prefilling. Only when the request carries a
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick.
+            conversation = body.get("messages")
+            if isinstance(conversation, list) and conversation:
+                cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -1999,6 +2038,13 @@ class APIHandler(BaseHTTPRequestHandler):
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
+        if cache_slot is None and self.server.kv_slots > 1:
+            # #634: pin each conversation to a stable KV slot so multi-turn reuses its
+            # cached prefix instead of re-prefilling. Only when the request carries a
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick.
+            conversation = body.get("messages")
+            if isinstance(conversation, list) and conversation:
+                cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
