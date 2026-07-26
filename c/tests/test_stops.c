@@ -63,9 +63,17 @@ static int expect(const char *what, int id, int want){
     return 0;
 }
 
+static void test_set_env(const char *name, const char *value){
+#ifdef _WIN32
+    _putenv_s(name,value);
+#else
+    setenv(name,value,1);
+#endif
+}
+
 static void clear_env(const char *name){
 #ifdef _WIN32
-    SetEnvironmentVariableA(name,NULL);
+    _putenv_s(name,"");
 #else
     unsetenv(name);
 #endif
@@ -139,19 +147,19 @@ int main(void){
     /* 6. Private chat uses SERVE=1 for the byte protocol but has no Python
      *    StopFilter. Only the batched gateway may reduce the engine stop set. */
     { Cfg c; memset(&c,0,sizeof c); c.stop_ids[0]=100; c.n_stop=1;
-      setenv("SERVE","1",1); clear_env("SERVE_BATCH"); clear_env("COLI_SERVE_ALL_STOPS");
+      test_set_env("SERVE","1"); clear_env("SERVE_BATCH"); clear_env("COLI_SERVE_ALL_STOPS");
       stops_arm_tok(&c,100,&T);
       fail|=expect("private chat keeps <|user|>",101,1);
       fail|=expect("private chat keeps <|observation|>",102,1);
       if(g_nstop!=5){ fprintf(stderr,"  FAIL private chat: expected 5 stops, got %d\n",g_nstop); fail=1; }
 
-      setenv("SERVE_BATCH","1",1);
+      test_set_env("SERVE_BATCH","1");
       stops_arm_tok(&c,100,&T);
       fail|=expect("batched gateway keeps EOS",100,1);
       fail|=expect("batched gateway filters <|user|>",101,0);
       if(g_nstop!=1){ fprintf(stderr,"  FAIL batched gateway: expected 1 stop, got %d\n",g_nstop); fail=1; }
 
-      setenv("COLI_SERVE_ALL_STOPS","1",1);
+      test_set_env("COLI_SERVE_ALL_STOPS","1");
       stops_arm_tok(&c,100,&T);
       fail|=expect("gateway override restores <|user|>",101,1);
       if(g_nstop!=5){ fprintf(stderr,"  FAIL gateway override: expected 5 stops, got %d\n",g_nstop); fail=1; }
