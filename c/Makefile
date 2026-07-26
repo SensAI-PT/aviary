@@ -514,6 +514,15 @@ install: colibri$(EXE) olmoe$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
+	@# The dashboard is an optional build artifact (cd web && npm run build), so install
+	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
+	@if [ -f ../web/dist/index.html ]; then \
+	  $(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/web/dist; \
+	  cp -R ../web/dist/. $(DESTDIR)$(LIBEXECDIR)/web/dist/; \
+	  echo "installed the web dashboard"; \
+	else \
+	  echo "web/dist absent -- skipping the dashboard (build it with: cd web && npm run build)"; \
+	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli
