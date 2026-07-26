@@ -5,7 +5,15 @@ the PCIe copy tax that keeps CUDA's streaming experts on the CPU — so colibrì
 has an opt-in Metal backend that runs the **routed-expert SwiGLU (batched,
 zero-copy from the RAM slabs)**, the **fused decode attention** (full MLA layer
 in one command buffer, S≤4), and **prefill's large GEMMs** on the GPU.
-Token-exact vs the CPU path.
+Decode is token-exact vs the CPU path. Prefill's large GEMMs run on the GPU in a
+different accumulation order, so on **near-tie logits** they can occasionally pick a
+different top token than the CPU — a floating-point ordering difference, not a kernel
+bug (`make metal-test` passes the GEMM at ~3e-6 against a 1e-4 tolerance; see
+[#622](https://github.com/JustVugg/colibri/issues/622)). It is invisible in normal use
+but can surface in teacher-forced oracle comparisons on pathological 4-bit toy
+containers. Set `COLI_METAL_GEMM_MIN=100000` to keep every GEMM on the CPU for
+bit-exact prefill (`DEBUG_LOGITS=1` on a `TF=1` run dumps the top-5 logits and the
+top1–top2 margin at each mismatch, so you can see how close the tie was).
 
 ```bash
 cd c

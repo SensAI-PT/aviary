@@ -4829,8 +4829,27 @@ static void emit_stream(int t, void *ud){
 }
 
 /* teacher-forcing: un solo forward su ids[S], argmax per posizione in pred[S] */
-static void forward_all(Model *m, const int *ids, int S, int *pred){
+/* DEBUG_LOGITS=1: on a teacher-forcing mismatch, dump the top-5 logits, the top1-top2 margin,
+ * and where the expected/got tokens land. Makes a near-tie divergence (e.g. the Metal prefill
+ * GEMM accumulation-order drift, #622) visible as the tiny gap it is, rather than a bare token
+ * mismatch. Stderr, opt-in, only on a mismatch — normal runs are byte-for-byte unchanged. */
+static void dump_top5_logits(int pos, const float *lo, int V, int expected, int got){
+    int idx[5]; float val[5];
+    for(int k=0;k<5;k++){ idx[k]=-1; val[k]=-INFINITY; }
+    for(int i=0;i<V;i++){ float v=lo[i];
+        for(int k=0;k<5;k++) if(v>val[k]){
+            for(int j=4;j>k;j--){ val[j]=val[j-1]; idx[j]=idx[j-1]; }
+            val[k]=v; idx[k]=i; break; } }
+    double gap = (idx[1]>=0) ? (double)(val[0]-val[1]) : 0.0;
+    fprintf(stderr,"[LOGITS] pos=%d top1-top2 gap=%.3e | expected=%d (%.5f)  got=%d (%.5f) | top5:",
+            pos, gap, expected, (expected>=0&&expected<V)?(double)lo[expected]:0.0,
+            got, (got>=0&&got<V)?(double)lo[got]:0.0);
+    for(int k=0;k<5&&idx[k]>=0;k++) fprintf(stderr," %d:%.5f", idx[k], (double)val[k]);
+    fprintf(stderr,"\n");
+}
+static void forward_all(Model *m, const int *ids, int S, int *pred, const int *ref){
     Cfg *c=&m->c; int D=c->hidden;
+    int dbg = ref && getenv("DEBUG_LOGITS");
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
@@ -4842,6 +4861,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
         matmul_qt(lo, row, &m->lm_head, 1);
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
+        if(dbg && pred[s]!=ref[s]) dump_top5_logits(s, lo, c->vocab, ref[s], pred[s]);
     }
     free(x); free(lo); free(row);
 }
@@ -7022,7 +7042,7 @@ int main(int argc, char **argv){
     if(getenv("TF")){
         int *tf=read_arr(ref,"tf_pred",&(int){0});
         int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
-        forward_all(&m, full, nfull, pred); double tdt=now_s()-tt;
+        forward_all(&m, full, nfull, pred, tf); double tdt=now_s()-tt;
         int ok=0; for(int i=0;i<nfull;i++){
             if(pred[i]==tf[i]) ok++;
             else fprintf(stderr,"[ORACLE] mismatch pos=%d expected=%d got=%d\n",i,tf[i],pred[i]);
