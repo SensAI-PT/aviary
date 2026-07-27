@@ -6688,6 +6688,11 @@ int main(int argc, char **argv){
         if(!i4_acc512_selftest()) return 1;
         puts("AVX512 i4 selftest: ok"); return 0;
     }
+    if(getenv("I3_AVX512")) g_i3_avx512=atoi(getenv("I3_AVX512"))!=0;
+    if(getenv("I3_AVX512_TEST")){
+        if(!i3_avx512_selftest()) return 1;
+        puts("AVX512 i3 selftest: ok"); return 0;
+    }
 #endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;

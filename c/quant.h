@@ -295,10 +295,62 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 static inline int64_t i3_groups(int I){ return ((int64_t)I + I3_GROUP - 1) / I3_GROUP; }
 static inline int64_t i3_rowbytes(int I){ return i3_groups(I) * I3_GBYTES; }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int g_i3_avx512=1;
+/* one full 64-value group -> f32 partial. Relies on immintrin.h arriving via the
+ * __AVX2__-gated include above (AVX512F implies AVX2 on clang/gcc/MSVC), same as
+ * dot_i4f_avx512. */
+static inline float dot_i3g64_avx512(const uint8_t *lo, const uint8_t *hi, const float *x){
+    const __m128i m2=_mm_set1_epi8(3); const __m512i c4=_mm512_set1_epi8(4);
+    __m128i by=_mm_loadu_si128((const __m128i*)lo);
+    __m128i p0=_mm_and_si128(by,m2),                   p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+    __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+    __m128i l01=_mm_unpacklo_epi8(p0,p1), h01=_mm_unpackhi_epi8(p0,p1);
+    __m128i l23=_mm_unpacklo_epi8(p2,p3), h23=_mm_unpackhi_epi8(p2,p3);
+    __m512i lov=_mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(
+        _mm512_castsi128_si512(_mm_unpacklo_epi16(l01,l23)),
+        _mm_unpackhi_epi16(l01,l23),1),
+        _mm_unpacklo_epi16(h01,h23),2),
+        _mm_unpackhi_epi16(h01,h23),3);            /* byte k = low 2 bits of value k */
+    uint64_t hb; memcpy(&hb,hi,8);                 /* mask bit k = high bit of value k */
+    __m512i wq=_mm512_sub_epi8(_mm512_mask_add_epi8(lov,(__mmask64)hb,lov,c4),c4); /* [-4,3] in order */
+    __m512 ac0=_mm512_setzero_ps(), ac1=_mm512_setzero_ps();
+    ac0=_mm512_fmadd_ps(_mm512_loadu_ps(x),    _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_castsi512_si128(wq))),      ac0);
+    ac1=_mm512_fmadd_ps(_mm512_loadu_ps(x+16), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,1))), ac1);
+    ac0=_mm512_fmadd_ps(_mm512_loadu_ps(x+32), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,2))), ac0);
+    ac1=_mm512_fmadd_ps(_mm512_loadu_ps(x+48), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,3))), ac1);
+    return _mm512_reduce_add_ps(_mm512_add_ps(ac0,ac1));
+}
+static int i3_avx512_selftest(void){
+    /* fixed group, asymmetric in every lane: pseudo-random 3-bit values with
+     * distinct nonzero integer activations. All terms and partials are small
+     * integers (exact in f32 under ANY summation order), so the compare is
+     * exact — any lane permutation, bias error or plane mix-up shifts the sum. */
+    uint8_t lo[16]={0}, hi[8]={0}; float x[I3_GROUP]; double ref=0;
+    uint64_t r=0x9E3779B97F4A7C15ull;
+    for(int k=0;k<I3_GROUP;k++){
+        r^=r<<13; r^=r>>7; r^=r<<17;
+        unsigned u=(unsigned)(r&7);
+        lo[k>>2]|=(uint8_t)((u&3)<<((k&3)*2));
+        hi[k>>3]|=(uint8_t)((u>>2)<<(k&7));
+        x[k]=(k&1)?-(float)(k+1):(float)(k+1);
+        ref+=(double)x[k]*((int)u-4);
+    }
+    float got=dot_i3g64_avx512(lo,hi,x);
+    if(got!=(float)ref){ fprintf(stderr,"AVX512 i3 selftest: %.9g != %.9g\n",got,ref); return 0; }
+    return 1;
+}
+#endif
+
 /* Dequant-on-use with PER-GROUP scale. Exact f32 path only (no IDOT in v1: int8
  * activations don't compose with per-group accumulation without a kernel
  * restructure — follow-up). NEON: low plane = matmul_i2's unpack, high plane
- * expanded via vtst on bit masks; x86 stays scalar for now (follow-up). */
+ * expanded via vtst on bit masks. AVX-512(F+BW): same unpack at 128-bit, high
+ * plane loaded as a __mmask64 (bit k = value k) driving a masked +4; one full
+ * group per iteration (dot_i3g64_avx512; I3_AVX512=0 falls back to scalar).
+ * Other x86 stays scalar (follow-up). Both vector arms reorder fma WITHIN a
+ * group only; the per-group partial is scaled by scale[g] and added to the
+ * row accumulator in scalar order, exactly like the scalar loop. */
 static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
     int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
     #pragma omp parallel for schedule(static)
@@ -312,7 +364,9 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
                 const uint8_t *lo=wrow+g*I3_GBYTES, *hi=lo+16;
                 int base=(int)(g*I3_GROUP), n = I-base < I3_GROUP ? I-base : I3_GROUP;
                 float a=0; int k=0;
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                if(g_i3_avx512 && n==I3_GROUP){ a=dot_i3g64_avx512(lo,hi,xs+base); k=I3_GROUP; }
+#elif defined(__ARM_NEON)
                 if(n==I3_GROUP){
                     const uint8x8_t m2v=vdup_n_u8(3); const int8x16_t b4q=vdupq_n_s8(4);
                     const uint8x16_t bitm={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
