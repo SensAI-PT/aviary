@@ -6259,6 +6259,7 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
 }
 #endif
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
+static double g_mem_avail_boot;   /* def. sotto (#653: corretta qui su GPU integrate) */
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
@@ -6395,6 +6396,23 @@ static void pin_load(Model *m, const char *statspath, double gb){
             g_cuda_reserve_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+        /* #653: on integrated / unified-memory GPUs (Grace-Blackwell GB10, Jetson) the
+         * expert tier and the host RAM cache draw from ONE physical pool, so the boot
+         * MemAvailable snapshot -- captured before this tier was placed -- over-counts
+         * free RAM by exactly the tier size. The auto RAM budget (cap_for_ram) and the
+         * overcommit guard both read g_mem_avail_boot, so correcting it here fixes both:
+         * the budget shrinks by the placed bytes and no longer over-commits into an
+         * OOM-kill during prefill. Discrete GPUs have a separate VRAM pool -> integrated
+         * is 0 and this is a no-op, leaving their behaviour unchanged. */
+        if(g_cuda_ndev>0 && m->gpu_expert_bytes>0 && g_mem_avail_boot>0 &&
+           coli_cuda_device_integrated(g_cuda_devices[0])){
+            double tier_gb = m->gpu_expert_bytes/1e9;
+            g_mem_avail_boot -= tier_gb;
+            if(g_mem_avail_boot < 1.0) g_mem_avail_boot = 1.0;
+            fprintf(stderr,"[CUDA] integrated/unified memory: expert tier shares physical RAM; "
+                "RAM budget snapshot reduced by %.2f GB -> MemAvailable=%.1f GB (#653)\n",
+                tier_gb, g_mem_avail_boot);
+        }
     }
 #endif
     if(gpu_prefix>0&&gpu_prefix<npin){

@@ -710,6 +710,16 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+/* #653: 1 when the device shares physical memory with the host (Grace-Blackwell /
+ * GB10, Jetson, integrated GPUs). On these the expert tier and the RAM cache draw
+ * from the same pool, so the RAM budget must account for the tier; on a discrete GPU
+ * VRAM is a separate pool and this returns 0. */
+extern "C" int coli_cuda_device_integrated(int device) {
+    cudaDeviceProp prop{};
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
+    return prop.integrated ? 1 : 0;
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
