@@ -33,6 +33,7 @@ typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
+typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
@@ -106,6 +107,7 @@ static struct {
     fn_device_count    device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
+    fn_device_integrated device_integrated;
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
@@ -216,6 +218,10 @@ static int coli_cuda_load(void){
     RESOLVE(device_count,   fn_device_count)
     RESOLVE(device_at,      fn_device_at)
     RESOLVE(mem_info,       fn_mem_info)
+    /* Optional: a DLL predating #653 leaves this NULL; the wrapper then reports
+     * "not integrated" (0), so the RAM-budget correction simply doesn't apply
+     * rather than taking the whole GPU backend down over one missing symbol. */
+    RESOLVE_OPT(device_integrated, fn_device_integrated)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
@@ -292,6 +298,11 @@ int coli_cuda_device_at(int index){
 int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes){
     if(!g_cuda.available){ if(free_bytes)*free_bytes=0; if(total_bytes)*total_bytes=0; return 0; }
     return g_cuda.mem_info(device, free_bytes, total_bytes);
+}
+
+int coli_cuda_device_integrated(int device){
+    if(!g_cuda.available || !g_cuda.device_integrated) return 0;
+    return g_cuda.device_integrated(device);
 }
 
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes){
