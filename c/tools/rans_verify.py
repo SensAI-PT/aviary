@@ -46,6 +46,31 @@ WHAT IS CHECKED, per shard:
   shard's own table must reproduce the record byte-for-byte
   (E_REENCODE_MISMATCH) — the writer is deterministic, so any surviving
   divergence is corruption the invariants above happened to miss.
+  whole-artifact layer (repack-manifest.json next to the shards, written by
+  repack_rans.py; per-shard whole-file sha256 + per-record sha256 digests):
+    E_MANIFEST_MALFORMED   a manifest file exists but cannot be parsed as
+                           the expected JSON shape — refused rather than
+                           treated as "no manifest", since a corrupted
+                           manifest is itself evidence of tampering
+    E_SHARD_DIGEST_MISMATCH  the complete shard file does not hash to the
+                           digest the mint run recorded — checked FIRST;
+                           covers .qs sidecars, headers and padding, which
+                           the per-record map cannot see. On mismatch the
+                           per-record layer still runs, to localize the
+                           damage when it sits inside a record
+    E_DIGEST_MISSING       the manifest carries digests but not for this
+                           shard or this stamped tensor (a record the
+                           mint run never produced)
+    E_DIGEST_MISMATCH      a record's bytes do not hash to the digest the
+                           mint run recorded — the wrong-checkpoint /
+                           swapped-record case per-record checks alone
+                           cannot see
+  No manifest, or a manifest without digest maps, means NO check is
+  possible (older mint runs): a note is printed and per-record
+  verification proceeds — never an error. This layer checks BUILD
+  integrity (these exact bytes came from that mint run); container
+  identity proper is the stamp/registry lineage, and the consumer-side
+  load check ships with the consumer PR.
 
 Exit status: 0 = every named shard TRUSTED; 1 = at least one refusal
 (each printed as `REFUSE <shard> <tensor|-> <CLASS>: detail`); 2 = usage.
@@ -58,6 +83,7 @@ Usage:
   python3 tools/rans_verify.py --max-tensors 8 <shard>   # sampled quick look
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -69,6 +95,70 @@ import rans_format as rf  # noqa: E402
 def refuse(failures, shard, tensor, code, detail):
     print(f"REFUSE {os.path.basename(shard)} {tensor or '-'} {code}: {detail}")
     failures.append((shard, tensor, code))
+
+
+def load_manifest_digests(shard_path):
+    """Digest evidence for one shard from the repack-manifest.json next to
+    it. Returns (file_sha256-or-None, records-map-or-None, notes:list);
+    raises RansRefusal E_MANIFEST_MALFORMED when a manifest exists but is
+    not the expected shape (a corrupt manifest is evidence, not an excuse
+    to skip checks), and E_DIGEST_MISSING when the manifest carries digest
+    evidence but no entry for this shard."""
+    mpath = os.path.join(os.path.dirname(os.path.abspath(shard_path)),
+                         "repack-manifest.json")
+    if not os.path.exists(mpath):
+        return None, None, ["no repack-manifest.json — whole-artifact digest "
+                            "check skipped"]
+    try:
+        with open(mpath) as fh:
+            man = json.load(fh)
+        if not isinstance(man, dict) or not isinstance(man.get("shards"), list):
+            raise ValueError("not the expected {.., shards: [..]} object")
+        entries = man["shards"]
+    except (OSError, ValueError) as exc:
+        raise rf.RansRefusal("E_MANIFEST_MALFORMED",
+                             f"repack-manifest.json unreadable: {exc}")
+    # type-validate EVERY entry's shape unconditionally, BEFORE the evidence
+    # scan: a wrong-typed sha256/records field is malformation regardless of
+    # whether any valid evidence remains elsewhere — otherwise an entry
+    # whose only digest fields are malformed-typed would zero the evidence
+    # scan and be silently classed as a digest-less older mint
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            raise rf.RansRefusal("E_MANIFEST_MALFORMED",
+                                 f"shards[{i}] is not an object")
+        sha = e.get("sha256")
+        if sha is not None and not isinstance(sha, str):
+            raise rf.RansRefusal("E_MANIFEST_MALFORMED",
+                                 f"shards[{i}].sha256 is not a string")
+        rec = e.get("records")
+        if rec is not None and (not isinstance(rec, dict) or
+                                not all(isinstance(k, str) and isinstance(v, str)
+                                        for k, v in rec.items())):
+            raise rf.RansRefusal("E_MANIFEST_MALFORMED",
+                                 f"shards[{i}].records is not a str->str map")
+    any_evidence = any(e.get("records") is not None or
+                       e.get("sha256") is not None for e in entries)
+    if not any_evidence:
+        return None, None, ["repack-manifest.json carries no digests "
+                            "(older mint) — whole-artifact digest check skipped"]
+    base = os.path.basename(shard_path)
+    for e in entries:
+        if e.get("file") != base:
+            continue
+        sha = e.get("sha256")
+        rec = e.get("records")
+        notes = []
+        if sha is None:
+            notes.append("manifest entry has no whole-file sha256 — "
+                         "file-level check skipped")
+        if rec is None:
+            notes.append("manifest entry has no record digests — "
+                         "record-level digest check skipped")
+        return sha, rec, notes
+    raise rf.RansRefusal("E_DIGEST_MISSING",
+                         f"manifest carries digests but no entry for {base} — "
+                         f"this shard is not part of the minted set")
 
 
 def verify_shard(path, failures, max_tensors=None):
@@ -116,6 +206,24 @@ def verify_shard(path, failures, max_tensors=None):
         refuse(failures, path, None, exc.code, exc.detail)
         return
 
+    try:
+        file_sha, digests, digest_notes = load_manifest_digests(path)
+    except rf.RansRefusal as exc:
+        refuse(failures, path, None, exc.code, exc.detail)
+        return
+    for note in digest_notes:
+        print(f"[note] {os.path.basename(path)}: {note}")
+    if file_sha is not None:
+        # whole-file gate FIRST (cheapest whole-artifact check; covers .qs
+        # sidecars, headers and padding the per-record map cannot see); on
+        # mismatch, continue into the per-record layer so the refusal gets
+        # localized to a tensor when the damage is inside a record
+        got = rf.sha256_file(path)
+        if got != file_sha:
+            refuse(failures, path, None, "E_SHARD_DIGEST_MISMATCH",
+                   f"file hashes {got[:16]}…, manifest recorded "
+                   f"{file_sha[:16]}… — shard bytes differ from the mint run")
+
     checked = 0
     trusted = 0
     for name in ours:
@@ -133,6 +241,20 @@ def verify_shard(path, failures, max_tensors=None):
                 raise rf.RansRefusal("E_STAMP_DTYPE",
                                      f"dtype {info['dtype']} != U8")
             blob, _ = rf.read_tensor_bytes(path, header, data_start, name)
+            if digests is not None:
+                # whole-artifact check first: the swapped-valid-record case
+                # every per-record invariant below is structurally blind to
+                if name not in digests:
+                    raise rf.RansRefusal(
+                        "E_DIGEST_MISSING",
+                        "manifest carries digests but none for this tensor — "
+                        "a record the mint run never produced")
+                got = hashlib.sha256(blob).hexdigest()
+                if got != digests[name]:
+                    raise rf.RansRefusal(
+                        "E_DIGEST_MISMATCH",
+                        f"record hashes {got[:16]}…, manifest recorded "
+                        f"{digests[name][:16]}… — bytes differ from the mint run")
             packed = rf.decode_record(blob, table)
             # deterministic re-encode cross-check
             re_rec = rf.build_record(rf.unpack_nibbles(packed), table["freq"],
@@ -153,7 +275,10 @@ def verify_shard(path, failures, max_tensors=None):
         trusted += 1
     print(f"[trust] {os.path.basename(path)}: {trusted}/{checked} verified "
           f"tensor(s) byte-exact (table_id={table['table_id']}, "
-          f"codec={'C' if rf.LIB else 'python'})")
+          f"codec={'C' if rf.LIB else 'python'}, file digest "
+          f"{'checked' if file_sha is not None else 'unavailable'}, "
+          f"record digests "
+          f"{'checked' if digests is not None else 'unavailable'})")
 
 
 def main():

@@ -29,6 +29,7 @@ the remainder by largest fractional part.
 """
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import struct
@@ -540,7 +541,10 @@ def read_tensor_bytes(path, header, data_start, name):
 def write_shard(path, tensors, metadata):
     """tensors: list of (name, dtype, shape, bytes) — written in the given
     order; metadata: {str: str}. Fully deterministic byte layout (sorted
-    metadata keys, insertion-ordered tensors, no timestamps)."""
+    metadata keys, insertion-ordered tensors, no timestamps). Returns the
+    sha256 hex of the COMPLETE file bytes, computed while streaming the
+    write (before the atomic rename) — the whole-file digest the manifest
+    records."""
     header = {"__metadata__": {k: metadata[k] for k in sorted(metadata)}}
     offset = 0
     for name, dtype, shape, raw in tensors:
@@ -548,10 +552,26 @@ def write_shard(path, tensors, metadata):
                         "data_offsets": [offset, offset + len(raw)]}
         offset += len(raw)
     hjson = json.dumps(header, separators=(",", ":"), sort_keys=False).encode()
+    h = hashlib.sha256()
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
-        f.write(struct.pack("<Q", len(hjson)))
-        f.write(hjson)
+        for chunk in (struct.pack("<Q", len(hjson)), hjson):
+            f.write(chunk)
+            h.update(chunk)
         for _, _, _, raw in tensors:
             f.write(raw)
+            h.update(raw)
     os.replace(tmp, path)
+    return h.hexdigest()
+
+
+def sha256_file(path, bufsize=1 << 20):
+    """sha256 hex of a whole file, chunked (shards can be GB-scale)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(bufsize)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()

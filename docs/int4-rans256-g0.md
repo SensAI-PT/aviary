@@ -211,6 +211,30 @@ description above to read records: parse the shard header, find the stamp
 and table in `__metadata__`, locate a tensor's record by name, and decode
 its 256 streams with the table (in any order or in parallel).
 
+## Whole-artifact verification
+
+Per-record validation (framing, stream invariants, re-encode pin) proves a
+record is *a* well-formed artifact of this format — it cannot prove it is
+*the* record a given mint run produced: a well-formed record swapped in
+from another checkpoint passes every check above. For that, the writer's
+`repack-manifest.json` (the completion marker, written last, deterministic)
+carries per shard a whole-file `sha256` (the complete `.safetensors` bytes,
+hashed while streaming the write — it subsumes the `.qs` sidecars, the
+header, and the padding, none of which per-record digests can see) plus a
+`records` map — original tensor name → sha256 of the emitted record bytes
+exactly as written — for granular diagnosis. `rans_verify.py` checks the
+file hash first, then every record against its digest, whenever the
+manifest sits next to the shards (named refusals:
+`E_SHARD_DIGEST_MISMATCH`, `E_DIGEST_MISMATCH`, `E_DIGEST_MISSING`,
+`E_MANIFEST_MALFORMED`); a manifest without digests, or no manifest, means
+no check is possible (a note, never an error), and
+`repack_rans.py --manifest-only <dir>` retro-generates digests for
+already-minted directories by hashing shards in place. This is **build
+integrity** — these exact bytes came from that mint run; container
+*identity* proper remains the stamp/registry lineage above, and the
+engine-side load check ships with the consumer PR. The record wire format
+is untouched by all of this: the manifest is a sidecar file.
+
 ## Proposed registry row
 
 | ordinal | name | weight bytes | scale layout | status |

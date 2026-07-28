@@ -40,12 +40,32 @@ Build `make rans` first for the C codec (tools/librans_c.*); without it this
 tool falls back to a pure-Python codec that emits the same bytes orders of
 magnitude slower (fine for the test fixtures, not for a real container).
 
+WHOLE-ARTIFACT DIGESTS: repack-manifest.json carries, per output shard,
+BOTH a whole-file `sha256` (the complete .safetensors bytes, hashed while
+streaming the write before the atomic rename — subsumes .qs sidecars,
+headers, and padding) AND a `records` map — original tensor name -> sha256
+of the emitted RECORD bytes (the U8 blob exactly as written) for granular
+diagnosis. The record wire format is untouched (sidecar-file fields only).
+rans_verify.py checks the file hash first, then records, when the manifest
+sits next to the shards; a manifest without digests (or no manifest) means
+"no check possible", never an error.
+`--manifest-only <dir>` regenerates the manifest for an ALREADY-minted
+output directory by hashing the existing shards in place (no re-encoding);
+it preserves every field of an existing manifest and only recomputes the
+digest maps, so retro output is byte-identical to mint output for the same
+shards. This mode lives HERE and not in rans_verify.py deliberately: the
+manifest is the writer's completion/provenance artifact, and the verifier
+stays side-effect-free — a tool you point at a stranger's download must
+never write into it.
+
 Usage:
   python3 tools/repack_rans.py --indir <int4_dir> --outdir <out> --dry-run
   python3 tools/repack_rans.py --indir <int4_dir> --outdir <out> [--layers 20,55]
+  python3 tools/repack_rans.py --manifest-only <outdir>
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -160,12 +180,114 @@ def select_targets(index, layers):
     return selected
 
 
+def write_manifest(manifest_path, manifest):
+    """Deterministic manifest write (sorted keys, no timestamps), atomic."""
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(manifest, fh, indent=1, sort_keys=True)
+    os.replace(tmp, manifest_path)
+
+
+def shard_record_digests(path):
+    """Hash every stamped record in one emitted shard: {name: sha256hex}.
+    Returns (digests, n_bytes). Read-only with respect to the shard."""
+    header, data_start = rf.read_header(path)
+    meta = header.get("__metadata__", {})
+    try:
+        fmt_map = json.loads(meta.get(rf.METADATA_KEY, "{}"))
+    except ValueError:
+        fmt_map = {}
+    digests = {}
+    for name in sorted(n for n, v in fmt_map.items()
+                       if v == rf.FORMAT_NAME and n in header):
+        blob, _ = rf.read_tensor_bytes(path, header, data_start, name)
+        digests[name] = hashlib.sha256(blob).hexdigest()
+    return digests, os.path.getsize(path)
+
+
+def manifest_only(outdir):
+    """Retro-manifest: (re)generate repack-manifest.json for an already-
+    minted output directory by hashing the existing shards in place — no
+    re-encoding. Preserves every field of an existing manifest and only
+    recomputes the per-shard digest maps, so the result is byte-identical
+    to what a fresh mint of the same shards writes."""
+    shards = sorted(glob.glob(os.path.join(outdir, "out-rans-*.safetensors")))
+    if not shards:
+        print(f"ERROR: no out-rans-*.safetensors under {outdir} — nothing to "
+              f"manifest", file=sys.stderr)
+        sys.exit(1)
+    manifest_path = os.path.join(outdir, "repack-manifest.json")
+    existing = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as fh:
+                existing = json.load(fh)
+            if not isinstance(existing, dict):
+                raise ValueError("manifest is not a JSON object")
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: existing {manifest_path} is unreadable ({exc}) — "
+                  f"remove it first if a rebuild from the shards is intended",
+                  file=sys.stderr)
+            sys.exit(1)
+    by_file = {e.get("file"): e for e in existing.get("shards", [])
+               if isinstance(e, dict)}
+
+    entries = []
+    total_records = 0
+    fmt_seen = None
+    crc_seen = None
+    for p in shards:
+        base = os.path.basename(p)
+        digests, nbytes = shard_record_digests(p)
+        if not digests:
+            print(f"ERROR: {base} carries no {rf.FORMAT_NAME} stamps — not an "
+                  f"entropy container this tool minted", file=sys.stderr)
+            sys.exit(1)
+        header, _ = rf.read_header(p)
+        meta = header.get("__metadata__", {})
+        try:
+            crc_seen = json.loads(meta[rf.TABLE_KEY]).get("table_crc32", crc_seen)
+        except (KeyError, ValueError):
+            pass
+        fmt_seen = rf.FORMAT_NAME
+        prior = by_file.get(base)
+        if prior is None or "source" not in prior:
+            # visible in output, not just by field absence: retro mode cannot
+            # reconstruct mint-time provenance
+            print(f"[manifest] warning: {base}: no prior manifest entry — "
+                  f"`source` provenance is unknowable in retro mode and is "
+                  f"omitted", file=sys.stderr)
+        entry = dict(prior or {})
+        entry.update({
+            "file": base,
+            "bytes": nbytes,
+            "weight_tensors": len(digests),
+            "sha256": rf.sha256_file(p),   # whole-file: subsumes .qs/header/pad
+            "records": digests,
+        })
+        entries.append(entry)
+        total_records += len(digests)
+        print(f"[manifest] {base}: {len(digests)} record digest(s)")
+
+    manifest = dict(existing)
+    manifest.update({
+        "format": existing.get("format", fmt_seen),
+        "table_crc32": existing.get("table_crc32", crc_seen),
+        "n_shards": len(entries),
+        "n_weight_tensors": total_records,
+        "shards": entries,
+    })
+    write_manifest(manifest_path, manifest)
+    print(f"[manifest] wrote {manifest_path}: {len(entries)} shard(s), "
+          f"{total_records} record digest(s)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--indir", required=True,
+    ap.add_argument("--indir",
                     help="directory of per-row-int4 *.safetensors shards")
-    ap.add_argument("--outdir", required=True,
+    ap.add_argument("--outdir",
                     help="destination for the entropy-coded container shards")
     ap.add_argument("--layers",
                     help="comma-separated layer subset (default: every layer)")
@@ -175,7 +297,21 @@ def main():
                     help="overwrite an outdir that already contains repack output "
                          "(default: refuse — a pre-existing partial set from an "
                          "interrupted run must never be silently papered over)")
+    ap.add_argument("--manifest-only", metavar="DIR",
+                    help="regenerate repack-manifest.json (incl. per-record "
+                         "sha256 digests) for an already-minted output "
+                         "directory, hashing shards in place — no re-encoding")
     a = ap.parse_args()
+
+    if a.manifest_only:
+        if a.indir or a.outdir:
+            print("ERROR: --manifest-only takes no --indir/--outdir",
+                  file=sys.stderr)
+            sys.exit(2)
+        manifest_only(a.manifest_only)
+        return
+    if not a.indir or not a.outdir:
+        ap.error("--indir and --outdir are required (unless --manifest-only)")
 
     layers = None
     if a.layers:
@@ -256,6 +392,7 @@ def main():
     for p in sorted(by_shard):
         tensors = []
         fmt_map = {}
+        digests = {}
         for name in by_shard[p]:
             _, header, data_start = index[name]
             raw, info = rf.read_tensor_bytes(p, header, data_start, name)
@@ -269,6 +406,8 @@ def main():
                 sys.exit(1)
             tensors.append((name, "U8", [len(record)], record))
             fmt_map[name] = rf.FORMAT_NAME
+            # whole-artifact digest: hash the record bytes already in hand
+            digests[name] = hashlib.sha256(record).hexdigest()
             total_record += len(record)
             qs = name + ".qs"
             qp, qheader, qdata_start = index[qs]
@@ -279,12 +418,14 @@ def main():
             rf.TABLE_KEY: table_json,
         }
         out_path = os.path.join(a.outdir, f"out-rans-{out_n:05d}.safetensors")
-        rf.write_shard(out_path, tensors, metadata)
+        file_sha = rf.write_shard(out_path, tensors, metadata)
         shard_manifest.append({
             "file": os.path.basename(out_path),
             "source": os.path.basename(p),
             "bytes": os.path.getsize(out_path),
             "weight_tensors": len(fmt_map),
+            "sha256": file_sha,
+            "records": digests,
         })
         print(f"[write] {out_path}: {len(tensors)} tensor(s) "
               f"({os.path.getsize(out_path) / 1e9:.4f} GB) "
@@ -300,10 +441,7 @@ def main():
         "n_weight_tensors": len(selected),
         "shards": shard_manifest,
     }
-    tmp = manifest_path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(manifest, fh, indent=1, sort_keys=True)
-    os.replace(tmp, manifest_path)
+    write_manifest(manifest_path, manifest)
 
     ratio = total_record / total_w
     print(f"[ratio] record/original: {ratio:.4f} ({(1 - ratio) * 100:.2f}% "

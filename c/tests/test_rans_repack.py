@@ -140,7 +140,13 @@ class TestRansRepack(unittest.TestCase):
         self.assertIn("RESULT: TRUST", r.stdout)
 
     def _reshard(self, shard, meta_mutator=None, tensor_mutator=None):
-        """Read a shard fully, apply mutators, rewrite it deterministically."""
+        """Read a shard fully, apply mutators, rewrite it deterministically.
+        Drops the manifest sitting next to it: the battery tests the
+        PER-RECORD layer, which must hold even when an attacker removes the
+        whole-artifact manifest (digest tampering has its own test)."""
+        manifest = shard.parent / "repack-manifest.json"
+        if manifest.exists():
+            manifest.unlink()
         header, data_start = rf.read_header(str(shard))
         meta = dict(header["__metadata__"])
         tensors = []
@@ -470,6 +476,138 @@ class TestRansRepack(unittest.TestCase):
         self.assertTrue(manifest.exists())
         fresh = self.repack(self.root / "partial_fresh")
         self.assertEqual(shards[0].read_bytes(), fresh[0].read_bytes())
+
+    def test_manifest_digests(self):
+        """Whole-artifact digest layer: mint-time digests verify green; a
+        tampered record bites as E_DIGEST_MISMATCH; retro --manifest-only
+        reproduces the mint manifest byte-for-byte; a digest-less manifest
+        (older mint) means note-and-proceed, never an error."""
+        import hashlib
+        out = self.root / "digests"
+        shard = self.repack(out)[0]
+        manifest = out / "repack-manifest.json"
+        man = json.loads(manifest.read_text())
+
+        # every weight record has a digest, and it matches the bytes on disk;
+        # the whole-file sha256 matches the complete shard bytes
+        header, data_start = rf.read_header(str(shard))
+        recs = man["shards"][0]["records"]
+        self.assertEqual(sorted(recs), sorted(self.weights))
+        for name, want in recs.items():
+            blob, _ = rf.read_tensor_bytes(str(shard), header, data_start, name)
+            self.assertEqual(hashlib.sha256(blob).hexdigest(), want, name)
+        self.assertEqual(man["shards"][0]["sha256"],
+                         hashlib.sha256(shard.read_bytes()).hexdigest())
+
+        # verify green, and it says both digest layers were actually checked
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertIn("file digest checked", r.stdout)
+        self.assertIn("record digests checked", r.stdout)
+
+        # retro equivalence: --manifest-only over the minted dir must
+        # reproduce the manifest byte-for-byte (fields preserved, digests
+        # recomputed identical)
+        mint_bytes = manifest.read_bytes()
+        r = run_tool("repack_rans.py", "--manifest-only", str(out))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertEqual(manifest.read_bytes(), mint_bytes)
+
+        # retro from scratch (manifest deleted): digests must equal the
+        # mint-time ones; provenance-only fields (source) are unknowable
+        manifest.unlink()
+        r = run_tool("repack_rans.py", "--manifest-only", str(out))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        # provenance loss is visible in output, not just by field absence
+        self.assertIn("provenance is unknowable in retro mode", r.stderr)
+        man2 = json.loads(manifest.read_text())
+        self.assertEqual(man2["shards"][0]["records"], recs)
+        self.assertEqual(man2["shards"][0]["sha256"], man["shards"][0]["sha256"])
+        self.assertEqual(man2["table_crc32"], man["table_crc32"])
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+
+        # tamper bite A: flip one payload byte of a digested record IN THE
+        # SHARD FILE (manifest untouched) -> the whole-file gate fires AND
+        # the per-record layer localizes it to the tensor
+        target = sorted(recs)[0]
+        b, e = header[target]["data_offsets"]
+        raw = bytearray(shard.read_bytes())
+        raw[data_start + b + rf.record_header_bytes() + 3] ^= 0x40
+        shard.write_bytes(bytes(raw))
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 1, msg=r.stdout)
+        self.assertIn("E_SHARD_DIGEST_MISMATCH", r.stdout)
+        self.assertIn("E_DIGEST_MISMATCH", r.stdout)
+
+        # tamper bite B — the exact gap the whole-file hash closes: flip a
+        # byte inside a .qs SIDECAR (raw passthrough; not covered by any
+        # record digest or record invariant). Only the file-level gate can
+        # see it: E_SHARD_DIGEST_MISMATCH fires, and NO record-level digest
+        # refusal appears (every record is intact)
+        raw[data_start + b + rf.record_header_bytes() + 3] ^= 0x40  # restore
+        qs_b, qs_e = header[target + ".qs"]["data_offsets"]
+        raw[data_start + qs_b + 1] ^= 0x01
+        shard.write_bytes(bytes(raw))
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 1, msg=r.stdout)
+        self.assertIn("E_SHARD_DIGEST_MISMATCH", r.stdout)
+        self.assertNotIn("E_DIGEST_MISMATCH:", r.stdout.replace(
+            "E_SHARD_DIGEST_MISMATCH:", ""))
+        raw[data_start + qs_b + 1] ^= 0x01                          # restore
+        shard.write_bytes(bytes(raw))
+
+        # backward compat: a manifest WITHOUT digest evidence (older mint)
+        # is note-and-proceed
+        for entry in man["shards"]:
+            del entry["records"]
+            del entry["sha256"]
+        manifest.write_text(json.dumps(man, indent=1, sort_keys=True))
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertIn("carries no digests", r.stdout)
+        self.assertIn("file digest unavailable", r.stdout)
+        self.assertIn("record digests unavailable", r.stdout)
+
+        # degraded mid-state: file sha present, records absent -> the file
+        # gate still runs (green here), record layer notes-and-skips
+        for entry, src in zip(man["shards"], man2["shards"]):
+            entry["sha256"] = src["sha256"]
+        manifest.write_text(json.dumps(man, indent=1, sort_keys=True))
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertIn("file digest checked", r.stdout)
+        self.assertIn("no record digests", r.stdout)
+
+        # a corrupt manifest is refused by name, not skipped
+        manifest.write_text("{not json")
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 1, msg=r.stdout)
+        self.assertIn("E_MANIFEST_MALFORMED", r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+
+        # malformed-typed digest fields must be malformation even when the
+        # malformation removes ALL digest evidence — an entry whose only
+        # digest fields are wrong-typed must never be classed as a
+        # digest-less older mint (note + TRUST)
+        for corpse in (
+            {"shards": [{"file": shard.name, "sha256": 12345}]},
+            {"shards": [{"file": shard.name, "records": ["a"]}]},
+        ):
+            manifest.write_text(json.dumps(corpse, sort_keys=True))
+            r = run_tool("rans_verify.py", str(shard))
+            self.assertEqual(r.returncode, 1, msg=f"{corpse}\n{r.stdout}")
+            self.assertIn("E_MANIFEST_MALFORMED", r.stdout, msg=str(corpse))
+            self.assertNotIn("RESULT: TRUST", r.stdout, msg=str(corpse))
+            self.assertNotIn("Traceback", r.stderr, msg=str(corpse))
+
+        # digests present but this shard missing from the set -> refusal
+        manifest.write_text(json.dumps(
+            {"shards": [{"file": "out-rans-99999.safetensors",
+                         "records": {"x": "0" * 64}}]}, sort_keys=True))
+        r = run_tool("rans_verify.py", str(shard))
+        self.assertEqual(r.returncode, 1, msg=r.stdout)
+        self.assertIn("E_DIGEST_MISSING", r.stdout)
 
     def test_quantize_freq_ties_and_termination(self):
         """Exact fractional-remainder ties must break identically everywhere
