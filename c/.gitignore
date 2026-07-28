@@ -11,3 +11,5 @@ tools/iq3.dll
 tools/librans_c.so
 tools/librans_c.dylib
 tools/rans_c.dll
+tests/fuzz_rans
+tests/*.dSYM/

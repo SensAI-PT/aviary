@@ -15,6 +15,14 @@
 #define RC_EXPORT
 #endif
 
+/* This bridge serves the int4-rans256-g0 TOOLS, so unlike the format-generic
+ * header entry points it can and does pin n_streams to the format's 256 —
+ * a zero or wrong-for-format value is refused by name before any division
+ * or decode dispatch (the header entries additionally refuse zero). */
+static int rc__nstreams_ok(uint32_t n_streams) {
+    return n_streams == RANS_NSTREAMS;
+}
+
 /* Encode n nibbles into one chunk record. Returns the record length, or the
  * negated rans_err on failure. out_cap should come from rc_record_bound. */
 RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n,
@@ -22,6 +30,7 @@ RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n,
                                    const uint16_t *slot_to_symbol,
                                    uint32_t scale_bits, uint32_t n_streams,
                                    uint8_t *out, uint64_t out_cap) {
+    if (!rc__nstreams_ok(n_streams)) return -(int64_t)RANS_E_NSTREAMS;
     rans_table t;
     rans_err e = rans_table_init(&t, scale_bits, freq, start, slot_to_symbol);
     if (e != RANS_OK) return -(int64_t)e;
@@ -33,6 +42,7 @@ RC_EXPORT int64_t rc_record_encode(const uint8_t *nibbles, uint64_t n,
 }
 
 RC_EXPORT uint64_t rc_record_bound(uint64_t n_symbols, uint32_t n_streams) {
+    if (!rc__nstreams_ok(n_streams)) return 0;   /* callers treat 0 as refusal */
     return rans_record_bound(n_symbols, n_streams);
 }
 
@@ -41,6 +51,7 @@ RC_EXPORT uint64_t rc_record_bound(uint64_t n_symbols, uint32_t n_streams) {
 RC_EXPORT int32_t rc_record_parse(const uint8_t *blob, uint64_t blob_len,
                                   uint32_t n_streams,
                                   uint64_t *n_symbols, uint64_t *packed_bytes) {
+    if (!rc__nstreams_ok(n_streams)) return (int32_t)RANS_E_NSTREAMS;
     rans_record rec;
     rans_err e = rans_record_parse(blob, blob_len, n_streams, &rec);
     if (e == RANS_OK) {
@@ -61,6 +72,7 @@ RC_EXPORT int32_t rc_record_decode(const uint8_t *blob, uint64_t blob_len,
                                    const uint16_t *slot_to_symbol,
                                    uint32_t scale_bits, int32_t path,
                                    uint8_t *out_packed) {
+    if (!rc__nstreams_ok(n_streams)) return (int32_t)RANS_E_NSTREAMS;
     rans_record rec;
     rans_err e = rans_record_parse(blob, blob_len, n_streams, &rec);
     if (e != RANS_OK) return (int32_t)e;

@@ -44,7 +44,8 @@ def run_tool(script, *args, env_extra=None):
 
 @unittest.skipIf(rf is None, "numpy not available (offline-tooling test)")
 class TestRansRepack(unittest.TestCase):
-    O, I = 8, 128           # per-row ratio I/2 = 64 (safely above the g64 signature)
+    O, I = 8, 256           # per-row ratio I/2 = 128, above every grouped
+                            # signature (32 = g64, 64 = g128/ambiguous)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -107,14 +108,31 @@ class TestRansRepack(unittest.TestCase):
                                             name + ".qs")
             self.assertEqual(qblob, qs, name + ".qs")
 
-        # determinism: an independent second run is byte-identical
+        # determinism: an independent second run is byte-identical, manifest
+        # (the completion marker) included
         out2 = self.repack(self.root / "out2")
         self.assertEqual(out1[0].read_bytes(), out2[0].read_bytes())
+        self.assertEqual(
+            (out1[0].parent / "repack-manifest.json").read_bytes(),
+            (out2[0].parent / "repack-manifest.json").read_bytes())
 
         # implementation identity: a forced pure-Python run emits the SAME
-        # bytes as the (lib-backed, when built) default run
+        # bytes as the C-bridge run. VACUOUS unless the bridge is actually
+        # loaded, so that is asserted — `make test-python` builds the bridge;
+        # a direct unittest invocation without it skips LOUDLY instead of
+        # green-lighting a pin it never checked.
+        if rf.LIB is None:
+            self.skipTest("tools/librans_c not built (run `make rans`): "
+                          "the C-vs-Python byte-identity pin was NOT checked")
         out3 = self.repack(self.root / "out3", RANS_FORCE_PYTHON="1")
         self.assertEqual(out1[0].read_bytes(), out3[0].read_bytes())
+
+        # bridge-presence: the default run must actually have used the C
+        # codec (not fallen back to Python with the lib sitting there)
+        r = run_tool("repack_rans.py", "--indir", str(self.indir),
+                     "--outdir", str(self.root / "outdry"), "--dry-run")
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertIn("codec: C (librans_c)", r.stdout)
 
         # the validator trusts it
         r = run_tool("rans_verify.py", str(out1[0]))
@@ -137,9 +155,12 @@ class TestRansRepack(unittest.TestCase):
             meta = meta_mutator(meta)
         rf.write_shard(str(shard), tensors, meta)
 
+    _corrupt_seq = 0
+
     def _corrupt_reshard_and_expect(self, expected_code, meta_mutator=None,
                                     tensor_mutator=None):
-        outdir = self.root / f"corrupt_{expected_code}"
+        TestRansRepack._corrupt_seq += 1
+        outdir = self.root / f"corrupt_{TestRansRepack._corrupt_seq}_{expected_code}"
         shard = self.repack(outdir)[0]
         self._reshard(shard, meta_mutator, tensor_mutator)
         r = run_tool("rans_verify.py", str(shard))
@@ -177,6 +198,15 @@ class TestRansRepack(unittest.TestCase):
                 blob[16 + (rf.N_STREAMS + 1) * 4] = 0x77      # header pad byte
             return blob
 
+        def bomb_header(name, blob):
+            if name == target:
+                # n_symbols = 2^40 with a consistent packed_bytes: the
+                # "oversize fields" class the spec names — must refuse as
+                # E_OVERSIZE, never an allocator traceback
+                blob[0:8] = (1 << 40).to_bytes(8, "little")
+                blob[8:16] = (1 << 39).to_bytes(8, "little")
+            return blob
+
         def drop_stamp(meta):
             del meta[rf.METADATA_KEY]
             return meta
@@ -206,6 +236,7 @@ class TestRansRepack(unittest.TestCase):
         # payload corruption trips a stream invariant or the re-encode pin;
         # both are refusals — assert on the shared prefix
         self._corrupt_reshard_and_expect("E_", tensor_mutator=flip_payload)
+        self._corrupt_reshard_and_expect("E_OVERSIZE", tensor_mutator=bomb_header)
         self._corrupt_reshard_and_expect("E_COUNT_MISMATCH",
                                          tensor_mutator=flip_count)
         self._corrupt_reshard_and_expect("E_", tensor_mutator=break_offsets)
@@ -235,6 +266,46 @@ class TestRansRepack(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("E_GEOMETRY_G64", r.stderr)
 
+        # gs=128 signature (upstream grouped-int4's actual group size):
+        # ratio exactly 64, byte-indistinguishable from per-row I=128 ->
+        # its own named refusal, never silently accepted as per-row
+        g128dir = self.root / "g128"
+        g128dir.mkdir()
+        rows128 = wb // 64
+        rf.write_shard(str(g128dir / "out-00000.safetensors"), [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", "U8", [wb],
+             bytes(wb)),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight.qs", "F32",
+             [rows128], bytes(rows128 * 4)),
+        ], {})
+        r = run_tool("repack_rans.py", "--indir", str(g128dir),
+                     "--outdir", str(self.root / "g128out"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("E_GEOMETRY_AMBIGUOUS", r.stderr)
+
+        # 2-D weight shape: per-row geometry is verified POSITIVELY from the
+        # shape fields — accepted when qs rows == O, refused by name when not
+        rng = np.random.default_rng(3)
+        O, rb2 = 8, 64
+        nib = rng.choice(np.arange(1, 16, dtype=np.uint8), size=O * rb2 * 2)
+        raw = rf.pack_nibbles(nib)
+        for rows2d, expect_ok in ((O, True), (O * 2, False)):
+            d2 = self.root / f"twod_{rows2d}"
+            d2.mkdir()
+            rf.write_shard(str(d2 / "out-00000.safetensors"), [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", "U8",
+                 [O, rb2], raw),
+                ("model.layers.0.mlp.experts.0.gate_proj.weight.qs", "F32",
+                 [rows2d], bytes(rows2d * 4)),
+            ], {})
+            r = run_tool("repack_rans.py", "--indir", str(d2),
+                         "--outdir", str(self.root / f"twod_out_{rows2d}"))
+            if expect_ok:
+                self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+            else:
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("E_GEOMETRY_NOT_PER_ROW", r.stderr)
+
         # missing .qs sidecar -> named refusal
         nsdir = self.root / "noscales"
         nsdir.mkdir()
@@ -257,6 +328,162 @@ class TestRansRepack(unittest.TestCase):
                      "--outdir", str(self.root / "emptyout"))
         self.assertEqual(r.returncode, 1)
         self.assertIn("refusing to emit an empty container", r.stderr)
+
+    def test_parity_c_python_refusal_classes(self):
+        """Same bytes into the C parser (via the bridge) and the Python
+        parser must produce the same named class — parity is a tested
+        property, not a documented intention. Covers the u64-wrap and
+        decompression-bomb header battery."""
+        if rf.LIB is None:
+            self.skipTest("tools/librans_c not built (run `make rans`): "
+                          "C/Python refusal parity was NOT checked")
+        import ctypes
+
+        def c_parse(blob):
+            buf = np.zeros(len(blob) + rf.SLACK, dtype=np.uint8)
+            buf[:len(blob)] = np.frombuffer(blob, dtype=np.uint8)
+            ns = ctypes.c_uint64()
+            pb = ctypes.c_uint64()
+            rc = rf.LIB.rc_record_parse(rf._p8(buf), len(blob), rf.N_STREAMS,
+                                        ctypes.byref(ns), ctypes.byref(pb))
+            return "OK" if rc == 0 else rf.LIB.rc_err_name(rc).decode()
+
+        def py_parse(blob):
+            try:
+                rf.parse_record(blob)
+                return "OK"
+            except rf.RansRefusal as exc:
+                return exc.code
+
+        rng = np.random.default_rng(11)
+        n = 4096
+        nib = rng.choice(np.arange(1, 16, dtype=np.uint8), size=n)
+        hist = np.bincount(nib, minlength=16)
+        freq = rf.quantize_freq(hist)
+        start, slot = rf.build_table(freq)
+        base = bytearray(rf.build_record(nib, freq, start, slot))
+        u64max = (1 << 64) - 1
+
+        def hdr(ns, pb):
+            b = bytearray(base)
+            b[0:8] = ns.to_bytes(8, "little")
+            b[8:16] = pb.to_bytes(8, "little")
+            return bytes(b)
+
+        cases = [bytes(base)]                          # the valid control
+        for ns, pb in ((u64max, 0), (u64max, 1 << 63), (0, 0),
+                       (1 << 40, 1 << 39), (1 << 32, 1 << 31),
+                       (n + 1, (n + 1) // 2), (n, n)):
+            cases.append(hdr(ns, pb))
+        cases.append(bytes(base[:64]))                 # truncated header
+        cases.append(bytes(base[:len(base) - 16]))     # truncated payload
+        cases.append(bytes(base) + b"\x00" * 16)       # trailing pad-shaped
+        cases.append(bytes(base) + b"\x77" * 16)       # trailing garbage
+        mono = bytearray(base)
+        mono[16 + 8 * 4] ^= 0x80                       # offsets landmine
+        cases.append(bytes(mono))
+        dirty = bytearray(base)
+        dirty[16 + (rf.N_STREAMS + 1) * 4] = 0x55      # header pad byte
+        cases.append(bytes(dirty))
+
+        for i, blob in enumerate(cases):
+            c_cls, py_cls = c_parse(blob), py_parse(blob)
+            self.assertEqual(c_cls, py_cls,
+                             msg=f"case {i}: C={c_cls} Python={py_cls}")
+        self.assertEqual(c_parse(cases[0]), "OK")      # control really is OK
+
+    def test_verifier_never_crashes(self):
+        """Hostile safetensors headers (the review round's traceback
+        classes): zero tracebacks, nonzero exit, a named REFUSE line each."""
+        name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ok_entry = {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}
+        stamp = json.dumps({name: rf.FORMAT_NAME})
+        cases = {
+            "meta_not_string": {"__metadata__": {rf.METADATA_KEY: 5},
+                                name: dict(ok_entry)},
+            "header_array": [1, 2, 3],
+            "no_data_offsets": {"__metadata__": {rf.METADATA_KEY: stamp,
+                                                 rf.TABLE_KEY: "{}"},
+                                name: {"dtype": "U8", "shape": [4]}},
+            "entry_not_dict": {"__metadata__": {rf.METADATA_KEY: stamp,
+                                                rf.TABLE_KEY: "{}"},
+                               name: "hello"},
+            "fmt_value_list": {"__metadata__":
+                               {rf.METADATA_KEY: json.dumps({name: ["a"]})},
+                               name: dict(ok_entry)},
+            "reversed_offsets": {"__metadata__": {rf.METADATA_KEY: stamp,
+                                                  rf.TABLE_KEY: "{}"},
+                                 name: {"dtype": "U8", "shape": [4],
+                                        "data_offsets": [8, 2]}},
+            "offsets_past_eof": {"__metadata__": {rf.METADATA_KEY: stamp,
+                                                  rf.TABLE_KEY: "{}"},
+                                 name: {"dtype": "U8", "shape": [4],
+                                        "data_offsets": [0, 4096]}},
+            "offsets_not_pair": {"__metadata__": {rf.METADATA_KEY: stamp,
+                                                  rf.TABLE_KEY: "{}"},
+                                 name: {"dtype": "U8", "shape": [4],
+                                        "data_offsets": [1, 2, 3]}},
+        }
+        hostile = self.root / "hostile"
+        hostile.mkdir()
+        for label, hdr in cases.items():
+            p = hostile / f"h_{label}.safetensors"
+            hj = json.dumps(hdr, separators=(",", ":")).encode()
+            with open(p, "wb") as f:
+                f.write(len(hj).to_bytes(8, "little"))
+                f.write(hj)
+                f.write(b"\x00" * 32)
+            r = run_tool("rans_verify.py", str(p))
+            self.assertNotIn("Traceback", r.stderr,
+                             msg=f"{label}: crashed\n{r.stderr}")
+            self.assertEqual(r.returncode, 1, msg=f"{label}: {r.stdout}")
+            self.assertIn("REFUSE", r.stdout, msg=f"{label}: no REFUSE line")
+
+    def test_partial_output_refusal(self):
+        """An outdir already holding repack output is refused (crash
+        evidence: an interrupted set must not be papered over); --force
+        redoes it; a completed run leaves repack-manifest.json."""
+        out = self.root / "partial"
+        shards = self.repack(out)
+        manifest = out / "repack-manifest.json"
+        self.assertTrue(manifest.exists())
+        man = json.loads(manifest.read_text())
+        self.assertEqual(man["n_shards"], len(shards))
+
+        # rerun over completed output: refused
+        r = run_tool("repack_rans.py", "--indir", str(self.indir),
+                     "--outdir", str(out))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("refusing to overwrite", r.stderr)
+
+        # simulate a crashed run: shards present, no completion manifest
+        manifest.unlink()
+        r = run_tool("repack_rans.py", "--indir", str(self.indir),
+                     "--outdir", str(out))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NO manifest", r.stderr)
+
+        # --force redoes from scratch, byte-identical to a fresh run
+        r = run_tool("repack_rans.py", "--indir", str(self.indir),
+                     "--outdir", str(out), "--force")
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        self.assertTrue(manifest.exists())
+        fresh = self.repack(self.root / "partial_fresh")
+        self.assertEqual(shards[0].read_bytes(), fresh[0].read_bytes())
+
+    def test_quantize_freq_ties_and_termination(self):
+        """Exact fractional-remainder ties must break identically everywhere
+        (stable argsort -> lowest symbol index wins), and an impossible table
+        size must raise instead of looping forever."""
+        hist = np.zeros(16, dtype=np.int64)
+        hist[1] = hist[2] = hist[3] = 1        # remainders tie exactly at 1/3
+        freq = rf.quantize_freq(hist)
+        self.assertEqual(freq.tolist(),
+                         [0, 5462, 5461, 5461, 0, 0, 0, 0,
+                          0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(int(freq.sum()), rf.M)
+        with self.assertRaises(ValueError):
+            rf.quantize_freq(np.ones(16, dtype=np.int64), m=8)
 
 
 if __name__ == "__main__":

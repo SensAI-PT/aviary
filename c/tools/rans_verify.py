@@ -4,6 +4,15 @@ boundary. Accepts a spec-conformant shard; produces a NAMED refusal for every
 corruption class; never crashes, never silently accepts.
 
 WHAT IS CHECKED, per shard:
+  container layer:
+    E_SHARD_MALFORMED      unreadable/absurd header; header not a JSON
+                           object; tensor entries not objects; dtype/shape
+                           missing; data_offsets absent, non-[b,e],
+                           reversed, or past the end of the file;
+                           __metadata__ not a str->str object
+    E_INTERNAL             anything unexpected — a catch-all that converts
+                           any surprise into a named refusal so "never
+                           crashes" is a property, not a hope
   stamp layer (the stamp is MANDATORY for this format — entropy-coded sizes
   are data-dependent, so the stamp is the ONLY signal a U8 tensor is
   entropy-coded at all):
@@ -22,9 +31,11 @@ WHAT IS CHECKED, per shard:
     E_TABLE_START          start[] not the prefix sum of freq[]
     E_TABLE_SLOT           slot_to_symbol inconsistent with freq[]/start[]
     E_TABLE_CRC            slot-table bytes do not match the stamped crc32
-  record layer (per stamped tensor; same names as c/rans.h's rans_err):
-    E_TRUNCATED E_EMPTY E_COUNT_MISMATCH E_OFFSET_FIRST E_OFFSETS_MONOTONIC
-    E_STREAM_SHORT E_LENGTH_MISMATCH E_PAD_NONZERO
+  record layer (per stamped tensor; same names as c/rans.h's rans_err, and
+  the same-bytes/same-class parity with the C parser is a tested property):
+    E_TRUNCATED E_EMPTY E_COUNT_MISMATCH E_OVERSIZE E_OFFSET_FIRST
+    E_OFFSETS_MONOTONIC E_STREAM_SHORT E_LENGTH_MISMATCH E_PAD_NONZERO
+    E_NOMEM (a record too large for this machine refuses by name)
   payload layer (per stream; a genuine encoder output ALWAYS satisfies
   these, so corruption is refused without any ground-truth bytes):
     E_STREAM_STATE_RANGE   initial state outside the encoder's invariant
@@ -61,6 +72,8 @@ def refuse(failures, shard, tensor, code, detail):
 
 
 def verify_shard(path, failures, max_tensors=None):
+    """One shard. Wrapped by main()'s catch-all so no input can escape as a
+    traceback; rf.read_header pins the whole header shape by name first."""
     try:
         header, data_start = rf.read_header(path)
     except rf.RansRefusal as exc:
@@ -111,37 +124,31 @@ def verify_shard(path, failures, max_tensors=None):
                   f"--max-tensors {max_tensors} of {len(ours)} stamped tensors")
             break
         checked += 1
-        if name not in header:
-            refuse(failures, path, name, "E_STAMP_DANGLING",
-                   "stamped but not present in this shard")
-            continue
-        info = header[name]
-        if info["dtype"] != "U8":
-            refuse(failures, path, name, "E_STAMP_DTYPE",
-                   f"dtype {info['dtype']} != U8")
-            continue
         try:
+            if name not in header:
+                raise rf.RansRefusal("E_STAMP_DANGLING",
+                                     "stamped but not present in this shard")
+            info = header[name]
+            if info["dtype"] != "U8":
+                raise rf.RansRefusal("E_STAMP_DTYPE",
+                                     f"dtype {info['dtype']} != U8")
             blob, _ = rf.read_tensor_bytes(path, header, data_start, name)
-        except rf.RansRefusal as exc:
-            refuse(failures, path, name, exc.code, exc.detail)
-            continue
-        try:
             packed = rf.decode_record(blob, table)
-        except rf.RansRefusal as exc:
-            refuse(failures, path, name, exc.code, exc.detail)
-            continue
-        # deterministic re-encode cross-check
-        try:
+            # deterministic re-encode cross-check
             re_rec = rf.build_record(rf.unpack_nibbles(packed), table["freq"],
                                      table["start"], table["slot_to_symbol"],
                                      table["scale_bits"])
+            if re_rec != blob:
+                raise rf.RansRefusal("E_REENCODE_MISMATCH",
+                                     "re-encoding the decoded stream does not "
+                                     "reproduce the record — content corruption")
         except rf.RansRefusal as exc:
             refuse(failures, path, name, exc.code, exc.detail)
             continue
-        if re_rec != blob:
-            refuse(failures, path, name, "E_REENCODE_MISMATCH",
-                   "re-encoding the decoded stream does not reproduce the "
-                   "record — content corruption")
+        except Exception as exc:                      # noqa: BLE001 — the point
+            # anything unexpected becomes a named refusal: "never crashes"
+            # is enforced here, not promised
+            refuse(failures, path, name, "E_INTERNAL", repr(exc))
             continue
         trusted += 1
     print(f"[trust] {os.path.basename(path)}: {trusted}/{checked} verified "
@@ -162,7 +169,10 @@ def main():
         if not os.path.exists(p):
             refuse(failures, p, None, "E_SHARD_MALFORMED", "no such file")
             continue
-        verify_shard(p, failures, a.max_tensors)
+        try:
+            verify_shard(p, failures, a.max_tensors)
+        except Exception as exc:                      # noqa: BLE001 — the point
+            refuse(failures, p, None, "E_INTERNAL", repr(exc))
     if failures:
         print(f"RESULT: REFUSE ({len(failures)} refusal(s))")
         sys.exit(1)

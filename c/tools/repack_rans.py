@@ -59,10 +59,20 @@ import rans_format as rf  # noqa: E402
 EXPERT_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
 
-# Per-row geometry guard (see module docstring). MIN_ROW_RATIO = I/2 for the
-# smallest hidden dim this tool accepts; the load-bearing exclusion is 32,
-# the exact ratio EVERY per-group-64 container measures regardless of shape.
+# Per-row geometry guard (see module docstring). When the weight tensor
+# carries a 2-D [O, rb] shape, per-row geometry is verified POSITIVELY
+# (qs elements == O). Flattened 1-D containers (what convert_fp8_to_int4.py
+# emits) can only be judged by the weight-bytes/scale-rows ratio:
+#   per-row      -> ratio == I/2 (3072 / 1024 for real GLM projections)
+#   per-group-64 -> ratio == exactly 32, ALWAYS, regardless of shape
+#   per-group-128 (upstream fmt=4's actual gs) -> ratio == exactly 64
+# so 32 refuses as g64, 64 refuses as AMBIGUOUS (indistinguishable from a
+# per-row I=128 tensor by bytes alone), and anything below MIN_ROW_RATIO
+# refuses as not-per-row. Collateral: 1-D per-row tensors with I <= 128 are
+# refused — loud, by name, and vacuous for every real container this repo
+# targets.
 G64_RATIO = 32
+G128_RATIO = 64
 MIN_ROW_RATIO = 64
 
 
@@ -110,6 +120,18 @@ def select_targets(index, layers):
             raise rf.RansRefusal("E_GEOMETRY_NOT_PER_ROW",
                                  f"{name}: {qs} is {sb} bytes (not F32-shaped)")
         rows = sb // 4
+        wshape = info["shape"]
+        if len(wshape) == 2:
+            # positive per-row verification: [O, rb] weight demands exactly
+            # one scale per row — no ratio heuristics involved
+            if rows != wshape[0]:
+                raise rf.RansRefusal(
+                    "E_GEOMETRY_NOT_PER_ROW",
+                    f"{name}: weight shape {wshape} has {wshape[0]} rows but "
+                    f"{qs} carries {rows} scales — not per-row geometry")
+            selected.append(name)
+            continue
+        # flattened 1-D container: byte-ratio judgement (docstring above)
         if wb % rows:
             raise rf.RansRefusal(
                 "E_GEOMETRY_NOT_PER_ROW",
@@ -121,6 +143,14 @@ def select_targets(index, layers):
                 f"{name}: weight/scale ratio {ratio} is the per-group-64 "
                 f"signature — g64 containers are out of this format's v1 scope "
                 f"(materially weaker entropy payoff; needs its own round)")
+        if ratio == G128_RATIO:
+            raise rf.RansRefusal(
+                "E_GEOMETRY_AMBIGUOUS",
+                f"{name}: weight/scale ratio {ratio} is exactly the "
+                f"per-group-128 signature (upstream grouped-int4's gs) and "
+                f"indistinguishable by bytes from a per-row I=128 tensor — "
+                f"refusing rather than stamping per-row geometry it cannot "
+                f"prove")
         if ratio < MIN_ROW_RATIO:
             raise rf.RansRefusal(
                 "E_GEOMETRY_NOT_PER_ROW",
@@ -141,6 +171,10 @@ def main():
                     help="comma-separated layer subset (default: every layer)")
     ap.add_argument("--dry-run", action="store_true",
                     help="inventory only: scan headers, print selection, write nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an outdir that already contains repack output "
+                         "(default: refuse — a pre-existing partial set from an "
+                         "interrupted run must never be silently papered over)")
     a = ap.parse_args()
 
     layers = None
@@ -195,9 +229,29 @@ def main():
     print(f"[table] pooled histogram {hist.tolist()}")
     print(f"[table] freq {freq.tolist()} (M={rf.M}, scale_bits={rf.SCALE_BITS})")
 
-    # pass 2: encode + verify + write, one output shard per input shard
+    # pass 2: encode + verify + write, one output shard per input shard.
+    # CRASH EVIDENCE: refuse a non-empty output directory (a crashed earlier
+    # run leaves individually-valid shards with no marker that the SET is
+    # incomplete — rerunning over them silently would hide that), and write
+    # repack-manifest.json only after every shard landed, so "manifest
+    # present and matching" == "the set is complete".
     os.makedirs(a.outdir, exist_ok=True)
+    manifest_path = os.path.join(a.outdir, "repack-manifest.json")
+    pre_existing = sorted(glob.glob(os.path.join(a.outdir, "out-rans-*.safetensors")))
+    if (pre_existing or os.path.exists(manifest_path)) and not a.force:
+        print(f"ERROR: {a.outdir} already contains repack output "
+              f"({len(pre_existing)} shard(s)"
+              f"{', manifest present' if os.path.exists(manifest_path) else ', NO manifest — likely an interrupted run'}) "
+              f"— refusing to overwrite; pass --force to redo from scratch",
+              file=sys.stderr)
+        sys.exit(1)
+    if a.force:
+        for p in pre_existing:
+            os.remove(p)
+        if os.path.exists(manifest_path):
+            os.remove(manifest_path)
     out_n = 0
+    shard_manifest = []
     total_record = 0
     for p in sorted(by_shard):
         tensors = []
@@ -226,16 +280,37 @@ def main():
         }
         out_path = os.path.join(a.outdir, f"out-rans-{out_n:05d}.safetensors")
         rf.write_shard(out_path, tensors, metadata)
+        shard_manifest.append({
+            "file": os.path.basename(out_path),
+            "source": os.path.basename(p),
+            "bytes": os.path.getsize(out_path),
+            "weight_tensors": len(fmt_map),
+        })
         print(f"[write] {out_path}: {len(tensors)} tensor(s) "
               f"({os.path.getsize(out_path) / 1e9:.4f} GB) "
               f"from {os.path.basename(p)}")
         out_n += 1
 
+    # completion marker, written LAST and deterministically (no timestamps):
+    # its absence over a shard set means the producing run did not finish
+    manifest = {
+        "format": rf.FORMAT_NAME,
+        "table_crc32": json.loads(table_json)["table_crc32"],
+        "n_shards": out_n,
+        "n_weight_tensors": len(selected),
+        "shards": shard_manifest,
+    }
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(manifest, fh, indent=1, sort_keys=True)
+    os.replace(tmp, manifest_path)
+
     ratio = total_record / total_w
     print(f"[ratio] record/original: {ratio:.4f} ({(1 - ratio) * 100:.2f}% "
           f"reduction incl. framing), {total_w / 1e6:.1f} MB -> "
           f"{total_record / 1e6:.1f} MB")
-    print(f"[done] {out_n} shard(s), every record round-trip-verified byte-exact")
+    print(f"[done] {out_n} shard(s) + repack-manifest.json, every record "
+          f"round-trip-verified byte-exact")
 
 
 if __name__ == "__main__":

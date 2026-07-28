@@ -38,7 +38,12 @@ second codec path in v1).
 
 ### Chunk record (one record = one weight tensor's bytes)
 
-All integers little-endian. `N` = 256 streams.
+All integers little-endian — explicitly including the `n_symbols` and
+`packed_bytes` u64 fields and every `stream_offsets` u32 (the same
+byte order the base64 `slot_to_symbol` field spells out). `N` = 256
+streams. The reference C implementation reads/writes these with
+native-order accesses and therefore refuses to compile on a big-endian
+host rather than emit byte-swapped records.
 
 ```
 offset 0:  n_symbols     u64   -- nibble count for this tensor
@@ -60,7 +65,24 @@ derived value. Validators refuse nonzero padding bytes. Alignment is
 **record-relative**, not file-absolute: safetensors does not 16-align
 tensor offsets, so a consumer that wants aligned u32/u64 access must read or
 map the tensor's bytes into an aligned allocation (any `malloc`/GPU-buffer
-allocation qualifies).
+allocation qualifies; the reference parser refuses a buffer that is not at
+least 4-byte aligned rather than perform unaligned accesses).
+
+Validity rules every conformant record satisfies (and validators enforce):
+
+- `packed_bytes == ceil(n_symbols / 2)`, computed in a non-wrapping form
+  (`n/2 + (n & 1)`) so `n_symbols = 2^64 - 1` cannot forge a match;
+- `stream_offsets[0] == 0`, offsets non-decreasing, and **every stream is at
+  least 4 bytes** — even a stream that encodes zero symbols carries its
+  4 flushed state bytes;
+- the record's total length equals the derived framing exactly (no trailing
+  bytes), and every derived padding byte is zero;
+- **amplification bound**: no admissible table can encode more than
+  `payload_len * 8 * M_max` symbols into a payload (`M_max = 2^15`, the
+  format's largest table size — a symbol's cost is bounded below by
+  `log2(M / (M-1))` bits). A header claiming more `n_symbols` than that is
+  a decompression bomb and must be refused *before* anything sizes buffers
+  from it.
 
 ### Interleaving
 
@@ -80,7 +102,18 @@ design): 32-bit state, byte renormalization, `L = 2^23`,
 `scale_bits = 14` (`M = 16384`).
 
 - encode walks the input backwards, writes bytes backwards, flushes the
-  final 4-byte state; decode reads forward:
+  final 4-byte state. Per symbol `s` (this is the complete recipe a
+  bit-identical third-party **writer** needs): with the state
+  `x` (initialized to `L`), first renormalize by emitting low bytes —
+  `x_max = ((L >> scale_bits) << 8) * freq[s]`;
+  `while (x >= x_max) { emit byte x & 0xFF; x >>= 8; }` — then update
+  `x = ((x / freq[s]) << scale_bits) + (x % freq[s]) + start[s]`
+  (integer division). After the last (i.e. first-in-stream-order) symbol,
+  emit the remaining 32-bit state as 4 bytes, low byte last. The emitted
+  byte sequence, reversed into forward order, is the stream. Worst case a
+  `freq = 1` symbol emits `scale_bits` bits, so a stream of `n` symbols
+  never exceeds `ceil(n * scale_bits / 8) + 4` bytes;
+- decode reads forward:
   `x = 4 bytes big-endian`, then per symbol:
   `slot = x & (M-1)`; `s = slot_to_symbol[slot]`;
   `x = freq[s]*(x >> scale_bits) + slot - start[s]`;

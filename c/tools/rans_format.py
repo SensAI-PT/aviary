@@ -64,10 +64,25 @@ class RansRefusal(Exception):
 def quantize_freq(hist, m=M):
     """hist: length-16 array of raw counts. Returns freq[16] uint32 summing to
     m; largest-remainder quantization; min 1 count for any nonzero-count
-    symbol (so it stays encodable); absent symbols get exactly 0."""
+    symbol (so it stays encodable); absent symbols get exactly 0.
+
+    Determinism: both argsorts use kind="stable" so exact fractional-remainder
+    (or frequency) ties break by symbol index identically on every host and
+    numpy version — contract 4's cross-host byte-identity depends on it.
+
+    Termination: requires m >= the number of present symbols (raises
+    ValueError otherwise — the min-1 constraint would be unsatisfiable).
+    Given that, the deficit<0 loop provably terminates: while deficit < 0,
+    sum(freq) = m - deficit > m >= n_present, so some entry exceeds 1 and
+    every full pass over `order` decrements at least one entry."""
     hist = np.asarray(hist, dtype=np.float64)
     total = hist.sum()
     assert total > 0
+    n_present = int(np.count_nonzero(hist))
+    if m < n_present:
+        raise ValueError(
+            f"quantize_freq: m={m} < {n_present} present symbols — every "
+            f"present symbol needs freq >= 1, so this table size is impossible")
     raw = hist / total * m
     freq = np.floor(raw).astype(np.int64)
     nonzero = hist > 0
@@ -76,7 +91,7 @@ def quantize_freq(hist, m=M):
     if deficit > 0:
         remainder = raw - np.floor(raw)
         remainder[~nonzero] = -1     # never give slots to symbols absent from data
-        order = np.argsort(-remainder)
+        order = np.argsort(-remainder, kind="stable")
         i = 0
         while deficit > 0 and i < len(order):
             idx = order[i]
@@ -85,7 +100,7 @@ def quantize_freq(hist, m=M):
                 deficit -= 1
             i += 1
     elif deficit < 0:
-        order = np.argsort(-freq)
+        order = np.argsort(-freq, kind="stable")
         i = 0
         while deficit < 0:
             idx = order[i % len(order)]
@@ -317,8 +332,18 @@ def build_record(nibbles, freq, start, slot_to_symbol, scale_bits=SCALE_BITS,
     """nibbles -> one chunk-record bytes object. Deterministic."""
     nib = np.ascontiguousarray(nibbles, dtype=np.uint8)
     n = nib.size
+    if n_streams != N_STREAMS:
+        raise RansRefusal("E_NSTREAMS",
+                          f"n_streams={n_streams} (this format fixes {N_STREAMS})")
     if n == 0:
         raise RansRefusal("E_EMPTY", "refusing to encode an empty tensor")
+    # pre-scan parity with c/rans.h: refuse uncodable input by name before
+    # any encoding work (values > 15, or symbols the table gives freq 0)
+    freq_a = np.asarray(freq, dtype=np.uint32)
+    if int(nib.max(initial=0)) > 15 or (freq_a[nib] == 0).any():
+        raise RansRefusal("E_SYMBOL_UNCODABLE",
+                          "input contains a value > 15 or a symbol whose "
+                          "table frequency is zero")
     if LIB is not None:
         cap = int(LIB.rc_record_bound(n, n_streams)) + SLACK
         out = np.zeros(cap, dtype=np.uint8)
@@ -345,13 +370,19 @@ def build_record(nibbles, freq, start, slot_to_symbol, scale_bits=SCALE_BITS,
 
 def parse_record(blob, n_streams=N_STREAMS):
     """Validate framing; returns dict(n_symbols, packed_bytes, offsets,
-    payload). Raises RansRefusal with the same named classes as c/rans.h."""
+    payload). Raises RansRefusal with the same named classes as c/rans.h —
+    that parity is a TESTED property (the e2e suite feeds identical bytes to
+    both implementations and asserts identical classes)."""
+    if n_streams == 0:
+        raise RansRefusal("E_NSTREAMS", "n_streams == 0")
     head = record_header_bytes(n_streams)
     if len(blob) < head:
         raise RansRefusal("E_TRUNCATED", f"{len(blob)} bytes < {head}-byte header")
     n_symbols, packed_bytes = struct.unpack_from("<QQ", blob, 0)
     if n_symbols == 0:
         raise RansRefusal("E_EMPTY", "n_symbols == 0")
+    # Python ints do not wrap, so ceil(n/2) here already agrees with the C
+    # side's non-wrapping n/2 + (n&1) for every uint64 value incl. UINT64_MAX
     if packed_bytes != (n_symbols + 1) // 2:
         raise RansRefusal("E_COUNT_MISMATCH",
                           f"packed_bytes={packed_bytes} != ceil({n_symbols}/2)")
@@ -372,6 +403,14 @@ def parse_record(blob, n_streams=N_STREAMS):
         raise RansRefusal("E_LENGTH_MISMATCH",
                           f"blob is {len(blob)} bytes, framing derives "
                           f"{head + _round16(payload_len)}")
+    # amplification bound, identical to c/rans.h: no table this format admits
+    # can encode more than payload_len*8*M_max symbols into this payload —
+    # refuse the decompression bomb before anything sizes buffers from
+    # n_symbols
+    if n_symbols > payload_len * 8 * (1 << 15):
+        raise RansRefusal("E_OVERSIZE",
+                          f"n_symbols={n_symbols} impossibly large for a "
+                          f"{payload_len}-byte payload")
     raw_head_end = 16 + (n_streams + 1) * 4
     if any(blob[raw_head_end:head]) or any(blob[head + payload_len:]):
         raise RansRefusal("E_PAD_NONZERO", "derived padding bytes are not zero")
@@ -390,10 +429,18 @@ def decode_record(blob, table, n_streams=N_STREAMS, checked=True):
     slot = np.ascontiguousarray(table["slot_to_symbol"], dtype=np.uint16)
     sb = table["scale_bits"]
     n = rec["n_symbols"]
+    # parse_record bounded n_symbols against the payload (E_OVERSIZE); a
+    # record that legitimately passes can still be too big for THIS machine —
+    # that is a named refusal, never an allocator traceback
+    try:
+        nib = np.empty(n, dtype=np.uint8)
+        out = np.empty(rec["packed_bytes"], dtype=np.uint8)
+    except MemoryError:
+        raise RansRefusal("E_NOMEM",
+                          f"cannot allocate buffers for n_symbols={n}")
     if LIB is not None and not checked:
         buf = np.zeros(len(blob) + SLACK, dtype=np.uint8)   # SLACK contract
         buf[:len(blob)] = np.frombuffer(blob, dtype=np.uint8)
-        out = np.empty(rec["packed_bytes"], dtype=np.uint8)
         rc = LIB.rc_record_decode(_p8(buf), len(blob), n_streams, _p32(freq),
                                   _p32(start), _p16(slot), sb, -1, _p8(out))
         if rc != 0:
@@ -402,7 +449,6 @@ def decode_record(blob, table, n_streams=N_STREAMS, checked=True):
     # checked per-stream decode (verification path), C-accelerated per stream
     payload = rec["payload"]
     offsets = rec["offsets"]
-    nib = np.empty(n, dtype=np.uint8)
     for i in range(n_streams):
         sub = payload[int(offsets[i]):int(offsets[i + 1])]
         n_i = len(range(i, n, n_streams))
@@ -431,23 +477,58 @@ def decode_record(blob, table, n_streams=N_STREAMS, checked=True):
 # external safetensors dependency, same spirit as doctor.py's own parser
 # ---------------------------------------------------------------------------
 def read_header(path):
+    """Parse AND validate a shard header. An untrusted container reaches the
+    tools through this function, so the whole header shape is pinned here —
+    every malformation is a named E_SHARD_MALFORMED refusal, never a
+    downstream KeyError/TypeError traceback: the header must be a JSON
+    object; every tensor entry an object with a string dtype, a list shape,
+    and data_offsets = [b, e] with 0 <= b <= e <= data size; __metadata__
+    (when present) a string-to-string object."""
+    fsize = os.path.getsize(path)
     with open(path, "rb") as f:
         raw = f.read(8)
         if len(raw) != 8:
             raise RansRefusal("E_SHARD_MALFORMED", f"{path}: no header length")
         hlen = struct.unpack("<Q", raw)[0]
-        if hlen > 512 * 1024 * 1024:
+        if hlen > 512 * 1024 * 1024 or 8 + hlen > fsize:
             raise RansRefusal("E_SHARD_MALFORMED", f"{path}: absurd header ({hlen} B)")
         try:
             header = json.loads(f.read(hlen))
         except ValueError as exc:
             raise RansRefusal("E_SHARD_MALFORMED", f"{path}: header not JSON: {exc}")
-    return header, 8 + hlen
+    if not isinstance(header, dict):
+        raise RansRefusal("E_SHARD_MALFORMED",
+                          f"{path}: header is {type(header).__name__}, not an object")
+    data_start = 8 + hlen
+    data_size = fsize - data_start
+    for name, info in header.items():
+        if name == "__metadata__":
+            if not isinstance(info, dict) or \
+                    not all(isinstance(k, str) and isinstance(v, str)
+                            for k, v in info.items()):
+                raise RansRefusal("E_SHARD_MALFORMED",
+                                  f"{path}: __metadata__ is not a str->str object")
+            continue
+        if not isinstance(info, dict):
+            raise RansRefusal("E_SHARD_MALFORMED",
+                              f"{path}:{name}: tensor entry is not an object")
+        if not isinstance(info.get("dtype"), str) or \
+                not isinstance(info.get("shape"), list):
+            raise RansRefusal("E_SHARD_MALFORMED",
+                              f"{path}:{name}: missing/malformed dtype or shape")
+        off = info.get("data_offsets")
+        if (not isinstance(off, list) or len(off) != 2 or
+                not all(isinstance(x, int) and not isinstance(x, bool) for x in off) or
+                not (0 <= off[0] <= off[1] <= data_size)):
+            raise RansRefusal("E_SHARD_MALFORMED",
+                              f"{path}:{name}: data_offsets {off!r} invalid for "
+                              f"{data_size} data bytes")
+    return header, data_start
 
 
 def read_tensor_bytes(path, header, data_start, name):
     info = header[name]
-    b, e = info["data_offsets"]
+    b, e = info["data_offsets"]          # validated by read_header
     with open(path, "rb") as f:
         f.seek(data_start + b)
         raw = f.read(e - b)

@@ -72,6 +72,15 @@
 #include <string.h>
 #include <stdint.h>
 
+/* ENDIANNESS PRECONDITION: record header integers (n_symbols, packed_bytes,
+ * stream_offsets) are little-endian on the wire, and this implementation
+ * reads/writes them with native-order memcpy — correct only on little-endian
+ * hosts. Refuse to compile elsewhere rather than emit byte-swapped records
+ * that silently break the cross-host byte-identity contract. */
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
+#error "rans.h assumes a little-endian host (record integers are little-endian)"
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #include <immintrin.h>
 #endif
@@ -83,6 +92,7 @@
 #define RANS_ALPHABET 16
 #define RANS_NSTREAMS 256          /* int4-rans256-g0's stream count */
 #define RANS_SLACK    64           /* readable bytes required past record buffers */
+#define RANS_SCALE_BITS_MAX 15     /* rans_table_init's upper bound on scale_bits */
 
 /* ---- scalar stream codec (ported unmodified from the proven prototype) --- */
 
@@ -98,7 +108,11 @@ static size_t rans_encode_stream(const uint8_t *nibbles, size_t n,
     uint32_t x = RANS_L;
     uint8_t *ptr = out_buf + out_cap;              /* write backwards from the end */
     for (size_t i = n; i-- > 0; ) {
-        uint32_t s = nibbles[i];
+        /* mask to the nibble alphabet: an out-of-range input byte must never
+         * index past freq[16]/start[16] (record-level entry points refuse
+         * such input by name BEFORE encoding; the mask makes this primitive
+         * memory-safe for any bytes regardless) */
+        uint32_t s = nibbles[i] & 15u;
         uint32_t f = freq[s];
         uint32_t st = start[s];
         /* renormalize: keep x below x_max so the update keeps x in [L, L*256) */
@@ -163,11 +177,14 @@ typedef enum {
     RANS_E_TRUNCATED,          /* blob shorter than its own framing claims  */
     RANS_E_EMPTY,              /* n_symbols == 0                            */
     RANS_E_COUNT_MISMATCH,     /* packed_bytes != ceil(n_symbols/2)         */
+    RANS_E_OVERSIZE,           /* n_symbols impossibly large for payload    */
     RANS_E_OFFSET_FIRST,       /* stream_offsets[0] != 0                    */
     RANS_E_OFFSETS_MONOTONIC,  /* stream_offsets not non-decreasing         */
     RANS_E_STREAM_SHORT,       /* a stream shorter than its 4-byte state    */
     RANS_E_LENGTH_MISMATCH,    /* blob length != derived framing length     */
     RANS_E_PAD_NONZERO,        /* a derived padding byte is not zero        */
+    RANS_E_UNALIGNED,          /* record buffer not 4-byte aligned          */
+    RANS_E_NSTREAMS,           /* n_streams zero / wrong for the format     */
     /* table-level refusals (rans_table_init) */
     RANS_E_TABLE_SCALE,        /* scale_bits out of range (1..15)           */
     RANS_E_TABLE_FREQ_SUM,     /* freq[] does not sum to M                  */
@@ -178,6 +195,11 @@ typedef enum {
     RANS_E_STREAM_UNDERRUN,    /* fewer than 4 bytes for the initial state  */
     RANS_E_STREAM_LEFTOVER,    /* decode finished with bytes unconsumed     */
     RANS_E_STREAM_FINAL_STATE, /* final state != L (not an encoder output)  */
+    /* encode-side refusals */
+    RANS_E_SYMBOL_UNCODABLE,   /* input contains a value > 15 or a symbol
+                                  whose table frequency is zero             */
+    RANS_E_SCRATCH,            /* encoder scratch/output bound exhausted
+                                  (a bound failure, NOT a memory condition) */
     /* misc */
     RANS_E_NOMEM,
     RANS_E_PATH_UNAVAILABLE    /* RANS_PATH forced an arm this build/CPU/env
@@ -190,11 +212,16 @@ static const char *rans_err_name(rans_err e) {
         case RANS_E_TRUNCATED:          return "E_TRUNCATED";
         case RANS_E_EMPTY:              return "E_EMPTY";
         case RANS_E_COUNT_MISMATCH:     return "E_COUNT_MISMATCH";
+        case RANS_E_OVERSIZE:           return "E_OVERSIZE";
         case RANS_E_OFFSET_FIRST:       return "E_OFFSET_FIRST";
         case RANS_E_OFFSETS_MONOTONIC:  return "E_OFFSETS_MONOTONIC";
         case RANS_E_STREAM_SHORT:       return "E_STREAM_SHORT";
         case RANS_E_LENGTH_MISMATCH:    return "E_LENGTH_MISMATCH";
         case RANS_E_PAD_NONZERO:        return "E_PAD_NONZERO";
+        case RANS_E_UNALIGNED:          return "E_UNALIGNED";
+        case RANS_E_NSTREAMS:           return "E_NSTREAMS";
+        case RANS_E_SYMBOL_UNCODABLE:   return "E_SYMBOL_UNCODABLE";
+        case RANS_E_SCRATCH:            return "E_SCRATCH";
         case RANS_E_TABLE_SCALE:        return "E_TABLE_SCALE";
         case RANS_E_TABLE_FREQ_SUM:     return "E_TABLE_FREQ_SUM";
         case RANS_E_TABLE_START:        return "E_TABLE_START";
@@ -306,38 +333,54 @@ static uint64_t rans_record_header_bytes(uint32_t n_streams) {
     return rans_round16(16u + ((uint64_t)n_streams + 1u) * 4u);
 }
 
-/* Worst-case record size for n nibbles: per-stream worst case mirrors the
- * encoder's own scratch rule (n + n/2 + 64 per stream is generous for any
- * 16-symbol table whose present symbols have freq >= 1), plus framing. */
+/* Worst-case record size for n nibbles. A symbol with table frequency f
+ * costs at most log2(M/f) bits, so the per-stream worst case over any valid
+ * table (f >= 1) is scale_bits bits/symbol — 1.875 bytes/symbol at the
+ * maximum scale_bits of 15 — plus the 4 flushed state bytes. This bound
+ * uses RANS_SCALE_BITS_MAX so it is table-independent and safe for every
+ * table rans_table_init accepts (the old "n + n/2" rule was FALSE for
+ * freq=1 symbols at scale_bits >= 13). Returns 0 for n_streams == 0. */
 static uint64_t rans_record_bound(uint64_t n_symbols, uint32_t n_streams) {
+    if (n_streams == 0) return 0;
     uint64_t per = n_symbols / n_streams + 1u;
+    uint64_t per_bytes = (per * RANS_SCALE_BITS_MAX + 7u) / 8u + 4u + 64u;
     return rans_record_header_bytes(n_streams) +
-           rans_round16((per + per / 2u + 64u) * n_streams);
+           rans_round16(per_bytes * n_streams);
 }
 
 /* Encode n nibbles as one int4-rans256-g0 chunk record (n_streams round-robin
  * interleaved streams, shared table). Writes at most rans_record_bound()
  * bytes into out; *out_len receives the exact record length. Deterministic:
- * same input + same table => byte-identical output. Returns RANS_OK, or
- * RANS_E_EMPTY / RANS_E_NOMEM. */
+ * same input + same table => byte-identical output. Returns RANS_OK, or:
+ * RANS_E_EMPTY (n == 0), RANS_E_NSTREAMS (n_streams == 0),
+ * RANS_E_SYMBOL_UNCODABLE (an input value > 15, or a symbol whose table
+ * frequency is zero — detected by a pre-scan BEFORE any encoding work),
+ * RANS_E_SCRATCH (a codec bound was exceeded — a logic/bound failure, never
+ * reported as a memory condition), RANS_E_NOMEM (malloc failed). */
 static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n,
                                    const rans_table *t, uint32_t n_streams,
                                    uint8_t *out, uint64_t out_cap,
                                    uint64_t *out_len) {
+    if (n_streams == 0) return RANS_E_NSTREAMS;
     if (n == 0) return RANS_E_EMPTY;
+    /* pre-scan: refuse uncodable input by name, before touching `out` */
+    for (uint64_t j = 0; j < n; j++)
+        if (nibbles[j] > 15u || t->freq[nibbles[j]] == 0)
+            return RANS_E_SYMBOL_UNCODABLE;
     uint64_t head = rans_record_header_bytes(n_streams);
-    if (out_cap < head) return RANS_E_NOMEM;
+    if (out_cap < head) return RANS_E_SCRATCH;
     uint64_t sub_max = n / n_streams + 1u;
-    uint64_t scap = sub_max + sub_max / 2u + 64u;   /* per-stream scratch cap */
+    /* per-stream scratch: a freq>=1 symbol costs at most scale_bits bits, so
+     * ceil(sub_max*scale_bits/8) + 4 flush bytes (+ slack) always fits */
+    uint64_t scap = (sub_max * t->scale_bits + 7u) / 8u + 4u + 64u;
     uint8_t *sub = (uint8_t *)malloc(sub_max ? sub_max : 1);
     uint8_t *enc = (uint8_t *)malloc(scap);
     if (!sub || !enc) { free(sub); free(enc); return RANS_E_NOMEM; }
 
     memset(out, 0, head);
-    uint64_t packed_bytes = (n + 1u) / 2u;
+    uint64_t packed_bytes = n / 2u + (n & 1u);
     memcpy(out, &n, 8);
     memcpy(out + 8, &packed_bytes, 8);
-    uint32_t *offs = (uint32_t *)(out + 16);
 
     uint64_t pos = 0;                                /* payload cursor */
     uint8_t *payload = out + head;
@@ -346,17 +389,19 @@ static rans_err rans_record_encode(const uint8_t *nibbles, uint64_t n,
         for (uint64_t j = i; j < n; j += n_streams) sub[ns++] = nibbles[j];
         size_t off = rans_encode_stream(sub, ns, t->freq, t->start,
                                         t->scale_bits, enc, scap);
-        if (off == (size_t)-1) { free(sub); free(enc); return RANS_E_NOMEM; }
+        if (off == (size_t)-1) { free(sub); free(enc); return RANS_E_SCRATCH; }
         uint64_t len = scap - off;
-        if (head + pos + len > out_cap) { free(sub); free(enc); return RANS_E_NOMEM; }
+        if (head + pos + len > out_cap) { free(sub); free(enc); return RANS_E_SCRATCH; }
         memcpy(payload + pos, enc + off, len);
-        offs[i] = (uint32_t)pos;
+        uint32_t pos32 = (uint32_t)pos;
+        memcpy(out + 16 + (uint64_t)i * 4u, &pos32, 4);
         pos += len;
-        if (pos > 0xFFFFFFFFu) { free(sub); free(enc); return RANS_E_NOMEM; }
+        if (pos > 0xFFFFFFFFu) { free(sub); free(enc); return RANS_E_SCRATCH; }
     }
-    offs[n_streams] = (uint32_t)pos;
+    uint32_t total32 = (uint32_t)pos;
+    memcpy(out + 16 + (uint64_t)n_streams * 4u, &total32, 4);
     uint64_t total = head + rans_round16(pos);
-    if (total > out_cap) { free(sub); free(enc); return RANS_E_NOMEM; }
+    if (total > out_cap) { free(sub); free(enc); return RANS_E_SCRATCH; }
     memset(payload + pos, 0, rans_round16(pos) - pos);
     *out_len = total;
     free(sub); free(enc);
@@ -376,30 +421,53 @@ typedef struct {
 /* Parse + validate one record blob (a tensor's full byte range). TRUST-
  * VERIFY-REFUSE: every malformation class returns its own named error and
  * the record is unusable on failure; there is no partial acceptance. The
- * blob is borrowed. NOTE for the batched decode arms: the blob must satisfy
- * the RANS_SLACK contract (header comment) — parsing alone does not read
- * past blob_len. */
+ * blob is borrowed and must be 4-byte aligned (any malloc'd or numpy-backed
+ * buffer qualifies; refused by name otherwise) so the stream_offsets
+ * pointer handed to the decode kernels indexes with defined behavior.
+ * NOTE for the batched decode arms: the blob must additionally satisfy the
+ * RANS_SLACK contract (header comment) — parsing alone does not read past
+ * blob_len, and it performs no allocation (in particular nothing
+ * proportional to the untrusted n_symbols field). */
 static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
                                   uint32_t n_streams, rans_record *out) {
     memset(out, 0, sizeof(*out));
+    if (n_streams == 0) return RANS_E_NSTREAMS;
+    if (((uintptr_t)blob & 3u) != 0) return RANS_E_UNALIGNED;
     uint64_t head = rans_record_header_bytes(n_streams);
     if (blob_len < head) return RANS_E_TRUNCATED;
     uint64_t n_symbols, packed_bytes;
     memcpy(&n_symbols, blob, 8);
     memcpy(&packed_bytes, blob + 8, 8);
     if (n_symbols == 0) return RANS_E_EMPTY;
-    if (packed_bytes != (n_symbols + 1u) / 2u) return RANS_E_COUNT_MISMATCH;
-    const uint32_t *offs = (const uint32_t *)(blob + 16);
-    if (offs[0] != 0) return RANS_E_OFFSET_FIRST;
+    /* non-wrapping form of packed_bytes == ceil(n_symbols/2): the additive
+     * form (n_symbols+1)/2 wraps at UINT64_MAX and would accept
+     * packed_bytes == 0 for it */
+    if (packed_bytes != n_symbols / 2u + (n_symbols & 1u))
+        return RANS_E_COUNT_MISMATCH;
+    uint32_t off_prev, off_cur;
+    memcpy(&off_prev, blob + 16, 4);
+    if (off_prev != 0) return RANS_E_OFFSET_FIRST;
     for (uint32_t i = 0; i < n_streams; i++) {
-        if (offs[i + 1] < offs[i]) return RANS_E_OFFSETS_MONOTONIC;
+        memcpy(&off_cur, blob + 16 + ((uint64_t)i + 1u) * 4u, 4);
+        if (off_cur < off_prev) return RANS_E_OFFSETS_MONOTONIC;
         /* every stream carries at least its 4-byte flushed state (true even
          * for streams that encode zero symbols) */
-        if (offs[i + 1] - offs[i] < 4u) return RANS_E_STREAM_SHORT;
+        if (off_cur - off_prev < 4u) return RANS_E_STREAM_SHORT;
+        off_prev = off_cur;
     }
-    uint64_t payload_len = offs[n_streams];
+    uint64_t payload_len = off_prev;               /* == offsets[n_streams] */
     if (head + payload_len > blob_len) return RANS_E_TRUNCATED;
     if (blob_len != head + rans_round16(payload_len)) return RANS_E_LENGTH_MISMATCH;
+    /* amplification bound: a symbol costs at least log2(M/(M-1)) bits under
+     * any valid table (present symbols of a genuine record cost more; the
+     * degenerate freq==M single-symbol table costs ~0 per symbol but still
+     * satisfies this bound easily). n_symbols beyond payload_len*8*M_max is
+     * impossible for ANY table this format admits — refuse the
+     * decompression bomb here, before any consumer sizes buffers from
+     * n_symbols. (No overflow: payload_len < 2^32, M_max = 2^15.) */
+    if (n_symbols > payload_len * 8u * (uint64_t)(1u << RANS_SCALE_BITS_MAX))
+        return RANS_E_OVERSIZE;
+    const uint32_t *offs = (const uint32_t *)(blob + 16);  /* aligned: checked */
     /* derived padding must be zero: bits hiding in the pad would make two
      * "identical" containers differ and defeat writer determinism */
     for (uint64_t i = 16u + ((uint64_t)n_streams + 1u) * 4u; i < head; i++)
@@ -499,6 +567,40 @@ static int rans__selftest_arm(rans_path p) {
         rans_record_encode(data, NSYM, &t, NT, rec_buf, cap, &rec_len) == RANS_OK) {
         rans_record rec;
         if (rans_record_parse(rec_buf, rec_len, NT, &rec) == RANS_OK) {
+            /* MACHINE-CHECKED band coverage: the load-bearing property of
+             * this fixture is that it drives multi-byte renorm refills
+             * (post-update x < 2^15 => refill count kb == 2) — the band a
+             * comfortable table never visits and where a vector-arm renorm
+             * bug hides. Count kb with the oracle-shaped loop and FAIL the
+             * selftest if the fixture ever stops covering it, instead of
+             * trusting a comment. (kb == 3 needs x < 2^7, impossible
+             * mid-stream: post-update x >= L >> scale_bits >= 2^8.) */
+            uint64_t kb2 = 0;
+            for (uint32_t i = 0; i < NT; i++) {
+                const uint8_t *ptr = rec.payload + rec.stream_offsets[i];
+                const uint8_t *e2 = rec.payload + rec.stream_offsets[i + 1];
+                uint32_t x = 0;
+                for (int b2 = 0; b2 < 4; b2++) x = (x << 8) | *ptr++;
+                for (uint64_t j = i; j < rec.n_symbols; j += NT) {
+                    uint32_t sl2 = x & (M - 1u);
+                    uint32_t sy2 = slot[sl2];
+                    x = freq[sy2] * (x >> sb) + sl2 - start[sy2];
+                    uint32_t kb = 0;
+                    while (x < RANS_L) {
+                        if (ptr >= e2) break;
+                        x = (x << 8) | *ptr++;
+                        kb++;
+                    }
+                    if (kb >= 2) kb2++;
+                }
+            }
+            if (kb2 == 0) {
+                fprintf(stderr, "[rans] selftest fixture lost multi-byte "
+                        "renorm coverage — fixture bug, arm not trusted\n");
+                free(rec_buf);
+                rans_table_free(&t);
+                return 0;
+            }
             memset(packed_ref, 0, sizeof(packed_ref));
             for (int i = 0; i < NSYM; i++)
                 packed_ref[i >> 1] |= (uint8_t)(data[i] << ((i & 1) * 4));
@@ -1015,6 +1117,9 @@ static void rans_record_decode_groups(const rans_record *rec, const rans_table *
 static rans_err rans_record_decode_packed(const rans_record *rec, const rans_table *t,
                                           uint32_t n_streams, rans_path p,
                                           uint8_t *out_packed) {
+    /* n_streams == 0 would decode zero streams and return uninitialized
+     * scratch as "successful" output — refuse before any path can run */
+    if (n_streams == 0) return RANS_E_NSTREAMS;
     if (p == RANS_PATH_INVALID) return RANS_E_PATH_UNAVAILABLE;
     /* an arm this build did not compile refuses rather than silently running
      * scalar: a quiet downgrade would let "we tested <arm>" become a false

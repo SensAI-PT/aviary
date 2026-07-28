@@ -460,6 +460,18 @@ tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 tests/test_rans$(EXE): tests/test_rans.c rans.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Structured-mutation fuzz for the rans record parser/decoder under
+# ASan+UBSan — seeded and bounded (a few thousand mutants, well under a
+# minute), asserting no sanitizer report and byte identity across every
+# compiled decode arm on every accepted record. NOT a test gate (sanitizer
+# flags differ from the normal build); build+run on demand:
+#   make fuzz-rans
+fuzz-rans: tests/fuzz_rans.c rans.h
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
+	./tests/fuzz_rans
+
 tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -505,7 +517,12 @@ tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
-test-python:
+# test-python builds the rans ctypes bridge first: without it the repack e2e
+# test's C-vs-Python byte-identity pin would silently compare Python against
+# itself (the test ALSO skips loudly if the library is somehow still absent,
+# e.g. when invoked via unittest directly — but a green `make test` must mean
+# the pin was actually checked).
+test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python
@@ -567,4 +584,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

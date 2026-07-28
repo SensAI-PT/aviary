@@ -615,6 +615,233 @@ static void test_path_envelope(void) {
 #undef UNSET_ENV
 }
 
+/* ---- 5. fix-round hardening regressions ---------------------------------- */
+
+/* Header-field overflow/amplification battery (u64 wrap + decompression
+ * bomb): reproduces the review round's poc_overflow.c cases and pins the
+ * non-wrapping count check + the E_OVERSIZE payload bound. */
+static void test_header_field_battery(void) {
+    const uint32_t N = RANS_NSTREAMS;
+    const uint64_t n = 8192;
+    uint8_t *d = (uint8_t *)malloc(n);
+    for (uint64_t i = 0; i < n; i++) d[i] = (uint8_t)(1 + (rnd() % 15));
+    test_table tt;
+    tt_from_hist(&tt, 14, d, n);
+    uint64_t rec_len = 0;
+    uint8_t *buf = make_record(d, n, &tt, N, &rec_len);
+    uint8_t *cp = (uint8_t *)malloc(rec_len + RANS_SLACK);
+    rans_record rec;
+    rans_err e;
+
+    struct { uint64_t n_symbols, packed_bytes; rans_err want; const char *why; }
+    cases[] = {
+        {UINT64_MAX, 0,                  RANS_E_COUNT_MISMATCH,
+         "u64 wrap: (n+1)/2 overflows to 0"},
+        {UINT64_MAX, (1ull << 63),       RANS_E_OVERSIZE,
+         "u64 max with non-wrapping-consistent pb"},
+        {UINT64_MAX - 1, (1ull << 63) - 1, RANS_E_OVERSIZE, "u64 max-1"},
+        {1ull << 63, 1ull << 62,         RANS_E_OVERSIZE, "2^63"},
+        {1ull << 40, 1ull << 39,         RANS_E_OVERSIZE, "decompression bomb 2^40"},
+        {1ull << 32, 1ull << 31,         RANS_E_OVERSIZE, "2^32"},
+        {(1ull << 32) + 1, (1ull << 31) + 1, RANS_E_OVERSIZE, "2^32+1"},
+        {0, 0,                           RANS_E_EMPTY, "zero symbols"},
+        {n + 1, (n + 1) / 2,             RANS_E_COUNT_MISMATCH, "n+1, stale pb"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        memcpy(cp, buf, rec_len);
+        memcpy(cp, &cases[c].n_symbols, 8);
+        memcpy(cp + 8, &cases[c].packed_bytes, 8);
+        e = rans_record_parse(cp, rec_len, N, &rec);
+        CHECK(e == cases[c].want, "%s: want %s got %s", cases[c].why,
+              rans_err_name(cases[c].want), rans_err_name(e));
+    }
+
+    /* minimally-framed bomb (every stream exactly its 4 flushed bytes,
+     * n_symbols = 2^40): must refuse at parse, which allocates nothing */
+    {
+        uint64_t head = rans_record_header_bytes(N);
+        uint64_t payload_len = 4ull * N;
+        uint64_t blen = head + rans_round16(payload_len);
+        uint8_t *bomb = (uint8_t *)calloc(blen + RANS_SLACK, 1);
+        uint64_t nb = 1ull << 40, pb = nb / 2;
+        memcpy(bomb, &nb, 8);
+        memcpy(bomb + 8, &pb, 8);
+        for (uint32_t i = 0; i <= N; i++) {
+            uint32_t v = 4u * i;
+            memcpy(bomb + 16 + (uint64_t)i * 4u, &v, 4);
+        }
+        for (uint64_t i = head; i < head + payload_len; i++) bomb[i] = 0x80;
+        e = rans_record_parse(bomb, blen, N, &rec);
+        CHECK(e == RANS_E_OVERSIZE, "minimal bomb: want E_OVERSIZE got %s",
+              rans_err_name(e));
+        free(bomb);
+    }
+    free(cp); free(buf); free(d);
+    tt_free(&tt);
+}
+
+/* Encoder scratch bound: bulk freq=1 input must encode fine at every
+ * scale_bits (the old n+n/2 rule failed at >= 13 — review poc_bound.c). */
+static void test_encoder_scratch_bound(void) {
+    for (uint32_t sb = 12; sb <= 15; sb++) {
+        uint32_t M = 1u << sb;
+        uint32_t freq[16] = {0};
+        freq[3] = 1;
+        freq[15] = M - 1;
+        test_table tt;
+        tt_build(&tt, sb, freq);
+        const uint64_t n = 8192;
+        uint8_t *d = (uint8_t *)malloc(n);
+        memset(d, 3, n);                      /* every symbol is the rare one */
+        uint64_t cap = rans_record_bound(n, 16) + RANS_SLACK, rl = 0;
+        uint8_t *rb = (uint8_t *)calloc(cap, 1);
+        rans_err e = rans_record_encode(d, n, &tt.t, 16, rb, cap, &rl);
+        CHECK(e == RANS_OK, "freq=1 bulk encode at sb=%u: %s", sb,
+              rans_err_name(e));
+        if (e == RANS_OK) {                   /* and it round-trips */
+            rans_record rec;
+            CHECK(rans_record_parse(rb, rl, 16, &rec) == RANS_OK,
+                  "freq=1 sb=%u parse", sb);
+            uint8_t *out = (uint8_t *)malloc(n / 2);
+            uint8_t *ref = (uint8_t *)malloc(n / 2);
+            pack_ref(d, n, ref);
+            CHECK(rans_record_decode_packed(&rec, &tt.t, 16, RANS_PATH_SCALAR,
+                                            out) == RANS_OK &&
+                  memcmp(out, ref, n / 2) == 0, "freq=1 sb=%u round trip", sb);
+            free(out); free(ref);
+        }
+        /* E_SCRATCH is a bound failure, never conflated with malloc failure:
+         * a too-small caller buffer names the bound, not the allocator */
+        e = rans_record_encode(d, n, &tt.t, 16, rb,
+                               rans_record_header_bytes(16) + 8, &rl);
+        CHECK(e == RANS_E_SCRATCH, "small out_cap at sb=%u: want E_SCRATCH "
+              "got %s", sb, rans_err_name(e));
+        free(rb); free(d);
+        tt_free(&tt);
+    }
+}
+
+/* Uncodable input is refused by name BEFORE any encoding work: a present
+ * symbol with table freq 0, and out-of-alphabet bytes (review poc_encode.c).
+ * The stream primitive itself masks to the nibble alphabet, so garbage
+ * bytes can never index past freq[16] (byte-identical to pre-masked input). */
+static void test_uncodable_input(void) {
+    uint32_t freq[16] = {0};
+    freq[1] = 1; freq[2] = 1; freq[3] = 1;
+    freq[15] = (1u << 14) - 3;                /* 4..14 have freq 0 */
+    test_table tt;
+    tt_build(&tt, 14, freq);
+    uint8_t d[64];
+    memset(d, 15, sizeof(d));
+    uint64_t cap = rans_record_bound(64, 16) + RANS_SLACK, rl = 0;
+    uint8_t *rb = (uint8_t *)calloc(cap, 1);
+    rans_err e;
+
+    d[7] = 9;                                 /* freq[9] == 0 */
+    e = rans_record_encode(d, 64, &tt.t, 16, rb, cap, &rl);
+    CHECK(e == RANS_E_SYMBOL_UNCODABLE, "freq=0 symbol: want "
+          "E_SYMBOL_UNCODABLE got %s", rans_err_name(e));
+
+    d[7] = 200;                               /* out of the nibble alphabet */
+    e = rans_record_encode(d, 64, &tt.t, 16, rb, cap, &rl);
+    CHECK(e == RANS_E_SYMBOL_UNCODABLE, "value 200: want E_SYMBOL_UNCODABLE "
+          "got %s", rans_err_name(e));
+
+    /* stream primitive: masked, so 200 encodes as 200&15 == 8, byte-exact */
+    uint32_t f2[16];
+    for (int s = 0; s < 16; s++) f2[s] = (1u << 14) / 16;
+    test_table t2;
+    tt_build(&t2, 14, f2);
+    uint8_t da[64], db[64], ba[512], bb[512];
+    for (int i = 0; i < 64; i++) da[i] = db[i] = (uint8_t)(rnd() & 15);
+    da[3] = 200; db[3] = 200 & 15;
+    size_t oa = rans_encode_stream(da, 64, t2.t.freq, t2.t.start,
+                                   t2.t.scale_bits, ba, sizeof(ba));
+    size_t ob = rans_encode_stream(db, 64, t2.t.freq, t2.t.start,
+                                   t2.t.scale_bits, bb, sizeof(bb));
+    CHECK(oa == ob && oa != (size_t)-1 &&
+          memcmp(ba + oa, bb + ob, sizeof(ba) - oa) == 0,
+          "stream mask: 200 must encode as 200&15, byte-identical");
+    free(rb);
+    tt_free(&tt); tt_free(&t2);
+}
+
+/* n_streams validation + record-buffer alignment refusals. */
+static void test_nstreams_and_alignment(void) {
+    const uint64_t n = 512;
+    uint8_t *d = (uint8_t *)malloc(n);
+    for (uint64_t i = 0; i < n; i++) d[i] = (uint8_t)(1 + (rnd() % 15));
+    test_table tt;
+    tt_from_hist(&tt, 14, d, n);
+    uint64_t rec_len = 0;
+    uint8_t *buf = make_record(d, n, &tt, RANS_NSTREAMS, &rec_len);
+    rans_record rec;
+    rans_err e;
+
+    CHECK(rans_record_bound(n, 0) == 0, "bound with n_streams=0 returns 0");
+    uint64_t rl = 0;
+    e = rans_record_encode(d, n, &tt.t, 0, buf, rec_len, &rl);
+    CHECK(e == RANS_E_NSTREAMS, "encode n_streams=0: %s", rans_err_name(e));
+    e = rans_record_parse(buf, rec_len, 0, &rec);
+    CHECK(e == RANS_E_NSTREAMS, "parse n_streams=0: %s", rans_err_name(e));
+    CHECK(rans_record_parse(buf, rec_len, RANS_NSTREAMS, &rec) == RANS_OK,
+          "control parse");
+    uint8_t out[256];
+    e = rans_record_decode_packed(&rec, &tt.t, 0, RANS_PATH_SCALAR, out);
+    CHECK(e == RANS_E_NSTREAMS, "decode n_streams=0: %s", rans_err_name(e));
+
+    /* a misaligned record buffer is refused by name, not cast through */
+    uint8_t *mis = (uint8_t *)malloc(rec_len + RANS_SLACK + 1);
+    memcpy(mis + 1, buf, rec_len);
+    e = rans_record_parse(mis + 1, rec_len, RANS_NSTREAMS, &rec);
+    CHECK(e == RANS_E_UNALIGNED, "misaligned blob: %s", rans_err_name(e));
+    free(mis); free(buf); free(d);
+    tt_free(&tt);
+}
+
+/* Band coverage as a checked property of the suite's own rare-symbol
+ * fixture (the runtime selftest asserts the same on its fixture): the
+ * multi-byte renorm band the sabotage exercise proved load-bearing must
+ * actually be visited, or the identity sweep is running blind. */
+static void test_band_coverage(void) {
+    const uint64_t n = 32768;
+    uint8_t *d = (uint8_t *)malloc(n);
+    uint32_t rare[16] = {0};
+    for (int s = 1; s <= 7; s++) rare[s] = 1;
+    for (int s = 8; s <= 14; s++) rare[s] = 3;
+    rare[15] = (1u << 14) - 7 - 21;
+    test_table tt;
+    tt_build(&tt, 14, rare);
+    for (uint64_t i = 0; i < n; i++)
+        d[i] = (uint8_t)((rnd() % 3 == 0) ? 1 + (rnd() % 14) : 15);
+    uint64_t rec_len = 0;
+    uint8_t *buf = make_record(d, n, &tt, RANS_NSTREAMS, &rec_len);
+    rans_record rec;
+    CHECK(rans_record_parse(buf, rec_len, RANS_NSTREAMS, &rec) == RANS_OK,
+          "band fixture parse");
+    uint64_t kb2 = 0, steps = 0;
+    for (uint32_t i = 0; i < RANS_NSTREAMS; i++) {
+        const uint8_t *ptr = rec.payload + rec.stream_offsets[i];
+        const uint8_t *end = rec.payload + rec.stream_offsets[i + 1];
+        uint32_t x = 0;
+        for (int b = 0; b < 4; b++) x = (x << 8) | *ptr++;
+        for (uint64_t j = i; j < rec.n_symbols; j += RANS_NSTREAMS) {
+            uint32_t slot = x & (tt.t.M - 1u);
+            uint32_t s = tt.slot[slot];
+            x = tt.t.freq[s] * (x >> tt.t.scale_bits) + slot - tt.t.start[s];
+            uint32_t kb = 0;
+            while (x < RANS_L) { if (ptr >= end) break; x = (x << 8) | *ptr++; kb++; }
+            if (kb >= 2) kb2++;
+            steps++;
+        }
+    }
+    CHECK(kb2 > steps / 100, "multi-byte renorm band: %llu of %llu steps "
+          "(need > 1%%) — the rare-symbol fixture lost its coverage",
+          (unsigned long long)kb2, (unsigned long long)steps);
+    free(buf); free(d);
+    tt_free(&tt);
+}
+
 int main(void) {
     test_stream_property_suite();
     test_stream_checked_refusals();
@@ -622,6 +849,11 @@ int main(void) {
     test_record_refusals();
     test_arm_identity_suite();
     test_path_envelope();
+    test_header_field_battery();
+    test_encoder_scratch_bound();
+    test_uncodable_input();
+    test_nstreams_and_alignment();
+    test_band_coverage();
     if (failures) {
         printf("test_rans: FAIL (%d)\n", failures);
         return 1;
