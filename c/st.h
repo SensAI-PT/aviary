@@ -271,7 +271,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 ndir, nf, snap_dir, c0);
     }
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; snprintf(tmp, sizeof(tmp), "%s", files[a]); snprintf(files[a], 1024, "%s", files[b]); snprintf(files[b], 1024, "%s", tmp); }
+        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; memcpy(tmp, files[a], 1024); memcpy(files[a], files[b], 1024); memcpy(files[b], tmp, 1024); }
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);

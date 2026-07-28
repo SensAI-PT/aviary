@@ -12,9 +12,12 @@
 #ifdef _WIN32
 #include <direct.h>
 #define MKDIR(p) _mkdir(p)
+#define RMDIR(p) _rmdir(p)
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #define MKDIR(p) mkdir(p, 0777)
+#define RMDIR(p) rmdir(p)
 #endif
 
 #define CHECK(condition) do { \
@@ -56,7 +59,7 @@ static void cleanup(void) {
         char path[256];
         snprintf(path, sizeof(path), "%s/model.safetensors", dirs[i]);
         remove(path);
-        remove(dirs[i]);
+        RMDIR(dirs[i]);   /* remove() deletes only files on Windows: stale dirs made every 2nd run fail */
     }
 }
 
