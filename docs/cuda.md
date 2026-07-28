@@ -99,15 +99,23 @@ sidecar format. `COLI_ANS_PROFILE=1` prints a one-line load-time breakdown.
 
 On a 6× RTX 5090 host with GLM-5.2 int4, a 2,500-expert raw tier plus 8,128
 compressed experts increased VRAM capacity from 9,335 to 10,628 experts
-(+13.9%). Greedy decode was byte-identical to the raw-tier baseline and measured
-6.19→7.12 tok/s over 32 tokens (+15.0%), and 6.75→7.31 tok/s over 128 tokens
-(+8.3%). Pinned asynchronous staging reduced placement from 197 to 157 seconds;
-aligned direct reads reduced it further to 80–103 seconds across two runs, with
-the 110 GB archive read accounting for 18.94–19.15 seconds. These results are a
-general compression guarantee: incompressible records are rejected, and the
-archived DietGPU dependency makes this an experimental build-time option.
-Live `REPIN` is disabled because it would invalidate the sidecar's fixed expert
-order.
+(+13.9%). The original controlled runs measured 6.19→7.12 tok/s over 32 tokens
+(+15.0%), and 6.75→7.31 tok/s over 128 tokens (+8.3%). A later fixed-token
+revalidation on current `dev` measured a smaller 8.17→8.54 tok/s median gain
+(+4.5%) against the full 176.6 GB raw tier. Pinned asynchronous staging reduced
+placement from 197 to 157 seconds; aligned direct reads reduced it further to
+80–103 seconds across two runs, with the 110 GB archive read accounting for
+18.94–19.23 seconds.
+
+The archive itself is lossless: every decoded weight byte is verified against
+the original tensor and incompressible records are rejected. That does **not**
+guarantee identical generated text versus the raw-tier placement. Moving more
+experts from CPU execution into CUDA changes floating-point accumulation order;
+a current greedy A/B diverged after a near tie even though both weight paths
+were byte-exact. Treat output identity as a measured workload result, not a
+property of the compression format. The archived DietGPU dependency therefore
+remains an experimental build-time option. Live `REPIN` is disabled because it
+would invalidate the sidecar's fixed expert order.
 
 ## The GPU-resident pipeline (`COLI_CUDA_PIPE`)
 
