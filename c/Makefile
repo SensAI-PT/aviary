@@ -199,7 +199,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_rans$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -337,6 +337,22 @@ iq3: $(IQ3LIB)
 $(IQ3LIB): tools/iq3_encode.c
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
+# int4-rans256-g0 codec bridge for tools/repack_rans.py + tools/rans_verify.py.
+# OPTIONAL: both tools fall back to a pure-Python codec producing the same
+# bytes far more slowly when the library is absent (fine for tests, not for a
+# real repack). Same ARCH story as the engine: an AVX-512/NEON host gets the
+# batched vector decoder, anything else the scalar paths.
+ifneq (,$(DARWIN))
+RANSLIB = tools/librans_c.dylib
+else ifneq ($(IS_WIN),)
+RANSLIB = tools/rans_c.dll
+else
+RANSLIB = tools/librans_c.so
+endif
+rans: $(RANSLIB)
+$(RANSLIB): tools/rans_ctypes.c rans.h
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
@@ -441,6 +457,21 @@ tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok
 tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_rans$(EXE): tests/test_rans.c rans.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Structured-mutation fuzz for the rans record parser/decoder under
+# ASan+UBSan — seeded and bounded (a few thousand mutants, well under a
+# minute), asserting no sanitizer report and byte identity across every
+# compiled decode arm on every accepted record. NOT a test gate (sanitizer
+# flags differ from the normal build); build+run on demand:
+#   make fuzz-rans
+fuzz-rans: tests/fuzz_rans.c rans.h
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
+	./tests/fuzz_rans
+
 tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -486,7 +517,12 @@ tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
-test-python:
+# test-python builds the rans ctypes bridge first: without it the repack e2e
+# test's C-vs-Python byte-identity pin would silently compare Python against
+# itself (the test ALSO skips loudly if the library is somehow still absent,
+# e.g. when invoked via unittest directly — but a green `make test` must mean
+# the pin was actually checked).
+test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python
@@ -548,4 +584,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
