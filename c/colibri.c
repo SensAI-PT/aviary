@@ -4732,6 +4732,15 @@ static void intr_install(void){
 #else
 static void intr_install(void){}
 #endif
+/* #678: mid-turn STOP/CANCEL for the single-slot speculative serve path. With
+ * KV_SLOTS=1 the whole turn runs inside ONE spec_decode call, so run_serve_mux's
+ * stdin poll never runs mid-turn and a server-sent STOP (raised when its stop
+ * filter matches, e.g. a role marker) sat unread until max_tokens. These flags
+ * are raised by mux_ctl_poll (called from the mux emit callback, once per emitted
+ * token) and checked in spec_decode next to g_intr. They are only ever set while
+ * a mux spec turn is running and are reset at each turn boundary, so every other
+ * spec_decode caller (chat, run, oracle) sees them permanently 0. */
+static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
@@ -4749,7 +4758,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
-    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
+    while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
+        /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -5497,9 +5507,62 @@ static void mux_data(Tok *T, unsigned long long id, int token){
     fflush(stdout);
 }
 
+/* #678: non-blocking stdin poll while a single-slot spec turn is running. Consumes
+ * pending STOP/CANCEL lines (raising g_mux_stop/g_mux_cancel for the active id) so
+ * the server's stop takes effect within ~1 token instead of after max_tokens. The
+ * framed protocol stays in sync: STOP/CANCEL are single lines; a SUBMIT cannot
+ * legally arrive while the only slot is busy, but if one does its payload is
+ * drained and it is refused with SLOT_BUSY exactly as mux_submit would. On stdin
+ * types the platform cannot poll (e.g. Windows non-pipe stdin), ready stays 0 and
+ * behaviour falls back to the pre-#678 end-of-turn handling. */
+static void mux_ctl_poll(unsigned long long id){
+    for(;;){
+        int ready=0;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+        struct timeval tv={0,0};
+        ready = select(STDIN_FILENO+1,&rfds,NULL,NULL,&tv)>0 && FD_ISSET(STDIN_FILENO,&rfds);
+#elif defined(_WIN32)
+        HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
+        DWORD avail=0;
+        ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
+#endif
+        if(!ready) return;
+        char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
+        if(nr<0){ free(line); return; }
+        if(nr && line[nr-1]=='\n') line[--nr]=0;
+        unsigned long long cid=0; char tail;
+        if(!strncmp(line,"STOP ",5) && sscanf(line+5,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_stop=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else if(!strncmp(line,"CANCEL ",7) && sscanf(line+7,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_cancel=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else{
+            ColiSubmit sub;
+            if(coli_submit_parse(line,&sub)){
+                long long left=(long long)sub.bytes+(long long)sub.gbytes;   /* drain payload */
+                char buf[4096];
+                while(left>0){
+                    size_t take = left>(long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
+                    size_t got=fread(buf,1,take,stdin); if(!got) break; left-=(long long)got;
+                }
+                int delim=fgetc(stdin); (void)delim;                          /* trailing '\n' */
+                printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout);
+            }else{
+                printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout);
+            }
+        }
+        free(line);
+    }
+}
+
 /* emit callback for the single-slot speculative path: stream straight to the mux protocol */
 typedef struct { Tok *T; unsigned long long id; } MuxEmit;
-static void mux_spec_emit(int t, void *ud){ MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t); }
+static void mux_spec_emit(int t, void *ud){
+    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t);
+    mux_ctl_poll(e->id);                 /* #678: honor STOP/CANCEL within ~1 token */
+}
 
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
@@ -5791,15 +5854,29 @@ static void run_serve_mux(Model *m, const char *snap){
                  * the exact contract run_serve (non-mux) already uses. No chunk
                  * splicing (that would re-enter spec_decode mid-turn and double
                  * the boundary token); Ctrl-C interrupts through g_intr inside
-                 * spec_decode, same as every other serve path. r->spec_logit
-                 * holds the prefill continuation from mux_submit. */
+                 * spec_decode, and a server STOP/CANCEL through g_mux_stop /
+                 * g_mux_cancel raised by mux_ctl_poll in the emit callback (#678).
+                 * r->spec_logit holds the prefill continuation from mux_submit. */
                 kv_bind(m,&sc->kv);
                 g_temp=r->temp; g_nuc=r->top_p;
                 float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
                 MuxEmit ud={&T,r->id};
+                g_mux_stop=0; g_mux_cancel=0;                  /* fresh per turn (#678) */
                 int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
                                      mux_spec_emit,&ud,&sc->len,NULL);
                 r->emitted+=prod;
+                if(g_mux_cancel){
+                    /* mirror of mux_submit's CANCEL epilogue: no DONE frame, the
+                     * dispatcher expects ERROR <id> CANCELLED. KV history is kept
+                     * consistent exactly like the between-turns path. */
+                    g_mux_cancel=0; g_mux_stop=0;
+                    r->spec=0; r->active=0;
+                    kv_bind(m,&sc->kv);
+                    kv_disk_append(m,sc->hist,sc->len);
+                    printf("ERROR %llu CANCELLED\n",r->id); fflush(stdout);
+                    continue;
+                }
+                g_mux_stop=0;                /* STOP or natural end: same DONE path */
                 mux_done(m,sc,r);
                 continue;                    /* whole turn handled outside the shared batch */
             }
