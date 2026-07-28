@@ -337,6 +337,22 @@ iq3: $(IQ3LIB)
 $(IQ3LIB): tools/iq3_encode.c
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
+# int4-rans256-g0 codec bridge for tools/repack_rans.py + tools/rans_verify.py.
+# OPTIONAL: both tools fall back to a pure-Python codec producing the same
+# bytes far more slowly when the library is absent (fine for tests, not for a
+# real repack). Same ARCH story as the engine: an AVX-512/NEON host gets the
+# batched vector decoder, anything else the scalar paths.
+ifneq (,$(DARWIN))
+RANSLIB = tools/librans_c.dylib
+else ifneq ($(IS_WIN),)
+RANSLIB = tools/rans_c.dll
+else
+RANSLIB = tools/librans_c.so
+endif
+rans: $(RANSLIB)
+$(RANSLIB): tools/rans_ctypes.c rans.h
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
@@ -440,6 +456,7 @@ tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok
 # the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
 tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 
 tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -548,4 +565,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm iq3 cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm iq3 rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
