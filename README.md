@@ -81,6 +81,23 @@ code that does it. Not renting intelligence behind an API — *holding* it:
 probing it, measuring it, improving it. The engine is deliberately small enough
 that the next useful optimization can come from anyone willing to measure it.
 
+## Technical highlights
+
+- **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
+  tiers for the same weights; limited fast memory changes speed, not model semantics.
+- **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
+  pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
+- **I/O is part of the engine.** Batched expert unions, overlapped reads and
+  compute, `O_DIRECT`, and weighted dual-SSD striping attack the streaming path
+  rather than pretending storage latency is free.
+- **Heterogeneous execution.** CPU, CUDA, Metal, NUMA memory, and partial or full
+  expert residency share one runtime and can be combined according to the machine.
+- **Compressed state without a different model.** Token-exact forward validation,
+  57× smaller MLA KV state, persistent warm conversations, and faithful DSA keep
+  optimization tied to correctness.
+- **Speculation that must earn its keep.** Native MTP and grammar-forced drafts
+  are measured end to end and can be disabled when acceptance does not repay verification.
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and

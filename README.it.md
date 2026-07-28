@@ -75,6 +75,23 @@ lo rende possibile. Non noleggiare intelligenza dietro un'API, ma possederla,
 analizzarla, misurarla e migliorarla. Il motore resta volutamente abbastanza piccolo
 perché la prossima ottimizzazione utile possa arrivare da chiunque sia disposto a misurarla.
 
+## Punti di forza tecnici
+
+- **Una gerarchia, non una soglia di memoria.** VRAM, RAM e NVMe sono livelli di
+  piazzamento degli stessi pesi; poca memoria veloce cambia la velocità, non il modello.
+- **Un JIT per i pesi.** Il calore di routing misurato alimenta una LRU per layer,
+  un hot-store appreso e il prefetch del layer successivo senza caricare tutti gli expert.
+- **L'I/O fa parte del motore.** Unione degli expert per batch, letture sovrapposte
+  al calcolo, `O_DIRECT` e striping pesato su due SSD ottimizzano direttamente lo streaming.
+- **Esecuzione eterogenea.** CPU, CUDA, Metal, memoria NUMA e residenza parziale o
+  completa degli expert condividono un runtime e si combinano in base alla macchina.
+- **Stato compresso senza cambiare modello.** Validazione token-exact, stato MLA KV
+  57× più piccolo, conversazioni persistenti e DSA fedele vincolano l'ottimizzazione
+  alla correttezza.
+- **La speculazione deve meritarsi il costo.** MTP nativo e draft vincolati da
+  grammatica sono misurati end-to-end e si disattivano quando l'accettazione non
+  ripaga la verifica.
+
 ## L'idea
 
 Un modello Mixture-of-Experts da 744B attiva solo ~40B parametri per token — e
