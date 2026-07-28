@@ -95,7 +95,7 @@ class AutotuneUnitTest(unittest.TestCase):
 class AutotuneIntegrationTest(unittest.TestCase):
     def test_fixed_replay_selects_and_persists_winner(self):
         with tempfile.TemporaryDirectory() as directory:
-            engine = Path(directory) / "fake-engine"
+            engine = Path(directory) / "fake-engine.py"
             engine.write_text(
                 "#!/usr/bin/env python3\n"
                 "import os\n"
@@ -125,7 +125,7 @@ class AutotuneIntegrationTest(unittest.TestCase):
 
     def test_reverse_confirmation_rejects_warmup_drift(self):
         with tempfile.TemporaryDirectory() as directory:
-            engine = Path(directory) / "drifting-engine"
+            engine = Path(directory) / "drifting-engine.py"
             counter = Path(directory) / "counter"
             engine.write_text(
                 "#!/usr/bin/env python3\n"

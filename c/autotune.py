@@ -14,6 +14,7 @@ import platform
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -176,6 +177,8 @@ def parse_replay(output: str) -> dict:
 
 
 def _run(command: list[str], env: dict, timeout: int) -> subprocess.CompletedProcess:
+    if Path(command[0]).suffix.lower() == ".py":
+        command = [sys.executable, *command]
     return subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout)
 
 
