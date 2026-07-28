@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
@@ -340,6 +341,8 @@ Se ti è utile:
 - ⭐ metti una stella al repository e condividilo;
 - 🐛 apri issue con i numeri di benchmark del tuo hardware — i datapoint
   fanno avanzare questo progetto più di qualsiasi altra cosa;
+- 💬 entra nella [comunità Discord](https://discord.gg/fpQxKnRb) per discutere
+  esperimenti, risultati hardware e direzioni di ricerca;
 - 💬 contattaci via GitHub issues per sponsorizzare lo sviluppo o donare hardware.
 
 ## Struttura del repository
