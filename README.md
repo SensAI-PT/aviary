@@ -81,22 +81,50 @@ code that does it. Not renting intelligence behind an API — *holding* it:
 probing it, measuring it, improving it. The engine is deliberately small enough
 that the next useful optimization can come from anyone willing to measure it.
 
-## Technical highlights
+## Core techniques and measured findings
 
 - **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
   tiers for the same weights; limited fast memory changes speed, not model semantics.
 - **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
   pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
+  It wins on repeatable workloads; history can overfit, and lookahead can lose on
+  some hosts, so both remain measurable policies rather than promises.
 - **I/O is part of the engine.** Batched expert unions, overlapped reads and
   compute, `O_DIRECT`, and weighted dual-SSD striping attack the streaming path
-  rather than pretending storage latency is free.
+  rather than pretending storage latency is free. `O_DIRECT` is drive-dependent,
+  and dual-SSD still needs broader end-to-end community A/Bs.
 - **Heterogeneous execution.** CPU, CUDA, Metal, NUMA memory, and partial or full
-  expert residency share one runtime and can be combined according to the machine.
+  expert residency share one runtime and can be combined according to the machine;
+  the profitable combination depends on compute, bandwidth, residency, and workload.
 - **Compressed state without a different model.** Token-exact forward validation,
   57× smaller MLA KV state, persistent warm conversations, and faithful DSA keep
-  optimization tied to correctness.
+  optimization tied to correctness. These are memory, latency, and correctness
+  properties — not a blanket throughput claim.
 - **Speculation that must earn its keep.** Native MTP and grammar-forced drafts
   are measured end to end and can be disabled when acceptance does not repay verification.
+
+## Open hypotheses, experiments, and how to help
+
+Colibrì treats an optimization as a hypothesis until a controlled end-to-end A/B
+shows otherwise. These are the main questions now:
+
+| hypothesis | evidence so far | experiment still needed |
+|---|---|---|
+| Routing history can place experts better than plain LRU | learned pins improve repeated workloads, but can overfit a prompt | held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
+| Multiple SSDs can turn independent bandwidth into decode speed | weighted mirror/split routing is implemented and validated; the bandwidth model is sound | cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
+| A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
+| Lossless or quality-bounded representations can reduce weight movement enough to matter | format and quantization ablations exist, with correctness/quality gates | reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
+| Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
+| CPU/GPU overlap can hide transfer and synchronization rather than merely move the bottleneck | CUDA and Metal wins exist, but fast CPUs and low residency can erase them | per-stage profiles and one-variable A/Bs across PCIe, unified-memory, and full-resident machines |
+
+Want to help? Pick one row and publish the negative results too. Record the
+hardware, commit, model/container, exact command, prompt, cache state, throughput,
+TTFT, expert hit rate, bytes read, and quality check; change one variable, repeat
+the run, and attach raw logs. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md), compare against
+[the benchmark protocol](docs/benchmarks.md), then
+[open an experiment issue](https://github.com/JustVugg/colibri/issues/new).
+A well-controlled failure is more valuable here than an unexplained fast number.
 
 ## The idea
 

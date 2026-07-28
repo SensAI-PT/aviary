@@ -75,22 +75,50 @@ lo rende possibile. Non noleggiare intelligenza dietro un'API, ma possederla,
 analizzarla, misurarla e migliorarla. Il motore resta volutamente abbastanza piccolo
 perché la prossima ottimizzazione utile possa arrivare da chiunque sia disposto a misurarla.
 
-## Punti di forza tecnici
+## Tecniche fondamentali e risultati misurati
 
 - **Una gerarchia, non una soglia di memoria.** VRAM, RAM e NVMe sono livelli di
   piazzamento degli stessi pesi; poca memoria veloce cambia la velocità, non il modello.
 - **Un JIT per i pesi.** Il calore di routing misurato alimenta una LRU per layer,
   un hot-store appreso e il prefetch del layer successivo senza caricare tutti gli expert.
+  Aiuta sui carichi ripetibili, ma la cronologia può sovradattarsi e il prefetch può
+  perdere su alcuni host: sono policy da misurare, non promesse.
 - **L'I/O fa parte del motore.** Unione degli expert per batch, letture sovrapposte
-  al calcolo, `O_DIRECT` e striping pesato su due SSD ottimizzano direttamente lo streaming.
+  al calcolo, `O_DIRECT` e striping pesato su due SSD ottimizzano direttamente lo
+  streaming. `O_DIRECT` dipende dal disco e il doppio SSD richiede più A/B end-to-end.
 - **Esecuzione eterogenea.** CPU, CUDA, Metal, memoria NUMA e residenza parziale o
-  completa degli expert condividono un runtime e si combinano in base alla macchina.
+  completa degli expert condividono un runtime; la combinazione utile dipende da
+  calcolo, banda, residenza e carico.
 - **Stato compresso senza cambiare modello.** Validazione token-exact, stato MLA KV
   57× più piccolo, conversazioni persistenti e DSA fedele vincolano l'ottimizzazione
-  alla correttezza.
+  alla correttezza. Sono proprietà di memoria, latenza e correttezza, non una
+  promessa generale di throughput.
 - **La speculazione deve meritarsi il costo.** MTP nativo e draft vincolati da
   grammatica sono misurati end-to-end e si disattivano quando l'accettazione non
   ripaga la verifica.
+
+## Ipotesi aperte, esperimenti e partecipazione
+
+Colibrì considera ogni ottimizzazione un'ipotesi finché un A/B end-to-end
+controllato non dimostra il contrario. Le domande principali sono:
+
+| ipotesi | evidenza attuale | esperimento ancora necessario |
+|---|---|---|
+| La cronologia di routing può piazzare gli expert meglio di una semplice LRU | i pin appresi migliorano carichi ripetuti, ma possono sovradattarsi al prompt | A/B cross-session su set esclusi: codice, chat, multilingua e contesti lunghi |
+| Più SSD possono trasformare banda indipendente in velocità di decode | routing pesato mirror/split implementato e validato; il modello di banda è solido | GLM-5.2 a cache fredda, uno contro due dischi su controller indipendenti reali |
+| Un planner hardware-aware può avvicinarsi automaticamente alla configurazione migliore | oggi rileva budget RAM/VRAM e diversi backend | confrontare il piano generato con sweep controllati su laptop, workstation, NUMA e multi-GPU |
+| Rappresentazioni lossless o a qualità limitata possono ridurre abbastanza il movimento dei pesi | esistono ablation di formato e quantizzazione con gate di qualità | riprodurre insieme qualità, byte mossi, latenza e costo per token utile, non solo il rapporto di compressione |
+| La speculazione routing-aware può convenire prima della residenza quasi completa | MTP e draft grammaticali funzionano, ma MTP ha anche perso il 32% intorno all'85% di expert hit | mappare il pareggio tra accettazione, hit rate, batch union e profondità del draft |
+| La sovrapposizione CPU/GPU può nascondere trasferimenti e sincronizzazione | esistono risultati positivi CUDA e Metal, ma CPU veloci e bassa residenza possono annullarli | profili per fase e A/B a variabile singola su PCIe, memoria unificata e piena residenza |
+
+Per contribuire, scegli una riga e pubblica anche i risultati negativi. Registra
+hardware, commit, container del modello, comando esatto, prompt, stato cache,
+throughput, TTFT, expert hit, byte letti e controllo qualità; cambia una sola
+variabile, ripeti e allega i log grezzi. Parti da
+[CONTRIBUTING.md](CONTRIBUTING.md), confronta il
+[protocollo di benchmark](docs/benchmarks.md), quindi
+[apri una issue di esperimento](https://github.com/JustVugg/colibri/issues/new).
+Un fallimento controllato vale più di un numero veloce senza spiegazione.
 
 ## L'idea
 
