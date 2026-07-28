@@ -1509,7 +1509,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
-        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        /* strnlen+memcpy come al load fmt-aware (#484): gcc -Wformat-truncation
+         * vede nm[k] a indice variabile come l'intero nm[3][] e segnala 863>320 */
+        { size_t n=strnlen(nm[k],sizeof(nm[k])); memcpy(qn,nm[k],n); memcpy(qn+n,".qs",4); }
+        tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ if(fatal) st_die_missing(&m->S,nm[k]);   /* #586: diagnose, don't just name it */
                             fprintf(stderr,"missing %s\n",nm[k]); return -1; }
     }
