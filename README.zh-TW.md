@@ -6,11 +6,16 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
 </p>
 
-**小巧引擎，龐大模型。**只要約 25 GB 記憶體，就能在消費級電腦上執行 **GLM-5.2（744B 參數的 MoE）**——以零相依套件的純 C 實作，從硬碟串流載入專家。
+**小巧引擎，龐大模型。**在消費級與異質硬體上探索 **GLM-5.2（744B 參數的
+MoE）**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-Colibrì 是一套輕量、維持品質的 MoE 執行環境，將 VRAM、RAM
-與儲存裝置視為統一管理的記憶體階層。高速記憶體不足可能降低速度，
-但預設策略**絕不會在未告知的情況下改變模型精度或路由語意**。
+> **Colibrì 是一個實驗性推論引擎與研究平台。**它的首要目標是在完整的軟硬體邊界上
+> 追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、推測解碼以及
+> CPU/GPU 重疊執行——讓大型模型減少對稀缺硬體的依賴，並降低執行成本。
+
+Colibrì 刻意用於驗證激進的系統構想，而不是提供 SLA 的生產執行環境。實驗必須透過
+可重現的端到端測量證明價值；預設策略**絕不會在未告知的情況下改變模型精度或路由語意**。
+高速記憶體不足可以降低速度，但不能悄悄重新定義模型。
 
 ```
 $ ./coli chat
@@ -42,6 +47,20 @@ VRAM／RAM／硬碟層級長條，以及角落的即時迷你大腦。</em></p>
 <p align="center"><em><strong>圖譜（Atlas）</strong>頁面：將<a href="https://github.com/JustVugg/colibri/issues/175">實測專家圖譜</a>
 呈現為 3D 星系——共 13,260 個已分析專家，其中 1,041 個可重現的專門專家會按主題聚集
 （詩歌、法律、中文、SQL……）。位置取自實測路由親和度，而非學習出的嵌入向量。拖曳即可旋轉。</em></p>
+
+## 研究使命
+
+前沿模型推論不該預設要求資料中心級硬體。Colibrì 的研究目標很簡單：
+**最佳化證據顯示受限的每一段推論路徑，降低推論的硬體依賴與總成本**。
+
+這包括改變權重的表示與移動方式，決定哪些內容常駐 VRAM、RAM 或儲存，重疊異質運算，
+降低啟動與同步開銷，利用稀疏性與重用，並驗證新的解碼演算法。傳統做法不是免責理由，
+微基準快也不是採用理由；最終依據是在真實機器上的端到端推論，同時測量正確性、品質、
+吞吐、延遲、記憶體與成本。
+
+它最終帶來的是可及性：在既有硬體上執行 744B 模型，即時觀察每個專家，並直接修改實作。
+不是從 API 租用智慧，而是持有、探測、測量和改進它。引擎刻意維持足夠小，讓任何願意測量
+的人都可能貢獻下一項有效最佳化。
 
 ## 核心概念
 
@@ -176,12 +195,16 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 ### 2. 取得模型
 
 Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使用
-**含 int8 MTP head 的版本**。它約為 **372 GB**，請放在空間足夠的硬碟上，最好是快碟：
+**含 int8 MTP head 的 group-scaled（gs64）版本**。它約為 **372 GB**，請放在空間足夠的硬碟上，最好是快碟：
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
-> ⚠️ 原始鏡像使用 int4 MTP head → 草稿接受率為 0%
->（[#8](https://github.com/JustVugg/colibri/issues/8)）。請檢查你的版本：
+> ⚠️ 請使用上面的 **gs64** 容器，不要使用較舊的 per-row int4 鏡像
+>（`mateogrgic/…`、`jlnsrk/…`）：後者品質實測低約 9 個百分點，也是
+> [#455](https://github.com/JustVugg/colibri/issues/455) 最初 think-mode 迴圈與生成不終止的根因。
+> gs64 修復了受控的 per-row A/B 問題，但不是通用的重複或 EOS starvation 防護。
+> MTP head 也必須是 **int8，而非 int4**（int4 的草稿接受率為 0%，
+> [#8](https://github.com/JustVugg/colibri/issues/8)）：
 > `ls -l <model>/out-mtp-*`——正確的 int8 大小為 `3527131672 / 5366238584 / 1065950496`。
 
 你也可以自行從 FP8 來源轉換——只需一條可續傳的指令，且任何時候都不需要
@@ -216,6 +239,15 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
 | OpenAI 相容 API、KV slots、網頁儀表板 | [docs/api.md](docs/api.md) |
 | 文法強制草稿（結構化輸出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | 環境變數完整清單 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+
+## 下一步
+
+- **推論系統研究就是產品。**目前階層採用 LRU 與學習型固定集；正在研究模型格式、壓縮、
+  配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
+  和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
+- **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
+  GLM-5.2 與 OLMoE 目前可用；**Kimi K2**、**Qwen3 MoE**、**MiniMax** 等開放權重模型
+  已列入路線圖。
 
 ## 支持專案
 

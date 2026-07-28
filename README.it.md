@@ -6,12 +6,21 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
-**Motore piccolo, modello immenso.** Esegui **GLM-5.2 (744 miliardi di parametri, MoE)** su un computer consumer con ~25 GB di RAM — in C puro, zero dipendenze, caricando gli expert dal disco in streaming.
+**Motore piccolo, modello immenso.** Esplora **GLM-5.2 (MoE da 744 miliardi di
+parametri)** su hardware consumer ed eterogeneo — in C puro, senza dipendenze
+del motore, trattando storage, RAM e VRAM come un'unica gerarchia di inferenza.
 
-Colibrì è un runtime MoE leggero e che preserva la qualità: tratta VRAM, RAM e
-disco come un'unica gerarchia di memoria gestita. Se la memoria veloce non basta
-il modello rallenta, ma la policy predefinita **non cambia mai silenziosamente la
-precisione del modello né la semantica del router**.
+> **Colibrì è un motore di inferenza sperimentale e una piattaforma di ricerca.**
+> Il suo obiettivo principale è migliorare le prestazioni di inferenza lungo
+> l'intero confine software/hardware — formati dei modelli, gerarchia di memoria,
+> I/O dello storage, piazzamento, scheduling, kernel, speculazione e sovrapposizione
+> CPU/GPU — affinché i grandi modelli dipendano meno da hardware raro e costino meno.
+
+Colibrì è intenzionalmente un luogo dove verificare idee di sistema aggressive,
+non un runtime di produzione con SLA. Gli esperimenti devono dimostrare il proprio
+valore con misure end-to-end riproducibili; la policy predefinita **non cambia mai
+silenziosamente la precisione del modello né la semantica del router**. Una memoria
+veloce insufficiente può ridurre la velocità, ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
@@ -45,6 +54,26 @@ tematica misurata</a> dell'expert.</em></p>
 misurato degli expert</a> come una galassia 3D — 13.260 expert caratterizzati, 1.041 specialisti
 replicabili che si raggruppano per argomento (poesia, legge, cinese, SQL…). La posizione deriva
 dall'affinità di routing misurata, non da un embedding appreso. Trascinare per ruotare.</em></p>
+
+## La missione di ricerca
+
+L'inferenza di frontiera non dovrebbe richiedere per forza hardware da datacenter.
+L'obiettivo di Colibrì è semplice: **ridurre la dipendenza dall'hardware e il costo
+totale dell'inferenza, ottimizzando ogni parte del percorso che le misure indicano
+come limitante**.
+
+Questo comprende cambiare il modo in cui i pesi sono rappresentati e spostati,
+decidere cosa risiede in VRAM, RAM o storage, sovrapporre calcolo eterogeneo,
+ridurre i costi di avvio e sincronizzazione, sfruttare sparsità e riuso e verificare
+nuovi algoritmi di decoding. La convenzione non protegge una tecnica; un microbenchmark
+veloce non basta ad adottarla. Decide l'inferenza end-to-end su macchine reali,
+misurando correttezza e qualità insieme a throughput, latenza, memoria e costo.
+
+Il risultato pratico è l'accessibilità: eseguire un modello da 744B sull'hardware
+che già possiedi, osservare ogni expert in tempo reale e modificare il codice che
+lo rende possibile. Non noleggiare intelligenza dietro un'API, ma possederla,
+analizzarla, misurarla e migliorarla. Il motore resta volutamente abbastanza piccolo
+perché la prossima ottimizzazione utile possa arrivare da chiunque sia disposto a misurarla.
 
 ## L'idea
 
@@ -194,14 +223,20 @@ resta in `c/` — è un'installazione editabile dal clone, non un wheel).
 
 ### 2. Scarica il modello
 
-Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — **usa la
-versione con le teste MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
+Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — usa la build
+**group-scaled (gs64) con la testa MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
 disco che abbia lo spazio, meglio se veloce:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
-> ⚠️ Il mirror originale contiene teste MTP int4 → accettazione dei draft allo 0%
-> ([#8](https://github.com/JustVugg/colibri/issues/8)). Verifica la tua versione:
+> ⚠️ Usa il container **gs64** qui sopra, non i vecchi mirror int4 per-row
+> (`mateogrgic/…`, `jlnsrk/…`): misurano circa 9 punti percentuali in meno sulla
+> qualità e causavano i loop in think-mode e le generazioni senza termine originali
+> di [#455](https://github.com/JustVugg/colibri/issues/455). Il container gs64 ha
+> corretto quegli A/B per-row controllati, ma non è una protezione generale contro
+> ripetizioni o EOS starvation. Anche la testa MTP deve essere **int8, non int4**
+> (int4 → 0% di accettazione dei draft,
+> [#8](https://github.com/JustVugg/colibri/issues/8)):
 > `ls -l <modello>/out-mtp-*` — int8 (corretto) è `3527131672 / 5366238584 / 1065950496`.
 
 Oppure converti tu stesso dalla sorgente FP8 — un unico comando riprendibile che
@@ -237,6 +272,19 @@ e per il gateway API opzionale.
 | API compatibile OpenAI, KV slot, dashboard web | [docs/api.md](docs/api.md) |
 | Draft forzati da grammatica (output strutturato) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Inventario delle variabili d'ambiente | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+
+## Prossimi passi
+
+- **La ricerca sui sistemi di inferenza è il prodotto.** La gerarchia attuale usa
+  LRU e un insieme appreso di expert fissati; il lavoro attivo copre formati,
+  compressione, piazzamento, scheduling, I/O, kernel CPU/GPU, sovrapposizione
+  eterogenea, stato KV e speculazione consapevole del routing. L'obiettivo è
+  ridurre i requisiti hardware e il costo per token utile, con risultati misurati
+  end-to-end, revisionati e sviluppati apertamente.
+- **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
+  qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
+  GLM-5.2 e OLMoE funzionano già; **Kimi K2**, **Qwen3 MoE** e **MiniMax** sono
+  nella roadmap.
 
 ## Sostenere il progetto
 
