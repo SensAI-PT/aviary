@@ -12,12 +12,22 @@
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
-**Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
+**Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a
+consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by
+streaming experts from disk.
 
-Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM, RAM,
-and storage as one managed memory hierarchy. Insufficient fast memory may reduce
-speed, but the default policy **never silently changes model precision or router
-semantics**.
+> **Colibrì is an experimental inference engine and research platform.** Its
+> primary goal is to pursue inference-side performance across the entire
+> software/hardware boundary — model formats, memory hierarchy, storage I/O,
+> placement, scheduling, kernels, speculation, and CPU/GPU overlap — so large
+> models depend less on scarce hardware and cost less to run.
+
+Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy. It is
+deliberately a place to test aggressive systems ideas, not a production runtime
+with an SLA. Experiments must earn their place through reproducible end-to-end
+measurements, and the default policy **never silently changes model precision
+or router semantics**. Insufficient fast memory may reduce speed; it must not
+quietly redefine the model.
 
 ```
 $ ./coli chat
@@ -50,15 +60,26 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
 (poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
 
-## The vision
+## The research mission
 
-Frontier models should not be sealed inside datacenters. colibrì exists so that
-**anyone curious enough can open one up**: run a 744B-parameter mind on hardware
-you already own, watch every expert fire in real time, and change the code that
-does it. Not renting intelligence behind an API — *holding* it: probing it,
-measuring it, improving it. Every optimisation in this project started with
-someone measuring something on their own machine; the engine is deliberately
-small enough that the next one can come from you.
+Frontier inference should not require datacenter-class hardware by default.
+Colibrì's research target is simple: **reduce the hardware dependency and total
+cost of inference by optimizing every part of the inference path that evidence
+shows is limiting it**.
+
+That includes changing how weights are represented and moved, deciding what
+lives in VRAM, RAM, or storage, overlapping heterogeneous compute, reducing
+launch and synchronization overhead, exploiting sparsity and reuse, and testing
+new decoding algorithms. Nothing is protected merely because it is conventional;
+nothing is adopted merely because a microbenchmark looks fast. The deciding
+result is end-to-end inference on real machines, with correctness and quality
+measured alongside throughput, latency, memory, and cost.
+
+The practical consequence is accessibility: run a 744B-parameter model on
+hardware you already own, watch every expert fire in real time, and change the
+code that does it. Not renting intelligence behind an API — *holding* it:
+probing it, measuring it, improving it. The engine is deliberately small enough
+that the next useful optimization can come from anyone willing to measure it.
 
 ## The idea
 
@@ -244,9 +265,10 @@ so put it on a disk with the room, ideally a fast one:
 
 > ⚠️ Use the **gs64** container above, not the older per-row int4 mirrors
 > (`mateogrgic/…`, `jlnsrk/…`): those measure ~9pp worse on quality and are the
-> root cause of the think-mode loops and never-terminating generations in
-> [#455](https://github.com/JustVugg/colibri/issues/455) — the gs64 container
-> cured every failing case there. The MTP head must also be **int8, not int4**
+> root cause of the original think-mode loops and never-terminating generations
+> in [#455](https://github.com/JustVugg/colibri/issues/455). The gs64 container
+> fixed those controlled per-row A/Bs, but it is not a general repetition or
+> EOS-starvation guard. The MTP head must also be **int8, not int4**
 > (int4 → 0% draft acceptance, [#8](https://github.com/JustVugg/colibri/issues/8)):
 > `ls -l <model>/out-mtp-*` — int8 (correct) is `3527131672 / 5366238584 / 1065950496`.
 
@@ -287,11 +309,12 @@ and the optional API gateway.
 
 ## What's next
 
-- **Algorithmic research is active.** The current hierarchy is LRU + a learned
-  pin set; the next step is under way — smarter placement and scheduling,
-  overlap of CPU and GPU expert execution, and routing-aware speculation.
-  Everything lands the way this project always works: measured, reviewed, and
-  merged in the open.
+- **Inference-systems research is the product.** The current hierarchy is LRU +
+  a learned pin set; active work spans model formats, compression, placement,
+  scheduling, I/O, CPU/GPU kernels, heterogeneous overlap, KV state, and
+  routing-aware speculation. The objective is lower hardware requirements and
+  lower cost per useful token. Everything lands the way this project works:
+  measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
   routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
   support for more open-weight families — **Kimi K2** (Moonshot AI),
