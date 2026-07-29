@@ -36,6 +36,25 @@ ceiling showed up on a disk-streaming host, where the extra rows also widen the
 per-forward expert union and cost LRU hit rate. Treat the forward count as the
 thing being optimized and measure wall clock separately.
 
+## When this helps, and when it does not
+
+Read the two numbers above as a **best case, not a general speed-up**: they come
+from replaying a prompt whose generation is already in the corpus, so nearly
+every step has a long suffix to match. That is the shape of a benchmark replay,
+a regression harness, or a workload that answers the same questions repeatedly.
+
+On genuinely novel text the corpus has nothing to propose, drafts fall back to
+MTP/n-gram, and the gain approaches zero (the lookup itself is cheap, but it is
+not free). A general chat assistant answering new questions is the case where
+this buys the least. The feature is opt-in for exactly that reason — unset
+`COLI_DRAFT_CORPUS` and nothing about decoding changes.
+
+Related: deep drafts from this source are what surfaced
+[#689](https://github.com/JustVugg/colibri/issues/689) — speculative verify
+batches at `S>=8` diverging from the unbatched path by a near-tie token on CUDA.
+That is a separate, open bug in the verify path rather than in this draft
+source, but a large `COLI_DRAFT_CORPUS` hit rate is the easiest way to reach it.
+
 Drafts that are *rejected* cost real time, so the source pauses itself below
 `COLI_CORPUS_MINACC` acceptance (default 50%, the measured break-even: 90%
 acceptance gave +22%, 19% gave −25%). A prompt with no relation to the corpus
