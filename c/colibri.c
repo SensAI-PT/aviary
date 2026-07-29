@@ -4524,6 +4524,53 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
 /* METODO E — prompt-lookup: cerca l'occorrenza piu' recente dell'ultimo bigramma nel
  * contesto e propone i token che la seguirono. Zero pesi extra, zero costo: e' solo
  * un'ipotesi che il modello verifichera'. */
+/* ---- CORPUS DRAFTS (REST-style external draft source) ----------------------
+ * COLI_DRAFT_CORPUS=<file>  whitespace-separated token ids of past generations
+ *                           (build one with TOKENS=1, which already dumps them)
+ * COLI_CORPUS_K=n           proposal depth, default 8 (cap 48: batch[64] in spec_decode)
+ * Proposals come from the longest suffix of the live context that also occurs in
+ * the corpus; the engine's existing verification accepts only what it would have
+ * generated anyway, so output stays byte-identical (lossless by construction).
+ * Unlike MTP (1 token/forward) a corpus hit proposes a whole span at once. */
+static int *g_corp=NULL; static long g_corp_n=0; static int g_corp_k=0;
+static uint64_t g_corp_prop=0, g_corp_acc=0;
+static void corpus_load(void){
+    const char *p=getenv("COLI_DRAFT_CORPUS");
+    if(!p||!*p) return;
+    FILE *f=fopen(p,"rb");
+    if(!f){ fprintf(stderr,"[CORPUS] cannot open %s\n",p); return; }
+    long cap=1<<16; g_corp=malloc((size_t)cap*sizeof(int)); g_corp_n=0;
+    int v;
+    while(g_corp && fscanf(f,"%d",&v)==1){
+        if(g_corp_n>=cap){ cap*=2; int *n2=realloc(g_corp,(size_t)cap*sizeof(int));
+            if(!n2){ free(g_corp); g_corp=NULL; break; } g_corp=n2; }
+        g_corp[g_corp_n++]=v;
+    }
+    fclose(f);
+    if(!g_corp){ g_corp_n=0; fprintf(stderr,"[CORPUS] OOM\n"); return; }
+    g_corp_k=getenv("COLI_CORPUS_K")?atoi(getenv("COLI_CORPUS_K")):8;
+    if(g_corp_k<1) g_corp_k=1;
+    if(g_corp_k>48) g_corp_k=48;
+    fprintf(stderr,"[CORPUS] %ld ids from %s (draft depth %d)\n",g_corp_n,p,g_corp_k);
+}
+static int corpus_draft(const int *ctx, int nctx, int *out, int k, int minn, int maxn){
+    /* il minimo utile e' un match di `minn` piu' ALMENO un token da proporre:
+     * sotto quella soglia non esiste proposta possibile (#test_corpus_draft) */
+    if(!g_corp||g_corp_n<(long)minn+1||nctx<minn||k<1) return 0;
+    for(int n=maxn;n>=minn;n--){
+        if(n>nctx) continue;
+        const int *suf=ctx+nctx-n;
+        for(long i=g_corp_n-n-1;i>=0;i--){
+            int ok=1;
+            for(int j=0;j<n;j++) if(g_corp[i+j]!=suf[j]||g_corp[i+j]<0){ ok=0; break; }
+            if(!ok) continue;
+            int g=0;
+            for(int j=0;j<k && i+n+j<g_corp_n && g_corp[i+n+j]>=0;j++) out[g++]=g_corp[i+n+j];
+            if(g>0) return g;
+        }
+    }
+    return 0;
+}
 static int ngram_draft(const int *ids, int len, int G, int *draft){
     if(len<4 || G<1) return 0;
     int a=ids[len-2], b=ids[len-1];
@@ -4758,6 +4805,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
+    uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
@@ -4770,6 +4818,31 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                                                          * forza, l'acceptance e' ~1 (#48) */
             g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
+        }
+        if(!g && g_corp && g_corp_k>0){                 /* corpus: uno span intero per forward
+                                                         * dove il contesto ricalca il congelato */
+            /* Guard di accettazione (stessa forma di quello MTP sopra, soglia diversa).
+             * Un draft di corpus RIFIUTATO costa piu' di uno MTP: la verifica batcha
+             * 1+K righe e in un MoE ogni riga attiva i propri expert, quindi lo spreco
+             * scala con la profondita'. Misurato su GLM-5.2/H200: 90% acceptance =
+             * +22% decode, 19% = -25% (il break-even sta circa a meta'). Sotto
+             * COLI_CORPUS_MINACC (default 50%) la fonte si mette in pausa. */
+            if(cp_pause>0){ cp_pause--; if(!cp_pause){ cp_prop0=g_corp_prop; cp_acc0=g_corp_acc; } }
+            else {
+                uint64_t pw=g_corp_prop-cp_prop0, aw=g_corp_acc-cp_acc0;
+                int minacc=getenv("COLI_CORPUS_MINACC")?atoi(getenv("COLI_CORPUS_MINACC")):50;
+                if(minacc<0) minacc=0; if(minacc>100) minacc=100;
+                if(pw>=24 && aw*100 < pw*(uint64_t)minacc){
+                    fprintf(stderr,"[CORPUS] %.0f%% acceptance over the last %llu proposals (<%d%%): "
+                            "drafts paused for %d tokens\n",
+                            100.0*aw/pw,(unsigned long long)pw,minacc,(int)GUARD_PAUSE_TOKENS);
+                    cp_pause=GUARD_PAUSE_TOKENS;
+                }
+            }
+            if(!cp_pause){
+                g=corpus_draft(all,kv+1,draft,g_corp_k,3,8);
+                if(g>0){ gsrc=3; g_corp_prop+=(uint64_t)g; }
+            }
         }
         if(!g && g_draft>0 && m->has_mtp){
             /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
@@ -4810,6 +4883,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
+        else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
@@ -5215,6 +5289,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
+    if(g_corp_prop) printf("corpus drafts: %.0f%% acceptance (%llu/%llu proposed from %ld frozen ids)\n",
+        100.0*g_corp_acc/g_corp_prop, (unsigned long long)g_corp_acc,
+        (unsigned long long)g_corp_prop, g_corp_n);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
     if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
@@ -6903,6 +6980,7 @@ int main(int argc, char **argv){
     if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
+    corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));

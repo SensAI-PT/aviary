@@ -137,6 +137,9 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `GRAMMAR` | unset | Path to a GBNF grammar file to constrain generation. Takes precedence over `SCHEMA`. |
 | `SCHEMA` | unset | Path to a JSON-Schema file compiled to GBNF to constrain generation (consulted only when `GRAMMAR` is empty). |
 | `GRAMMAR_DRAFT` | unset | Max grammar-forced draft span length. |
+| `COLI_DRAFT_CORPUS` | unset | Path to a file of frozen token ids (whitespace-separated, `-1` separates spans) used as a speculative draft source: the engine proposes the continuation that followed the longest suffix of the live context found in the corpus. Off when unset. Build one from any run with `TOKENS=1`. See [corpus-draft.md](corpus-draft.md). |
+| `COLI_CORPUS_K` | `8` (max 48) | Proposal depth for `COLI_DRAFT_CORPUS`. Deeper raises the forward multiplier and the per-forward cost. |
+| `COLI_CORPUS_MINACC` | `50` | Acceptance floor (percent) for the corpus source. Below it over a 24-proposal window the source pauses for 256 tokens, then re-arms — rejected drafts cost real time. |
 | `EXPERT_BUDGET` | `0` (off) | Cap experts loaded per layer (MoE-Spec). **Quarantined:** silently forced to `0` unless `EXPERT_BUDGET_EXPERIMENTAL` is set — every tested value is either no faster or incoherent (issue #303). |
 | `EXPERT_BUDGET_EXPERIMENTAL` | unset | Setting it (any value) allows `EXPERT_BUDGET>0` to actually take effect (expect garbage, #294). |
 | `DSA` | on | Dynamic Sparse Attention indexer. `DSA=0` disables. |
