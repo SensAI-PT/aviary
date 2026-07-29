@@ -361,6 +361,41 @@ On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
+#### The same commands run any of the models
+
+`coli` reads the model's `config.json`, picks the matching engine binary, and
+renders that family's chat template — so **nothing about the command line
+changes between models**. Build the engine you want once, then just point
+`COLI_MODEL` at the right directory:
+
+```bash
+make -C c glm                                     # GLM-5.2
+make -C c inkling                                 # Inkling
+make -C c kimi_k3                                 # Kimi K3
+
+COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
+COLI_MODEL=/nvme/inkling_i4    ./coli chat
+COLI_MODEL=/nvme/kimi_k3       ./coli chat
+
+./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/kimi_k3
+./coli serve --model /nvme/inkling_i4             # API only
+```
+
+For the non-GLM engines `coli chat` starts the gateway locally and attaches the
+TUI to it, so the TUI, the API and the dashboard all go through the same
+arch-aware chat template — you never have to pass the template yourself.
+
+Two things that differ per model, both documented in the per-model page:
+
+- **Inkling on a RAM-tight host** needs the int4 dense container and a small
+  expert cache: `./coli chat --model /nvme/inkling_i4 --cap 2`
+  (see [inkling.md](docs/inkling.md) — the default `--cap 8` wants ~14 GB of
+  cache on top of the resident set).
+- **Kimi K3** streams its MXFP4 experts from the original checkpoint, so there
+  is nothing to convert — but the snapshot is ~1.6 TB
+  (see [kimi_k3.md](docs/kimi_k3.md)).
+
 ### 4. Go deeper
 
 | topic | doc |
