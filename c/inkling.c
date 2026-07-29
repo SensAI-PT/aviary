@@ -120,6 +120,7 @@ typedef struct {
     uint32_t **eusage;                    /* per-layer expert selection counts */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
+    uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
@@ -136,6 +137,9 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
+/* TOPP=p (0..1): top-p adattivo sui routed — tieni gli esperti fino al peso
+ * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
+static float g_topp = 0.f;
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -1062,6 +1066,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     matmul(logits, x, l->router, S, D, ET);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     int   *idx  = malloc((size_t)S*K*sizeof(int));
+    int   *keff = malloc((size_t)S*sizeof(int));      /* routed effettivi per token (TOPP) */
     float *wgt  = malloc((size_t)S*(K+ns)*sizeof(float));
     Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
@@ -1087,6 +1092,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[si[kk]]); sum += w[kk]; }
         for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);    sum += w[K+j]; }
         for (int kk = 0; kk < K+ns; kk++) w[kk] *= c->route_scale * l->rgs / sum;
+        /* TOPP: tieni i routed fino al peso cumulato p, scarta la coda. Stessa
+         * semantica di colibri.c (g_topp) e kimi_k3.c (K3_TOPP): NON rinormalizza,
+         * il peso scartato semplicemente non contribuisce. E' una leva di QUALITA'
+         * — cambia il calcolo — quindi opt-in e annunciata all'avvio.
+         * Su questo motore vale piu' che sugli altri: Inkling e' limitato dal disco
+         * (topk=6 x 28 MB di esperto x 66 layer ~ 11 GB letti per token), e ogni
+         * esperto scartato e' un esperto NON letto.
+         * L'ordine di si[] segue sigmoid(logit)+bias mentre il peso e' sigmoid(logit)
+         * senza bias, quindi i pesi non sono garantiti decrescenti: si riordina la
+         * coppia (peso, id) prima di tagliare, come fa colibri.c. */
+        keff[s] = K;
+        m->ereq += K;
+        if (g_topp > 0.f && g_topp < 1.f) {
+            for (int a = 1; a < K; a++) { int ii = si[a]; float ww = w[a]; int b = a-1;
+                while (b >= 0 && w[b] < ww) { w[b+1] = w[b]; si[b+1] = si[b]; b--; }
+                w[b+1] = ww; si[b+1] = ii; }
+            float tot = 1e-20f; for (int kk = 0; kk < K; kk++) tot += w[kk];
+            float cum = 0;
+            for (int kk = 0; kk < K; kk++) { cum += w[kk];
+                if (cum >= g_topp * tot) { keff[s] = kk+1; break; } }
+        }
+        m->euse += keff[s];
     }
     /* Il ciclo sotto ACQUISISCE uno slot per ogni coppia (token, esperto) e ne tiene
      * il puntatore fino al calcolo. slot_acquire evince l'LRU quando la cache e'
@@ -1110,6 +1137,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         nfill = 0;
         for (int64_t t = base; t < end; t++) {           /* acquisizione del giro */
             int s = (int)(t / K), kk = (int)(t % K);
+            if (kk >= keff[s]) { use[t - base] = NULL; continue; }   /* scartato da TOPP */
             int eid = idx[(int64_t)s*K + kk];
             if (m->eusage[layer]) m->eusage[layer][eid]++;
             Slot *e = slot_find(m, layer, eid);
@@ -1130,10 +1158,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         double te = now_s();
         for (int64_t t = base; t < end; t++) {            /* calcolo + accumulo */
             int s = (int)(t / K), kk = (int)(t % K);
+            Slot *e = use[t - base];
+            if (!e) continue;                              /* scartato da TOPP */
             const float *xs = x + (int64_t)s*D;
             float *os = out + (int64_t)s*D;
             float *w = wgt + (int64_t)s*(K+ns);
-            Slot *e = use[t - base];
             if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
@@ -1173,7 +1202,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_shared += now_s() - ts;
     }
-    free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
+    free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
     free(g); free(hh);              /* u aliases g+I */
 }
 
@@ -1563,6 +1592,14 @@ int main(int argc, char **argv) {
 #endif  /* !COLI_CUDA */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
+    if (g_topp > 0.f && g_topp < 1.f)
+        fprintf(stderr, "[TOPP] %.2f: routed experts kept to cumulative weight — "
+                "fewer experts read per token, but the routing is TRIMMED "
+                "(quality lever, A/B it before trusting the speed-up)\n", g_topp);
+    else if (g_topp != 0.f) {
+        fprintf(stderr, "TOPP must be in (0,1); %.3f ignored\n", g_topp); g_topp = 0.f;
+    }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
     int cap = -1, bits = 0, n_new = 256, npos = 0, chat = 0;
@@ -1634,6 +1671,13 @@ int main(int argc, char **argv) {
                tot ? 100.0*m.hits/tot : 0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss,
                saved ? " | usage history saved" : "");
+        /* quanto ha tagliato TOPP, in modo che la leva sia misurabile e non creduta */
+        if (g_topp > 0.f && m.ereq)
+            printf("[topp] %.2f: %llu/%llu routed used (%.1f%% trimmed, "
+                   "%.2f experts/token avg)\n", g_topp,
+                   (unsigned long long)m.euse, (unsigned long long)m.ereq,
+                   100.0*(double)(m.ereq-m.euse)/(double)m.ereq,
+                   (double)m.euse/((double)m.ereq/(double)m.c.topk));
         return 0;
     }
 
