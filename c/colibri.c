@@ -6607,6 +6607,16 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
             m->resident_bytes/1e9,slack/1e9,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+#ifdef COLI_CUDA
+        /* #686: on a single GPU that also holds host copies of the VRAM tier, the
+         * thing inflating the resident set is often those copies rather than
+         * PIN_GB itself -- name the knob instead of leaving the user to find it. */
+        if(g_cuda_enabled && g_cuda_ndev==1 && !g_cuda_release_host &&
+           (g_cuda_expert_gb>0||g_cuda_expert_auto))
+            fprintf(stderr,"[RAM] the VRAM expert tier still has host copies in RAM "
+                "(CUDA_RELEASE_HOST=0 on a single GPU): CUDA_RELEASE_HOST=1 frees them for "
+                "the RAM tier and is what this topology usually wants (#686).\n");
+#endif
         if(g_mem_avail_boot>0 && peak > g_mem_avail_boot*1e9 &&
            !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
             fprintf(stderr,"[RAM] refusing to start: that peak also exceeds the %.1f GB actually "
@@ -6944,7 +6954,31 @@ int main(int argc, char **argv){
     g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
-    g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    /* CUDA_RELEASE_HOST default: ndev>1 was chosen when the host copy was the
+     * multi-GPU re-upload path. On a SINGLE GPU asked to fill RAM as well
+     * (PIN_GB=all, or a PIN_GB large enough that the two tiers compete), that
+     * default keeps a full host copy of every VRAM-tier expert and the RAM tier
+     * starves: measured on 1x H200 + 235 GB, 9,297 vs 14,951 resident experts and
+     * 1.10 vs 4.18-5.37 tok/s -- a 3.8x decode difference from one default (#686).
+     * The host copy is provably redundant there: releasing it still reloads from
+     * disk if CUDA later fails. So: keep ndev>1 exactly as before, and add the
+     * single-GPU + large-PIN_GB case. An explicit CUDA_RELEASE_HOST always wins. */
+    if(getenv("CUDA_RELEASE_HOST")) g_cuda_release_host=atoi(getenv("CUDA_RELEASE_HOST"));
+    else if(g_cuda_ndev>1)          g_cuda_release_host=1;          /* unchanged */
+    else if(g_cuda_enabled && (g_cuda_expert_gb>0||g_cuda_expert_auto)){
+        const char *pg=getenv("PIN_GB");
+        /* "large PIN_GB" = all, or >= the VRAM tier itself. Under CUDA_EXPERT_GB=auto
+         * the tier is sized to the whole card, so any explicit PIN_GB qualifies. */
+        if(pg&&*pg){
+            if(!strcmp(pg,"all")) g_cuda_release_host=1;
+            else { double p=atof(pg);
+                   if(p>0 && (g_cuda_expert_auto || p>=g_cuda_expert_gb)) g_cuda_release_host=1; }
+        }
+        if(g_cuda_release_host)
+            fprintf(stderr,"[CUDA] single-GPU with a large PIN_GB: releasing host copies of the "
+                           "VRAM tier so the RAM tier can use that memory (#686; "
+                           "CUDA_RELEASE_HOST=0 keeps them)\n");
+    }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
