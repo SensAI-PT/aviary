@@ -976,7 +976,11 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
-    tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    /* grouped_s4_wmma's body needs __CUDA_ARCH__>=750: on builds where the
+     * WMMA kernels are compiled out (COLI_HIP_NO_WMMA) the launch would
+     * succeed with an EMPTY kernel and the output buffer would silently keep
+     * stale data. Gate the branch like TC_W4A16 below does. */
+    tc=tc&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(tc){

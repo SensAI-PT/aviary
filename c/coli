@@ -183,8 +183,11 @@ def cuda_binary():
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("CUDA_EXPERT_GB",0))
+    def num(v):
+        try: return float(v)
+        except ValueError: return 0.0  # "auto": the planner sizes it; the engine reads the string itself
+    ram=a.ram or num(env.get("RAM_GB",0))
+    vram=a.vram or num(env.get("CUDA_EXPERT_GB",0))
     gpu=a.gpu
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
