@@ -46,6 +46,15 @@ float i8(uint word, int lane) {
 float i4(uint word, int lane) {
     return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
 }
+// fmt=7 MXFP4 (Kimi K3 experts): e2m1 nibble, bit3 = sign, LOW nibble = even
+// column (same packing order as i4). Scales arrive as f32 (host pre-expands
+// the ue8m0 exponents), one per 32-input group.
+float mx4(uint word, int lane) {
+    uint n = (word >> (uint(lane) * 4u)) & 0xfu;
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
 
 void main() {
     int s   = int(gl_WorkGroupID.y);
@@ -97,16 +106,22 @@ void main() {
                 }
                 sum += a * scale[sb + uint(g)];
             }
-        } else if (p.fmt == 4) { // grouped int4 (#298 semantics): nibble decode, one scale
-            // per gs inputs — gs % 8 == 0 (host-gated), so a packed word never straddles
-            // a group and its scale multiplies the 8-wide partial. Per-row scale must NOT run.
+        } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 (#298 semantics) or MXFP4:
+            // nibble decode, one scale per gs inputs — gs % 8 == 0 (host-gated), so a
+            // packed word never straddles a group and its scale multiplies the 8-wide
+            // partial. Per-row scale must NOT run.
             int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
             uint sb = uint(o) * uint(ng);
             for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
                 float a = 0.0;
-                for (int k = 0; k < 8; k++) { int i = i0 + k;
-                    if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * i4(pk, k); }
+                if (p.fmt == 4) {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * i4(pk, k); }
+                } else {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k;
+                        if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * mx4(pk, k); }
+                }
                 sum += a * scale[sb + uint(i0 / p.gs)];
             }
         } else { // int4
@@ -120,6 +135,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7) ? tot : tot * scale[o];
     }
 }
