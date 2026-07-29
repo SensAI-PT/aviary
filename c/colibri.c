@@ -296,6 +296,24 @@ static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
 }
+/* #687: a resident tensor that fails to upload is disabled PERMANENTLY and silently
+ * falls back to CPU. The per-tensor line below is easy to lose in a busy log, and the
+ * end state -- GPU fully allocated, ~0% useful -- reads as healthy. Count them and say
+ * it once, loudly, naming the knob that actually fixes it. */
+static int g_cuda_disabled_n;
+static void cuda_disabled_note(void){
+    enum { CUDA_DISABLED_LOUD_AT = 8 };
+    if(++g_cuda_disabled_n != CUDA_DISABLED_LOUD_AT) return;
+    fprintf(stderr,
+        "[CUDA] ***** %d resident tensors have been disabled and moved to CPU *****\n"
+        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is now\n"
+        "[CUDA] on CPU: this run will be at or below CPU speed while the card stays\n"
+        "[CUDA] allocated. The usual cause is the expert tier claiming all VRAM and\n"
+        "[CUDA] leaving nothing for the lazily-uploaded resident tensors.\n"
+        "[CUDA] Fix: set an explicit CUDA_EXPERT_GB below the auto value (leave room\n"
+        "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
+        CUDA_DISABLED_LOUD_AT);
+}
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
@@ -318,6 +336,11 @@ static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-wind
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    /* #687: say it again at the end -- by now the per-tensor lines are thousands of
+     * log lines back, and this is the number that explains a CPU-speed "GPU" run. */
+    if(g_cuda_disabled_n) fprintf(stderr,
+        "[CUDA] %d tensors ran on CPU after failed uploads: this run did NOT use the GPU for "
+        "them. Lower CUDA_EXPERT_GB (#687).\n", g_cuda_disabled_n);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -583,8 +606,10 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-            w->O,w->I,w->cuda_device);
+        if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+                w->O,w->I,w->cuda_device);
+        cuda_disabled_note();
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
