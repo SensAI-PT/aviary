@@ -183,7 +183,22 @@ HIP       ?= 0
 ROCM_HOME ?= /opt/rocm
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
 HIP_ARCH  ?= native
-HIPCCFLAGS ?= -O3 -std=c++17 -x hip --offload-arch=$(HIP_ARCH) -Wall -Wextra -fPIE
+# HIP_ARCH accepts a list (space- or comma-separated, e.g. "gfx906 gfx1030")
+# to fat-bundle several targets into one binary; COLI_GPUS picks at runtime.
+# `native` is resolved to the local GPUs' arch names HERE (not left to hipcc):
+# the NO_WMMA_ARCHS filter below must see real gfx names to know whether the
+# rocWMMA paths can compile at all. `override` beats command-line assignment.
+comma := ,
+override HIP_ARCH := $(subst $(comma), ,$(HIP_ARCH))
+ifeq ($(strip $(HIP_ARCH)),native)
+ifeq ($(HIP),1)
+override HIP_ARCH := $(shell $(ROCM_HOME)/bin/rocm_agent_enumerator 2>/dev/null | grep -v gfx000 | sort -u)
+ifeq ($(strip $(HIP_ARCH)),)
+$(error HIP_ARCH=native but rocm_agent_enumerator found no GPUs; set HIP_ARCH=gfxNNNN explicitly)
+endif
+endif
+endif
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra -fPIE
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
@@ -240,6 +255,23 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+# rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
+# headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
+# let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
+# reach both hipcc passes, hence a compile define, not an arch macro. If a
+# HIP_ARCH=native build dies inside rocwmma, set the arch explicitly.
+NO_WMMA_ARCHS = gfx803 gfx900 gfx902 gfx904 gfx906 gfx90c \
+                gfx1010 gfx1011 gfx1012 gfx1013 \
+                gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1103
+ifneq (,$(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)))
+HIPCCFLAGS += -DCOLI_HIP_NO_WMMA
+# The define must hold for every arch in the fat binary (host dispatch is
+# shared), so one incapable arch disables the WMMA kernels for all of them.
+# Loud, because on a WMMA-capable card that is a real capability loss.
+ifneq (,$(filter-out $(NO_WMMA_ARCHS),$(HIP_ARCH)))
+$(warning mixed HIP_ARCH list: $(filter $(HIP_ARCH),$(NO_WMMA_ARCHS)) cannot run rocWMMA -> tensor-core kernels disabled for ALL targets ($(HIP_ARCH)). Build separate binaries to keep WMMA on the capable card.)
+endif
+endif
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
