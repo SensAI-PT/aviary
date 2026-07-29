@@ -296,6 +296,24 @@ static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
 }
+/* #687: a resident tensor that fails to upload is disabled PERMANENTLY and silently
+ * falls back to CPU. The per-tensor line below is easy to lose in a busy log, and the
+ * end state -- GPU fully allocated, ~0% useful -- reads as healthy. Count them and say
+ * it once, loudly, naming the knob that actually fixes it. */
+static int g_cuda_disabled_n;
+static void cuda_disabled_note(void){
+    enum { CUDA_DISABLED_LOUD_AT = 8 };
+    if(++g_cuda_disabled_n != CUDA_DISABLED_LOUD_AT) return;
+    fprintf(stderr,
+        "[CUDA] ***** %d resident tensors have been disabled and moved to CPU *****\n"
+        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is now\n"
+        "[CUDA] on CPU: this run will be at or below CPU speed while the card stays\n"
+        "[CUDA] allocated. The usual cause is the expert tier claiming all VRAM and\n"
+        "[CUDA] leaving nothing for the lazily-uploaded resident tensors.\n"
+        "[CUDA] Fix: set an explicit CUDA_EXPERT_GB below the auto value (leave room\n"
+        "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
+        CUDA_DISABLED_LOUD_AT);
+}
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
@@ -318,6 +336,11 @@ static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-wind
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    /* #687: say it again at the end -- by now the per-tensor lines are thousands of
+     * log lines back, and this is the number that explains a CPU-speed "GPU" run. */
+    if(g_cuda_disabled_n) fprintf(stderr,
+        "[CUDA] %d tensors ran on CPU after failed uploads: this run did NOT use the GPU for "
+        "them. Lower CUDA_EXPERT_GB (#687).\n", g_cuda_disabled_n);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -583,8 +606,10 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-            w->O,w->I,w->cuda_device);
+        if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+                w->O,w->I,w->cuda_device);
+        cuda_disabled_note();
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -1509,7 +1534,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
-        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        /* strnlen+memcpy come al load fmt-aware (#484): gcc -Wformat-truncation
+         * vede nm[k] a indice variabile come l'intero nm[3][] e segnala 863>320 */
+        { size_t n=strnlen(nm[k],sizeof(nm[k])); memcpy(qn,nm[k],n); memcpy(qn+n,".qs",4); }
+        tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ if(fatal) st_die_missing(&m->S,nm[k]);   /* #586: diagnose, don't just name it */
                             fprintf(stderr,"missing %s\n",nm[k]); return -1; }
     }
@@ -4521,6 +4549,53 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
 /* METODO E — prompt-lookup: cerca l'occorrenza piu' recente dell'ultimo bigramma nel
  * contesto e propone i token che la seguirono. Zero pesi extra, zero costo: e' solo
  * un'ipotesi che il modello verifichera'. */
+/* ---- CORPUS DRAFTS (REST-style external draft source) ----------------------
+ * COLI_DRAFT_CORPUS=<file>  whitespace-separated token ids of past generations
+ *                           (build one with TOKENS=1, which already dumps them)
+ * COLI_CORPUS_K=n           proposal depth, default 8 (cap 48: batch[64] in spec_decode)
+ * Proposals come from the longest suffix of the live context that also occurs in
+ * the corpus; the engine's existing verification accepts only what it would have
+ * generated anyway, so output stays byte-identical (lossless by construction).
+ * Unlike MTP (1 token/forward) a corpus hit proposes a whole span at once. */
+static int *g_corp=NULL; static long g_corp_n=0; static int g_corp_k=0;
+static uint64_t g_corp_prop=0, g_corp_acc=0;
+static void corpus_load(void){
+    const char *p=getenv("COLI_DRAFT_CORPUS");
+    if(!p||!*p) return;
+    FILE *f=fopen(p,"rb");
+    if(!f){ fprintf(stderr,"[CORPUS] cannot open %s\n",p); return; }
+    long cap=1<<16; g_corp=malloc((size_t)cap*sizeof(int)); g_corp_n=0;
+    int v;
+    while(g_corp && fscanf(f,"%d",&v)==1){
+        if(g_corp_n>=cap){ cap*=2; int *n2=realloc(g_corp,(size_t)cap*sizeof(int));
+            if(!n2){ free(g_corp); g_corp=NULL; break; } g_corp=n2; }
+        g_corp[g_corp_n++]=v;
+    }
+    fclose(f);
+    if(!g_corp){ g_corp_n=0; fprintf(stderr,"[CORPUS] OOM\n"); return; }
+    g_corp_k=getenv("COLI_CORPUS_K")?atoi(getenv("COLI_CORPUS_K")):8;
+    if(g_corp_k<1) g_corp_k=1;
+    if(g_corp_k>48) g_corp_k=48;
+    fprintf(stderr,"[CORPUS] %ld ids from %s (draft depth %d)\n",g_corp_n,p,g_corp_k);
+}
+static int corpus_draft(const int *ctx, int nctx, int *out, int k, int minn, int maxn){
+    /* il minimo utile e' un match di `minn` piu' ALMENO un token da proporre:
+     * sotto quella soglia non esiste proposta possibile (#test_corpus_draft) */
+    if(!g_corp||g_corp_n<(long)minn+1||nctx<minn||k<1) return 0;
+    for(int n=maxn;n>=minn;n--){
+        if(n>nctx) continue;
+        const int *suf=ctx+nctx-n;
+        for(long i=g_corp_n-n-1;i>=0;i--){
+            int ok=1;
+            for(int j=0;j<n;j++) if(g_corp[i+j]!=suf[j]||g_corp[i+j]<0){ ok=0; break; }
+            if(!ok) continue;
+            int g=0;
+            for(int j=0;j<k && i+n+j<g_corp_n && g_corp[i+n+j]>=0;j++) out[g++]=g_corp[i+n+j];
+            if(g>0) return g;
+        }
+    }
+    return 0;
+}
 static int ngram_draft(const int *ids, int len, int G, int *draft){
     if(len<4 || G<1) return 0;
     int a=ids[len-2], b=ids[len-1];
@@ -4729,6 +4804,15 @@ static void intr_install(void){
 #else
 static void intr_install(void){}
 #endif
+/* #678: mid-turn STOP/CANCEL for the single-slot speculative serve path. With
+ * KV_SLOTS=1 the whole turn runs inside ONE spec_decode call, so run_serve_mux's
+ * stdin poll never runs mid-turn and a server-sent STOP (raised when its stop
+ * filter matches, e.g. a role marker) sat unread until max_tokens. These flags
+ * are raised by mux_ctl_poll (called from the mux emit callback, once per emitted
+ * token) and checked in spec_decode next to g_intr. They are only ever set while
+ * a mux spec turn is running and are reset at each turn boundary, so every other
+ * spec_decode caller (chat, run, oracle) sees them permanently 0. */
+static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
@@ -4746,7 +4830,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
-    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
+    uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
+    while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
+        /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -4757,6 +4843,31 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                                                          * forza, l'acceptance e' ~1 (#48) */
             g=grammar_draft(&g_grd,draft,g_grd.max);
             if(g>0) gsrc=1;
+        }
+        if(!g && g_corp && g_corp_k>0){                 /* corpus: uno span intero per forward
+                                                         * dove il contesto ricalca il congelato */
+            /* Guard di accettazione (stessa forma di quello MTP sopra, soglia diversa).
+             * Un draft di corpus RIFIUTATO costa piu' di uno MTP: la verifica batcha
+             * 1+K righe e in un MoE ogni riga attiva i propri expert, quindi lo spreco
+             * scala con la profondita'. Misurato su GLM-5.2/H200: 90% acceptance =
+             * +22% decode, 19% = -25% (il break-even sta circa a meta'). Sotto
+             * COLI_CORPUS_MINACC (default 50%) la fonte si mette in pausa. */
+            if(cp_pause>0){ cp_pause--; if(!cp_pause){ cp_prop0=g_corp_prop; cp_acc0=g_corp_acc; } }
+            else {
+                uint64_t pw=g_corp_prop-cp_prop0, aw=g_corp_acc-cp_acc0;
+                int minacc=getenv("COLI_CORPUS_MINACC")?atoi(getenv("COLI_CORPUS_MINACC")):50;
+                if(minacc<0) minacc=0; if(minacc>100) minacc=100;
+                if(pw>=24 && aw*100 < pw*(uint64_t)minacc){
+                    fprintf(stderr,"[CORPUS] %.0f%% acceptance over the last %llu proposals (<%d%%): "
+                            "drafts paused for %d tokens\n",
+                            100.0*aw/pw,(unsigned long long)pw,minacc,(int)GUARD_PAUSE_TOKENS);
+                    cp_pause=GUARD_PAUSE_TOKENS;
+                }
+            }
+            if(!cp_pause){
+                g=corpus_draft(all,kv+1,draft,g_corp_k,3,8);
+                if(g>0){ gsrc=3; g_corp_prop+=(uint64_t)g; }
+            }
         }
         if(!g && g_draft>0 && m->has_mtp){
             /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
@@ -4797,6 +4908,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
+        else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
@@ -5202,6 +5314,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
+    if(g_corp_prop) printf("corpus drafts: %.0f%% acceptance (%llu/%llu proposed from %ld frozen ids)\n",
+        100.0*g_corp_acc/g_corp_prop, (unsigned long long)g_corp_acc,
+        (unsigned long long)g_corp_prop, g_corp_n);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
     if(g_grd.prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_grd.acc/g_grd.prop, (unsigned long long)g_grd.acc, (unsigned long long)g_grd.prop);
@@ -5494,9 +5609,62 @@ static void mux_data(Tok *T, unsigned long long id, int token){
     fflush(stdout);
 }
 
+/* #678: non-blocking stdin poll while a single-slot spec turn is running. Consumes
+ * pending STOP/CANCEL lines (raising g_mux_stop/g_mux_cancel for the active id) so
+ * the server's stop takes effect within ~1 token instead of after max_tokens. The
+ * framed protocol stays in sync: STOP/CANCEL are single lines; a SUBMIT cannot
+ * legally arrive while the only slot is busy, but if one does its payload is
+ * drained and it is refused with SLOT_BUSY exactly as mux_submit would. On stdin
+ * types the platform cannot poll (e.g. Windows non-pipe stdin), ready stays 0 and
+ * behaviour falls back to the pre-#678 end-of-turn handling. */
+static void mux_ctl_poll(unsigned long long id){
+    for(;;){
+        int ready=0;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+        struct timeval tv={0,0};
+        ready = select(STDIN_FILENO+1,&rfds,NULL,NULL,&tv)>0 && FD_ISSET(STDIN_FILENO,&rfds);
+#elif defined(_WIN32)
+        HANDLE ih=(HANDLE)_get_osfhandle(_fileno(stdin));
+        DWORD avail=0;
+        ready=(PeekNamedPipe(ih,NULL,0,NULL,&avail,NULL) && avail>0)?1:0;
+#endif
+        if(!ready) return;
+        char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
+        if(nr<0){ free(line); return; }
+        if(nr && line[nr-1]=='\n') line[--nr]=0;
+        unsigned long long cid=0; char tail;
+        if(!strncmp(line,"STOP ",5) && sscanf(line+5,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_stop=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else if(!strncmp(line,"CANCEL ",7) && sscanf(line+7,"%llu %c",&cid,&tail)==1 && cid){
+            if(cid==id) g_mux_cancel=1;
+            else { printf("ERROR %llu NOT_FOUND\n",cid); fflush(stdout); }
+        }else{
+            ColiSubmit sub;
+            if(coli_submit_parse(line,&sub)){
+                long long left=(long long)sub.bytes+(long long)sub.gbytes;   /* drain payload */
+                char buf[4096];
+                while(left>0){
+                    size_t take = left>(long long)sizeof(buf) ? sizeof(buf) : (size_t)left;
+                    size_t got=fread(buf,1,take,stdin); if(!got) break; left-=(long long)got;
+                }
+                int delim=fgetc(stdin); (void)delim;                          /* trailing '\n' */
+                printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout);
+            }else{
+                printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout);
+            }
+        }
+        free(line);
+    }
+}
+
 /* emit callback for the single-slot speculative path: stream straight to the mux protocol */
 typedef struct { Tok *T; unsigned long long id; } MuxEmit;
-static void mux_spec_emit(int t, void *ud){ MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t); }
+static void mux_spec_emit(int t, void *ud){
+    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t);
+    mux_ctl_poll(e->id);                 /* #678: honor STOP/CANCEL within ~1 token */
+}
 
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
@@ -5788,15 +5956,29 @@ static void run_serve_mux(Model *m, const char *snap){
                  * the exact contract run_serve (non-mux) already uses. No chunk
                  * splicing (that would re-enter spec_decode mid-turn and double
                  * the boundary token); Ctrl-C interrupts through g_intr inside
-                 * spec_decode, same as every other serve path. r->spec_logit
-                 * holds the prefill continuation from mux_submit. */
+                 * spec_decode, and a server STOP/CANCEL through g_mux_stop /
+                 * g_mux_cancel raised by mux_ctl_poll in the emit callback (#678).
+                 * r->spec_logit holds the prefill continuation from mux_submit. */
                 kv_bind(m,&sc->kv);
                 g_temp=r->temp; g_nuc=r->top_p;
                 float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
                 MuxEmit ud={&T,r->id};
+                g_mux_stop=0; g_mux_cancel=0;                  /* fresh per turn (#678) */
                 int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
                                      mux_spec_emit,&ud,&sc->len,NULL);
                 r->emitted+=prod;
+                if(g_mux_cancel){
+                    /* mirror of mux_submit's CANCEL epilogue: no DONE frame, the
+                     * dispatcher expects ERROR <id> CANCELLED. KV history is kept
+                     * consistent exactly like the between-turns path. */
+                    g_mux_cancel=0; g_mux_stop=0;
+                    r->spec=0; r->active=0;
+                    kv_bind(m,&sc->kv);
+                    kv_disk_append(m,sc->hist,sc->len);
+                    printf("ERROR %llu CANCELLED\n",r->id); fflush(stdout);
+                    continue;
+                }
+                g_mux_stop=0;                /* STOP or natural end: same DONE path */
                 mux_done(m,sc,r);
                 continue;                    /* whole turn handled outside the shared batch */
             }
@@ -6527,6 +6709,16 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
             m->resident_bytes/1e9,slack/1e9,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+#ifdef COLI_CUDA
+        /* #686: on a single GPU that also holds host copies of the VRAM tier, the
+         * thing inflating the resident set is often those copies rather than
+         * PIN_GB itself -- name the knob instead of leaving the user to find it. */
+        if(g_cuda_enabled && g_cuda_ndev==1 && !g_cuda_release_host &&
+           (g_cuda_expert_gb>0||g_cuda_expert_auto))
+            fprintf(stderr,"[RAM] the VRAM expert tier still has host copies in RAM "
+                "(CUDA_RELEASE_HOST=0 on a single GPU): CUDA_RELEASE_HOST=1 frees them for "
+                "the RAM tier and is what this topology usually wants (#686).\n");
+#endif
         if(g_mem_avail_boot>0 && peak > g_mem_avail_boot*1e9 &&
            !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
             fprintf(stderr,"[RAM] refusing to start: that peak also exceeds the %.1f GB actually "
@@ -6813,6 +7005,7 @@ int main(int argc, char **argv){
     if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
+    corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
@@ -6864,7 +7057,31 @@ int main(int argc, char **argv){
     g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
-    g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    /* CUDA_RELEASE_HOST default: ndev>1 was chosen when the host copy was the
+     * multi-GPU re-upload path. On a SINGLE GPU asked to fill RAM as well
+     * (PIN_GB=all, or a PIN_GB large enough that the two tiers compete), that
+     * default keeps a full host copy of every VRAM-tier expert and the RAM tier
+     * starves: measured on 1x H200 + 235 GB, 9,297 vs 14,951 resident experts and
+     * 1.10 vs 4.18-5.37 tok/s -- a 3.8x decode difference from one default (#686).
+     * The host copy is provably redundant there: releasing it still reloads from
+     * disk if CUDA later fails. So: keep ndev>1 exactly as before, and add the
+     * single-GPU + large-PIN_GB case. An explicit CUDA_RELEASE_HOST always wins. */
+    if(getenv("CUDA_RELEASE_HOST")) g_cuda_release_host=atoi(getenv("CUDA_RELEASE_HOST"));
+    else if(g_cuda_ndev>1)          g_cuda_release_host=1;          /* unchanged */
+    else if(g_cuda_enabled && (g_cuda_expert_gb>0||g_cuda_expert_auto)){
+        const char *pg=getenv("PIN_GB");
+        /* "large PIN_GB" = all, or >= the VRAM tier itself. Under CUDA_EXPERT_GB=auto
+         * the tier is sized to the whole card, so any explicit PIN_GB qualifies. */
+        if(pg&&*pg){
+            if(!strcmp(pg,"all")) g_cuda_release_host=1;
+            else { double p=atof(pg);
+                   if(p>0 && (g_cuda_expert_auto || p>=g_cuda_expert_gb)) g_cuda_release_host=1; }
+        }
+        if(g_cuda_release_host)
+            fprintf(stderr,"[CUDA] single-GPU with a large PIN_GB: releasing host copies of the "
+                           "VRAM tier so the RAM tier can use that memory (#686; "
+                           "CUDA_RELEASE_HOST=0 keeps them)\n");
+    }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
