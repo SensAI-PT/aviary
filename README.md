@@ -325,6 +325,27 @@ the full 756 GB on disk at once:
 ./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
 ```
 
+#### Other supported models
+
+GLM-5.2 is the reference model, but the same streaming approach runs three more
+families. Each is a **sibling engine** — one C file, its own architecture, the same
+`coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
+the model's `config.json`):
+
+| Family | Total / active | Weights | Build | Docs |
+|---|---|---|---|---|
+| **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
+| **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
+| **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
+| **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+
+Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
+the original Hugging Face shards, and the bf16 dense set is quantized at load time.
+Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a host
+that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
+the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
+trade-off written down.
+
 ### 3. Run it
 
 ```bash
