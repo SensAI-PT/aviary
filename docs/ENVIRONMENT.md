@@ -92,17 +92,26 @@ re-measuring. Details that matter when you meet this file in the wild:
 - **Contamination veto.** If the shard offers fewer than 64 MB of such cold
   windows, the measurement is refused: nothing is cached, one stderr line
   explains the deferral, the conservative (slow-storage) defaults hold, and
-  the probe simply retries on the next, colder, startup.
+  the probe simply retries on the next, colder, startup. The same veto (with
+  its own honest message) fires for an under-allocated shard — a sparse or
+  still-downloading file whose "cold" pages are holes that would measure as
+  RAM-speed zero-fill — and for a shard too small to ever offer 64 MB of
+  probe windows. The probe measures the largest `.safetensors` in the dir.
 - **Format (v2).** One line, `v2 <gbs> <st_dev>` — the measured GB/s and the
   `st_dev` of the model dir's volume at measurement time. The grammar is
   strict (plain digits, `0 < gbs < 1000`; no inf/nan/hex/exponents) and both
   readers — the C engine and `coli doctor`/`coli plan` — accept exactly the
   same bytes; anything else is ignored and re-probed, never trusted.
-- **Volume identity.** The cache is honored only while its recorded `st_dev`
-  matches the model dir's current volume. Copy or rsync the model dir
-  (including this hidden file) to another drive and the engine re-probes there
-  instead of inheriting the old drive's number; doctor/plan likewise stop
-  showing the stale value.
+- **Volume identity (best-effort).** The cache is honored only while its
+  recorded `st_dev` matches the model dir's current volume, so copying or
+  rsyncing the model dir (including this hidden file) to another drive
+  normally triggers a re-probe there instead of inheriting the old drive's
+  number; doctor/plan likewise stop showing the stale value. This is
+  best-effort, not an identity guarantee: macOS recycles `st_dev` values, so
+  a cache carried to an external volume that happens to be assigned the old
+  device id (e.g. drives attached one after another in the same slot) will be
+  wrongly trusted until deleted. When in doubt after moving a model dir,
+  delete `.coli_ssd`. True volume-UUID identity is a named follow-up.
 - **Legacy upgrade.** A pre-v2 bare-number cache (written before steering
   existed, so possibly warm-contaminated) is re-measured once on the next
   startup and rewritten as v2.
