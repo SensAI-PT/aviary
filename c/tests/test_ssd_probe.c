@@ -18,9 +18,33 @@
  * Portable: the pure layer builds and runs on every platform, same as
  * test_cap_precedence.c. */
 #define COLI_SSD_PROBE_TEST 1
+
+#ifdef __APPLE__
+/* pread recorder (#386 r2, FR2-2): pins that probe_raw actually READS the
+ * offsets the steering selected -- the decision function alone proved
+ * mutable out from under the suite (a probe_raw that ignores tiles[] and
+ * reads r11-style random offsets passed every round-1 test). unistd.h is
+ * included BEFORE the macro below so its include guard keeps the real
+ * prototype; every pread in the engine TU then routes through the recorder,
+ * which delegates to the real call. */
+#include <unistd.h>
+#include <sys/types.h>
+static long long g_pread_rec[4096];
+static int g_pread_nrec;
+static int g_pread_rec_on;
+static ssize_t coli_test_pread(int fd, void *buf, size_t n, off_t off){
+    if(g_pread_rec_on && g_pread_nrec<4096) g_pread_rec[g_pread_nrec++]=(long long)off;
+    return pread(fd,buf,n,off);
+}
+#define pread coli_test_pread
+#endif /* __APPLE__ */
+
 #define main coli_glm_main_unused
 #include "../colibri.c"
 #undef main
+#ifdef __APPLE__
+#undef pread
+#endif
 
 static int failures = 0;
 
@@ -250,15 +274,17 @@ static void run_cached_decisions(void){
             free(mb); fclose(f);
             char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
             unlink(cp);                          /* start with no cache at all */
-            int contaminated=0;
-            double raw=coli_ssd_probe_raw(dirbuf,&contaminated);
-            if(!contaminated){
+            int veto=COLI_SSD_VETO_NONE;
+            double raw=coli_ssd_probe_raw(dirbuf,&veto);
+            if(veto==COLI_SSD_VETO_NONE){
                 /* the OS evicted a fresh 80MB write already? environment too
                  * unusual to assert on -- report and move on, the pure veto
                  * tests above still hold the line */
                 fprintf(stderr,"note: fresh shard not resident (raw=%.3f), skipping veto e2e\n",raw);
             }else{
                 CHECK(raw==-1,"vetoed raw probe must report -1: got %.3f",raw);
+                CHECK(veto==COLI_SSD_VETO_RESIDENT,
+                      "fully-allocated warm shard must veto as RESIDENT, not %d",veto);
                 got=coli_ssd_probe_cached(dirbuf);
                 CHECK(got==-1,"vetoed cached probe must report -1: got %.3f",got);
                 CHECK(read_file(dirbuf,".coli_ssd",back,sizeof(back))==-1,
@@ -271,14 +297,176 @@ static void run_cached_decisions(void){
     char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
     unlink(cp); rmdir(dirbuf);
 }
+
+/* ---- round 2: sparse / small / steering-pin arms ------------------------ */
+
+static char *make_scratch_dir(char *dirbuf, size_t sz){
+    const char *tmp=getenv("TMPDIR");
+    snprintf(dirbuf,sz,"%s/coli_ssd_probe_r2.XXXXXX",(tmp && strlen(tmp)<1100)?tmp:"/tmp");
+    if(!mkdtemp(dirbuf)){ perror("mkdtemp"); failures++; return NULL; }
+    return dirbuf;
+}
+
+/* write `mb` MB through F_NOCACHE so the pages land on disk but NOT in the
+ * page cache (the confirmation battery's cold-file technique) */
+static int write_cold_mb(const char *path, int mb){
+    int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if(fd<0) return -1;
+    fcntl(fd,F_NOCACHE,1);
+    char *buf=malloc(1u<<20);
+    if(!buf){ close(fd); return -1; }
+    memset(buf,0x5A,1u<<20);
+    int ok=1;
+    for(int i=0;i<mb && ok;i++) ok = write(fd,buf,1u<<20)==(ssize_t)(1u<<20);
+    free(buf); close(fd);
+    return ok?0:-1;
+}
+
+/* fraction of the byte range [lo,hi) currently page-cache resident */
+static double resident_share(const char *path, long long lo, long long hi){
+    int fd=open(path,O_RDONLY);
+    if(fd<0) return -1;
+    struct stat st;
+    if(fstat(fd,&st)!=0){ close(fd); return -1; }
+    size_t page_sz=(size_t)getpagesize();
+    size_t npages=((size_t)st.st_size+page_sz-1)/page_sz;
+    unsigned char *vec=malloc(npages);
+    void *map=vec?mmap(NULL,(size_t)st.st_size,PROT_READ,MAP_SHARED,fd,0):MAP_FAILED;
+    double share=-1;
+    if(map!=MAP_FAILED && mincore(map,(size_t)st.st_size,(char*)vec)==0){
+        size_t p0=(size_t)(lo/(long long)page_sz), p1=(size_t)(hi/(long long)page_sz);
+        if(p1>npages) p1=npages;
+        size_t res=0;
+        for(size_t i=p0;i<p1;i++) res+=(size_t)(vec[i]&1);
+        share = p1>p0 ? (double)res/(double)(p1-p0) : -1;
+    }
+    if(map!=MAP_FAILED) munmap(map,(size_t)st.st_size);
+    free(vec); close(fd);
+    return share;
+}
+
+/* F1: an under-allocated (sparse / still-downloading) shard must be vetoed
+ * BEFORE any read: its never-resident pages are holes, and pread of a hole
+ * is VFS zero-fill at RAM speed (auditor repro: 73.3 GB/s latched). */
+static void run_sparse_veto(void){
+    char dirbuf[1200];
+    if(!make_scratch_dir(dirbuf,sizeof(dirbuf))) return;
+    char p[1400]; snprintf(p,sizeof(p),"%s/out-00000.safetensors",dirbuf);
+    int fd=open(p,O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if(fd<0){ perror(p); failures++; rmdir(dirbuf); return; }
+    char *mb=malloc(1u<<20); memset(mb,0xA5,1u<<20);
+    for(int i=0;i<100;i++) write(fd,mb,1u<<20);          /* 100 MB real data */
+    free(mb);
+    ftruncate(fd,(off_t)400*1024*1024);                  /* + 300 MB of holes */
+    close(fd);
+    struct stat st;
+    if(stat(p,&st)==0 && !coli_ssd_probe_underallocated((long long)st.st_blocks*512,(long long)st.st_size)){
+        fprintf(stderr,"note: filesystem allocated the ftruncate hole (blocks*512=%lld); skipping sparse e2e\n",
+                (long long)st.st_blocks*512);
+    }else{
+        int veto=COLI_SSD_VETO_NONE;
+        double raw=coli_ssd_probe_raw(dirbuf,&veto);
+        CHECK(raw==-1,"sparse shard must not yield a measurement: got %.3f",raw);
+        CHECK(veto==COLI_SSD_VETO_SPARSE,"sparse shard must veto as SPARSE, got %d",veto);
+        double got=coli_ssd_probe_cached(dirbuf);
+        char back[160];
+        CHECK(got==-1,"sparse cached probe must report -1: got %.3f",got);
+        CHECK(read_file(dirbuf,".coli_ssd",back,sizeof(back))==-1,
+              "sparse probe must not write .coli_ssd (found: %s)",back);
+    }
+    unlink(p);
+    char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
+    unlink(cp); rmdir(dirbuf);
+}
+
+/* F4 honesty: a shard that can never offer 64 MB of probe windows is SMALL,
+ * not "page-cache resident" -- even when it is stone cold. */
+static void run_small_veto(void){
+    char dirbuf[1200];
+    if(!make_scratch_dir(dirbuf,sizeof(dirbuf))) return;
+    char p[1400]; snprintf(p,sizeof(p),"%s/out-00000.safetensors",dirbuf);
+    if(write_cold_mb(p,30)!=0){ perror(p); failures++; rmdir(dirbuf); return; }
+    int veto=COLI_SSD_VETO_NONE;
+    double raw=coli_ssd_probe_raw(dirbuf,&veto);
+    CHECK(raw==-1,"30MB shard must not yield a measurement: got %.3f",raw);
+    CHECK(veto==COLI_SSD_VETO_SMALL,"cold 30MB shard must veto as SMALL, got %d",veto);
+    unlink(p); rmdir(dirbuf);
+}
+
+/* FR2-2: the steering must be USED, not merely computed. Half the shard is
+ * cold (F_NOCACHE-written), half deliberately warmed; every offset probe_raw
+ * actually preads (recorded by the coli_test_pread shim) must fall in the
+ * cold half. A probe_raw that ignores tiles[] and reads r11-style random
+ * offsets lands ~half its reads in the warm half and fails here. */
+static void run_steering_pin(void){
+    enum { MB_TOTAL=144, MB_COLD=72 };           /* 36 tiles: 18 cold + 18 warm */
+    char dirbuf[1200];
+    if(!make_scratch_dir(dirbuf,sizeof(dirbuf))) return;
+    char p[1400]; snprintf(p,sizeof(p),"%s/out-00000.safetensors",dirbuf);
+    if(write_cold_mb(p,MB_TOTAL)!=0){ perror(p); failures++; rmdir(dirbuf); return; }
+    long long warm_lo=(long long)MB_COLD*1024*1024;
+    long long warm_hi=(long long)MB_TOTAL*1024*1024;
+    /* warm the second half with plain buffered reads */
+    int fd=open(p,O_RDONLY);
+    if(fd>=0){
+        char *buf=malloc(1u<<20);
+        for(long long off=warm_lo; off<warm_hi; off+=1u<<20)
+            if(pread(fd,buf,1u<<20,(off_t)off)<=0) break;
+        free(buf); close(fd);
+    }
+    double cold_res=resident_share(p,0,warm_lo);
+    double warm_res=resident_share(p,warm_lo,warm_hi);
+    if(!(cold_res>=0 && cold_res<0.05 && warm_res>0.90)){
+        /* residency preconditions not met on this box: report, don't flake */
+        fprintf(stderr,"note: residency prep off (cold %.0f%%, warm %.0f%%), skipping steering pin\n",
+                cold_res*100,warm_res*100);
+    }else{
+        g_pread_nrec=0; g_pread_rec_on=1;
+        int veto=COLI_SSD_VETO_NONE;
+        double gbs=coli_ssd_probe_raw(dirbuf,&veto);
+        g_pread_rec_on=0;
+        CHECK(veto==COLI_SSD_VETO_NONE,"half-cold shard must not veto (72MB cold): got %d",veto);
+        CHECK(gbs>0,"half-cold shard must measure: got %.3f",gbs);
+        CHECK(g_pread_nrec>0,"probe made no preads");
+        for(int i=0;i<g_pread_nrec;i++){
+            CHECK(g_pread_rec[i]>=0 && g_pread_rec[i]<warm_lo,
+                  "pread %d at %lld outside the cold half [0,%lld)",i,g_pread_rec[i],warm_lo);
+            CHECK(g_pread_rec[i]%COLI_SSD_PROBE_BLK==0,
+                  "pread %d at %lld is not tile-aligned",i,g_pread_rec[i]);
+        }
+        fprintf(stderr,"steering pin: %d preads, all in the cold half\n",g_pread_nrec);
+    }
+    unlink(p);
+    char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
+    unlink(cp); rmdir(dirbuf);
+}
 #endif /* __APPLE__ */
+
+/* F1's decision layer, portable: st_blocks*512 must cover st_size within
+ * 12.5% slack; the boundary sits exactly at size - size/8. */
+static void run_underallocated(void){
+    const long long GBl=1024ll*1024*1024;
+    CHECK(coli_ssd_probe_underallocated(100ll*1024*1024,10*GBl),
+          "auditor repro: 100MB real of 10GB must read as under-allocated");
+    CHECK(!coli_ssd_probe_underallocated(10*GBl,10*GBl),"fully allocated must pass");
+    CHECK(!coli_ssd_probe_underallocated(10*GBl+4096,10*GBl),
+          "metadata rounding above size must pass");
+    long long size=800ll*1024*1024;
+    CHECK(!coli_ssd_probe_underallocated(size-size/8,size),"exactly at the slack edge must pass");
+    CHECK(coli_ssd_probe_underallocated(size-size/8-1,size),"one byte past the slack must veto");
+    CHECK(coli_ssd_probe_underallocated(0,size),"zero allocation must veto");
+}
 
 int main(void){
     run_vectors();
     run_roundtrip();
     run_steering();
+    run_underallocated();
 #ifdef __APPLE__
     run_cached_decisions();
+    run_sparse_veto();
+    run_small_veto();
+    run_steering_pin();
 #endif
     if(failures){
         fprintf(stderr,"ssd probe tests: %d FAILURE(S)\n",failures);

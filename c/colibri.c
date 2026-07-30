@@ -7597,6 +7597,29 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
 #define COLI_SSD_PROBE_COLD_FLOOR (64ll*1024*1024) /* fewer cold bytes than this = contaminated */
 #define COLI_SSD_CACHE_MAX   64                 /* longest well-formed .coli_ssd, in bytes */
 
+/* Why a measurement was refused (contaminated-class: nothing cached, one
+ * honest stderr line naming the ACTUAL condition, retry on a later start).
+ * The reasons differ in what the user should do about them -- "wait for a
+ * cold start" vs "finish the download" vs "nothing, this shard can never
+ * host a trustworthy probe" -- so the message must not lump them. */
+enum {
+    COLI_SSD_VETO_NONE = 0,
+    COLI_SSD_VETO_RESIDENT,                     /* too few cold pages: page cache would answer */
+    COLI_SSD_VETO_SMALL,                        /* shard offers < COLD_FLOOR of whole windows, ever */
+    COLI_SSD_VETO_SPARSE                        /* under-allocated: holes read as VFS zero-fill */
+};
+
+/* Under-allocation gate (#386 round 2, F1): steering prefers never-resident
+ * pages, and in a sparse or still-downloading file those are HOLES -- pread
+ * of a hole is VFS zero-fill at RAM speed (a 10 GB shard with 100 MB of real
+ * data measured 73 GB/s and latched it as disk bandwidth). st_blocks*512 is
+ * what actually sits on disk; require it to cover the file size within 12.5%
+ * slack (HFS+/APFS metadata rounding, tail blocks). Same conservative
+ * polarity as the residency veto: not fully allocated -> not measurable. */
+static int coli_ssd_probe_underallocated(long long allocated, long long size){
+    return allocated < size - size/8;
+}
+
 /* digits [ "." digits ] -- returns chars consumed, 0 = no match. The ONLY
  * number shape the cache grammar admits (see coli_ssd_cache_parse). */
 static size_t coli_ssd_scan_number(const char *p, size_t len){
@@ -7702,30 +7725,42 @@ static int coli_ssd_probe_vetoed(long long cold_bytes){
 }
 
 #ifdef __APPLE__
-/* Path of the first *.safetensors shard in snap_dir into out, or out[0]=0 if
- * none. readdir order, unsorted (unlike st_init): any shard is representative
- * for a bandwidth probe, so sorting would buy nothing. */
+/* Path of the LARGEST *.safetensors shard in snap_dir into out, or out[0]=0
+ * if none. Any shard's bandwidth is representative, but the biggest one
+ * offers the most cold 4 MB windows -- a stray small shard picked by readdir
+ * order could starve the probe below the 64 MB floor forever (#386 round 2,
+ * F4) even though a full-size neighbor sits right next to it. */
 static void coli_ssd_probe_pick_shard(const char *snap_dir, char *out, size_t outsz){
     out[0]=0;
     DIR *d=opendir(snap_dir);
     if(!d) return;
     struct dirent *e;
+    long long best=-1;
     while((e=readdir(d))){
         const char *dot=strrchr(e->d_name,'.');
-        if(dot && !strcmp(dot,".safetensors")){ snprintf(out,outsz,"%s/%s",snap_dir,e->d_name); break; }
+        if(!dot || strcmp(dot,".safetensors")) continue;
+        char cand[1280];
+        snprintf(cand,sizeof(cand),"%s/%s",snap_dir,e->d_name);
+        struct stat st;
+        if(stat(cand,&st)==0 && (long long)st.st_size>best){
+            best=(long long)st.st_size;
+            snprintf(out,outsz,"%s",cand);
+        }
     }
     closedir(d);
 }
 
 /* F_NOCACHE random-read probe on one real shard, steered to verified-cold
  * ranges. Returns measured GB/s, or -1 if the probe could not run (no shard,
- * open/map failure, file too small) or was vetoed as contaminated --
- * callers treat -1 as "not fast", never as an error to surface;
- * *contaminated_out distinguishes the veto so the caller can say why and
- * skip the cache write. The mmap is address space only (nothing is faulted
- * in): it exists so mincore can fill the residency vector. */
-static double coli_ssd_probe_raw(const char *snap_dir, int *contaminated_out){
-    if(contaminated_out) *contaminated_out=0;
+ * open/map failure, file too small) or was vetoed as contaminated -- callers
+ * treat -1 as "not fast", never as an error to surface; *veto_out gets the
+ * COLI_SSD_VETO_* reason so the caller can say honestly why and skip the
+ * cache write. Veto order: SPARSE (holes would measure as zero-fill) before
+ * SMALL (can never offer the floor) before RESIDENT (cold today, maybe).
+ * The mmap is address space only (nothing is faulted in): it exists so
+ * mincore can fill the residency vector. */
+static double coli_ssd_probe_raw(const char *snap_dir, int *veto_out){
+    if(veto_out) *veto_out=COLI_SSD_VETO_NONE;
     char path[1280];
     coli_ssd_probe_pick_shard(snap_dir,path,sizeof(path));
     if(!path[0]) return -1;
@@ -7735,6 +7770,16 @@ static double coli_ssd_probe_raw(const char *snap_dir, int *contaminated_out){
     fcntl(fd,F_RDAHEAD,0);                       /* random access, not sequential streaming */
     struct stat st;
     if(fstat(fd,&st)!=0 || st.st_size<(off_t)(COLI_SSD_PROBE_BLK*2)){ close(fd); return -1; }
+    if(coli_ssd_probe_underallocated((long long)st.st_blocks*512,(long long)st.st_size)){
+        if(veto_out) *veto_out=COLI_SSD_VETO_SPARSE;
+        close(fd);
+        return -1;
+    }
+    if(((long long)st.st_size/COLI_SSD_PROBE_BLK)*COLI_SSD_PROBE_BLK<COLI_SSD_PROBE_COLD_FLOOR){
+        if(veto_out) *veto_out=COLI_SSD_VETO_SMALL;   /* even fully cold it cannot reach the floor */
+        close(fd);
+        return -1;
+    }
     size_t page_sz=(size_t)getpagesize();
     size_t npages=((size_t)st.st_size+page_sz-1)/page_sz;
     unsigned char *vec=malloc(npages);
@@ -7744,8 +7789,10 @@ static double coli_ssd_probe_raw(const char *snap_dir, int *contaminated_out){
     if(map!=MAP_FAILED && mincore(map,(size_t)st.st_size,(char*)vec)==0){
         long long cold_bytes=0;
         size_t ntiles=coli_ssd_probe_cold_tiles(vec,npages,page_sz,tiles,&cold_bytes);
-        if(coli_ssd_probe_vetoed(cold_bytes)){
-            if(contaminated_out) *contaminated_out=1;
+        if(ntiles==0 || coli_ssd_probe_vetoed(cold_bytes)){
+            /* ntiles==0 is implied by the floor today, but the modulo below
+             * must NEVER be reachable with 0 on its own merits (#386 r2, F7) */
+            if(veto_out) *veto_out=COLI_SSD_VETO_RESIDENT;
         }else{
             void *buf=NULL;
             if(posix_memalign(&buf,16384,COLI_SSD_PROBE_BLK)!=0) buf=NULL;
@@ -7794,17 +7841,34 @@ static double coli_ssd_probe_cached(const char *snap_dir){
             return cached;
         /* v2 from another volume, legacy, or garbage: fall through, re-measure */
     }
-    int contaminated=0;
-    double gbs=coli_ssd_probe_raw(snap_dir,&contaminated);
-    if(contaminated){
-        fprintf(stderr,"METAL: storage probe deferred -- the shard is already page-cache resident "
-                "(<%lld MB cold), a read now would measure RAM, not the disk; keeping the "
-                "conservative cache default, will re-measure on a cold start\n",
-                COLI_SSD_PROBE_COLD_FLOOR/(1024*1024));
+    int veto=COLI_SSD_VETO_NONE;
+    double gbs=coli_ssd_probe_raw(snap_dir,&veto);
+    if(veto!=COLI_SSD_VETO_NONE){
+        /* one honest line per deferral, naming the condition that actually
+         * fired (#386 r2, F4): "resident" advice (wait for a cold start) is
+         * wrong advice for a partial download or a permanently tiny shard. */
+        const char *why =
+            veto==COLI_SSD_VETO_SPARSE ? "the shard is not fully allocated on disk (partial "
+                                         "download?), holes would measure as RAM-speed zero-fill" :
+            veto==COLI_SSD_VETO_SMALL  ? "the largest shard offers under 64 MB of probe windows, "
+                                         "too small for a trustworthy measurement" :
+                                         "the shard is already page-cache resident (<64 MB cold), "
+                                         "a read now would measure RAM, not the disk";
+        fprintf(stderr,"METAL: storage probe deferred -- %s; keeping the conservative cache "
+                "default, will re-check on a later start\n",why);
+        return -1;
+    }
+    if(gbs<0) return -1;                         /* could not run at all: no shard, open failure */
+    if(!(gbs>0 && gbs<1000)){
+        /* a number the cache grammar itself would refuse (0, >=1000 GB/s,
+         * non-finite) is no more trustworthy for THIS run than for the next
+         * one (#386 r2, F6): treat it as contaminated, not as "fast". */
+        fprintf(stderr,"METAL: storage probe measured an implausible %g GB/s -- ignoring the "
+                "measurement, keeping the conservative cache default\n",gbs);
         return -1;
     }
     char line[COLI_SSD_CACHE_MAX+1];
-    if(gbs>0 && gbs<1000 && coli_ssd_cache_format(line,sizeof(line),gbs,cur_dev)>0){
+    if(coli_ssd_cache_format(line,sizeof(line),gbs,cur_dev)>0){
         /* mkstemp (unique name, O_EXCL) + rename: the model dir is shared (a
          * concurrent serve + run pair may both probe a virgin dir) so a torn
          * write must never survive, and a fixed, predictable temp name could
@@ -7813,14 +7877,25 @@ static double coli_ssd_probe_cached(const char *snap_dir){
          * the safe direction (the platform default just stays off). */
         char tpath[1310];
         snprintf(tpath,sizeof(tpath),"%s.XXXXXX",cpath);
+        int cache_errno=0;
         int tfd=mkstemp(tpath);
-        if(tfd>=0){
+        if(tfd<0) cache_errno=errno;
+        else{
             size_t len=strlen(line);
+            mode_t um=umask(0); umask(um);       /* read it back; umask() has no getter */
             int ok = write(tfd,line,len)==(ssize_t)len;
-            ok = fchmod(tfd,0644)==0 && ok;      /* mkstemp's 0600 would hide it from group readers */
+            ok = fchmod(tfd,(mode_t)(0644&~um))==0 && ok;  /* mkstemp forces 0600; honor the umask instead */
+            if(!ok) cache_errno=errno;
             close(tfd);
-            if(!ok || rename(tpath,cpath)!=0) unlink(tpath);
+            if(ok && rename(tpath,cpath)!=0){ cache_errno=errno; ok=0; }
+            if(!ok) unlink(tpath);
         }
+        if(cache_errno)
+            /* the measurement still governs THIS run; only persistence failed
+             * (read-only model dir, quota, ...) -- say so once (#386 r2, F5) */
+            fprintf(stderr,"METAL: could not cache the storage probe in %s (%s) -- "
+                    "will re-measure on every start until it is writable\n",
+                    cpath,strerror(cache_errno));
     }
     return gbs;
 }
