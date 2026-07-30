@@ -143,17 +143,56 @@ def memory_available():
     return 0
 
 
+# Strict .coli_ssd grammar -- the byte-for-byte mirror of colibri.c's
+# coli_ssd_cache_parse() (keep the two in lockstep; test_resource_plan.py and
+# test_ssd_probe.c chew the same vector file, tests/fixtures/ssd_cache_vectors.txt):
+#   v2:     b"v2 <gbs> <st_dev>"   single spaces, at most one trailing \n
+#   legacy: b"<gbs>"               the pre-fix format, never trusted
+# where <gbs> = digits["."digits] with 0 < gbs < 1000 and <st_dev> = 1..20
+# digits fitting unsigned 64-bit; total length <= 64 bytes, no NULs, nothing
+# else. float() permissiveness ("inf", "nan", "1e99", whitespace, signs) is
+# deliberately out: it let corrupt caches surface as measurements, and "inf"
+# reached doctor's JSON as the invalid literal Infinity.
+_SSD_CACHE_V2 = re.compile(rb"\Av2 (\d+(?:\.\d+)?) (\d{1,20})\n?\Z")
+_SSD_CACHE_LEGACY = re.compile(rb"\A(\d+(?:\.\d+)?)\n?\Z")
+
+
+def parse_ssd_cache(data):
+    """Classify raw .coli_ssd bytes under the strict grammar above. Returns
+    ("v2", gbs, st_dev), ("legacy", gbs, None), or (None, None, None) for
+    garbage. Classification only -- trust (the st_dev match) is the caller's."""
+    if not data or len(data) > 64 or b"\x00" in data:
+        return (None, None, None)
+    match = _SSD_CACHE_V2.match(data)
+    if match:
+        gbs, dev = float(match.group(1)), int(match.group(2))
+        if 0 < gbs < 1000 and dev <= 0xFFFFFFFFFFFFFFFF:
+            return ("v2", gbs, dev)
+        return (None, None, None)
+    match = _SSD_CACHE_LEGACY.match(data)
+    if match:
+        gbs = float(match.group(1))
+        if 0 < gbs < 1000:
+            return ("legacy", gbs, None)
+    return (None, None, None)
+
+
 def read_ssd_probe(model_dir):
     """Read the cached F_NOCACHE storage probe the C engine writes to
-    <model>/.coli_ssd on its first Metal+darwin startup (colibri.c coli_ssd_probe_cached,
-    issue #379). Read-only: never re-measures, never guesses -- mirrors S4's
-    "read-and-display only" contract for `coli doctor`/`coli plan`. Returns the
-    measured GB/s as a float, or None if the file is absent or unparsable."""
+    <model>/.coli_ssd on its first Metal+darwin startup (colibri.c
+    coli_ssd_probe_cached, issue #379). Read-only: never re-measures, never
+    guesses -- mirrors S4's "read-and-display only" contract for `coli
+    doctor`/`coli plan`. Returns the measured GB/s as a float, or None.
+    Trust matches the engine exactly: only a v2 cache whose recorded st_dev
+    still matches the model dir's volume counts -- a legacy bare number or a
+    cache carried to another drive is one the engine will re-measure, so
+    surfacing it here would show a number the engine no longer believes."""
     try:
-        text = (Path(model_dir) / ".coli_ssd").read_text(encoding="utf-8").strip()
-        value = float(text.split()[0])
-        return value if value >= 0 else None
-    except (OSError, ValueError, IndexError):
+        kind, gbs, dev = parse_ssd_cache((Path(model_dir) / ".coli_ssd").read_bytes())
+        if kind == "v2" and dev == os.stat(model_dir).st_dev:
+            return gbs
+        return None
+    except OSError:
         return None
 
 

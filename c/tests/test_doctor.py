@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -156,10 +157,22 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
 
     def test_ssd_probe_check_passes_and_reports_cached_value(self):
-        (self.model / ".coli_ssd").write_text("14.3\n")
+        (self.model / ".coli_ssd").write_text(f"v2 14.3 {os.stat(self.model).st_dev}\n")
         checks = self.checks_by_id(self.report())
         self.assertEqual(checks["storage.ssd_probe"]["status"], "pass")
         self.assertEqual(checks["storage.ssd_probe"]["details"]["gbs"], 14.3)
+
+    def test_ssd_probe_check_never_emits_json_infinity(self):
+        # float("inf") used to sail through the old reader; json.dumps renders
+        # it as the bare literal Infinity, which is not JSON -- machine
+        # consumers of `coli doctor --json` would then fail to parse the whole
+        # report. The strict v2 grammar bans inf/nan outright (#386 fix round).
+        (self.model / ".coli_ssd").write_text("inf\n")
+        report = self.report()
+        checks = self.checks_by_id(report)
+        self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
+        encoded = json.dumps(report, indent=2, allow_nan=False)  # raises on inf/nan
+        json.loads(encoded)
 
     def test_text_format_contains_checks_plan_and_result(self):
         output = format_doctor(self.report())
