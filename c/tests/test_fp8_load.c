@@ -203,7 +203,16 @@ static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const cha
         printf("FAIL %s: expected exit(1) refusal, got status=%d, stderr=%.200s\n", tag, status, err);
         return 0;
     }
-    if(!strstr(err,"refus")){
+    /* Search the ENGINE's message, not this test's own words: qt_resolve_fmt
+     * prints "%s: ..." with the caller-supplied name -- which is `tag` here --
+     * so a tag containing "refuses" would satisfy a naive strstr all by
+     * itself and turn this assertion into a tautology (fix round 1, found
+     * while pinning the ue8m0 family: the ue8m0 refusal message itself
+     * lacked any "refus" wording and the check never noticed). Skip the
+     * echoed tag prefix before searching. */
+    const char *msg = err; size_t tl = strlen(tag);
+    if(!strncmp(err, tag, tl)) msg = err + tl;
+    if(!strstr(msg,"refus")){
         printf("FAIL %s: exited(1) but message lacked a refusal explanation: %.200s\n", tag, err);
         return 0;
     }
@@ -402,6 +411,35 @@ static void test_ue8m0_scale_refusal(void){
         "ue8m0/fmt=1 collision O=1 I=400, stamped int8-row -> resolves to fmt=1 (real, decodable candidate)"));
     CHECK(expect_refuse_stamped(1,400, nb1, 4, "fp8-e4m3-b128",
         "ue8m0/fmt=1 collision O=1 I=400, stamped fp8-e4m3-b128 -> STILL refuses (no ue8m0 decoder)"));
+}
+
+/* ---- Part A3b (fix round 1): the ue8m0-vs-fmt=1 unstamped-refusal FAMILY,
+ * pinned at two more member shapes. Membership is exactly:
+ *     nb == O*I  &&  ns == O*4  &&  ceil(O/128)*ceil(I/128) == 4*O
+ * (qt_resolve_fmt's is_row && is_blk_ue8m0; is_blk can never co-hold, since
+ * nblk==O and nblk==4*O are disjoint for O>=1). The [1,400] case above is
+ * the O=1 member; these pin O=2 (nblkO=1) and O=129 (nblkO=2, past the
+ * block edge) so the family's O-dependence is exercised, not one corner.
+ * CURRENT POLARITY, pinned deliberately: an UNSTAMPED tensor whose bytes
+ * are genuine plain int8 at a member shape REFUSES here (the named ue8m0
+ * refusal, carrying its "ALSO matches per-row int8" clause), while a build
+ * without this PR's fp8 branches loads the same bytes as fmt=1 -- this is
+ * a knowing, disclosed strictness trade for untrusted containers, and the
+ * stamp ("int8-row") is the designed escape hatch, verified here too.
+ * No GLM-5.2 resident tensor is a member: at I<=16384 (nblkI<=128),
+ * membership forces O<=32, and every repack-eligible GLM-5.2 role has
+ * O>=576 (tools/fp8_collision_census.py enumerates the roles). */
+static void test_ue8m0_family_sweep(void){
+    /* [2,1024]: nblkO=1, nblkI=8 -> nblk=8 == 4*O. ns = O*4 = nblk = 8. */
+    CHECK(expect_refuse(2,1024, (int64_t)2*1024, 8,
+        "ue8m0 family [2,1024] (nblk=8==4*O), unstamped int8-shaped -> refuses (current polarity)"));
+    CHECK(expect_fmt_stamped(2,1024, (int64_t)2*1024, 8, "int8-row", 1,
+        "ue8m0 family [2,1024], stamped int8-row -> resolves to fmt=1 (the escape hatch)"));
+    /* [129,33000]: nblkO=2, nblkI=258 -> nblk=516 == 4*129. ns = 516. */
+    CHECK(expect_refuse(129,33000, (int64_t)129*33000, 516,
+        "ue8m0 family [129,33000] (nblk=516==4*O, nblkO=2), unstamped int8-shaped -> refuses (current polarity)"));
+    CHECK(expect_fmt_stamped(129,33000, (int64_t)129*33000, 516, "int8-row", 1,
+        "ue8m0 family [129,33000], stamped int8-row -> resolves to fmt=1"));
 }
 
 /* ---- Part B: qt_from_disk loader-seam (real safetensors file) ---- */
@@ -1071,6 +1109,7 @@ int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
     test_ue8m0_scale_refusal();
+    test_ue8m0_family_sweep();
     test_loader_seam();
     check_fp8_bytes(2048,6144, "qt_bytes fmt=8 gate/up-shaped O=2048 I=6144 (spec example)");
     check_fp8_bytes(6144,2048, "qt_bytes fmt=8 down-shaped O=6144 I=2048");

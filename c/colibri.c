@@ -1490,10 +1490,19 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * corner to fmt=1 (the stamp confirms it really is plain int8, a format
      * this build CAN decode); a stamp naming "fp8-e4m3-b128" does NOT resolve
      * it, for the same "recognized but not implemented" reason the clean
-     * (non-colliding) ue8m0 case below refuses regardless of any stamp. No
-     * real GLM tensor has these shapes; see also the SECOND DESIGN LANDMINE
-     * above for the analogous ue8m0-vs-fmt=6 corner this same signature can
-     * hit. */
+     * (non-colliding) ue8m0 case below refuses regardless of any stamp.
+     * The colliding FAMILY is exactly: nb==O*I && ns==O*4 &&
+     * ceil(O/128)*ceil(I/128)==4*O (is_row && is_blk_ue8m0 below; is_blk can
+     * never co-hold since nblk==O and nblk==4*O are disjoint for O>=1).
+     * At I<=16384 (nblkI<=128) membership forces O<=32; every GLM-5.2
+     * resident/routed role has O>=576 (kv_a's kv_lora+qk_rope is the
+     * smallest -- tools/fp8_collision_census.py enumerates the roles, and
+     * the census over the real checkpoint was run in this PR's rev5 round),
+     * so no GLM-5.2 tensor is a member -- the discipline exists for
+     * untrusted containers. tests/test_fp8_load.c's Part A3b pins the
+     * family's polarity at member shapes [1,400], [2,1024], [129,33000].
+     * See also the SECOND DESIGN LANDMINE above for the analogous
+     * ue8m0-vs-fmt=6 corner this same signature can hit. */
     if(fmt==1){
         int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I);
         int64_t ns_row=(int64_t)O*4, ns_blk=nblkO*nblkI*4, ns_blk_ue8m0=nblkO*nblkI;
@@ -1532,7 +1541,8 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
                 fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
                     "implemented; only f32 block scales are supported in this build (nb=%lld "
                     "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
-                    "1 byte/block)%s%s\n",
+                    "1 byte/block)%s%s -- refusing rather than misreading the sidecar "
+                    "(untrusted container)\n",
                     name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
                     is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
                     stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"

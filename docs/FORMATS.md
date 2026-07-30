@@ -62,8 +62,8 @@ the bytes alone say.
 | 3 | `int2-row` | `O*ceil(I/4)` bytes (`q4`, 4 packed 2-bit values/byte) | 1 `f32` per **row** (`O` entries) | stable, upstream | `1ae22a6` (initial commit) |
 | 4 | `int4-grouped` | `O*ceil(I/2)` bytes (`q4`, same packed layout as fmt=2) | 1 `f32` per **group** of `gs` inputs, `O*ceil(I/gs)` entries | stable, upstream | `498ab0c` / merged PR [#242](https://github.com/JustVugg/colibri/pull/242) |
 | 5 | `int3-g64` | `O*ceil(I/64)*24` bytes (`q4`; 24B/group = 16B low-plane + 8B high-plane, `I3_GROUP=64`/`I3_GBYTES=24`) | 1 `f32` per **64-input group**, `O*ceil(I/64)` entries | stable, upstream | `5e42e70` |
-| 6 | `e8-iq3` (E8/IQ3 lattice) | `O*ceil(I/256)*98` bytes (98-byte self-contained super-blocks: E8 lattice indices + parity signs + fp16 super-scales; `E8_QK=256`, `E8_BBYTES=98`) | none as a separate array — scales live **inside** the super-blocks; the `.qs` sidecar is a single-float tag (`ns==4` is the loader's discriminator). NOTE: stores `W@Q` (block-diagonal FWHT rotation) — activations must be rotated before the kernel | **stable, upstream** — [#465](https://github.com/JustVugg/colibri/pull/465) MERGED 2026-07-21 | dev `dce7012` |
-| 7 | `mxfp4` (no in-tree name string — dev has no stamp feature) | `O*ceil(I/2)` bytes (e2m1 nibbles, 2 packed values/byte — same nibble packing as fmt=2/4) | 1 `f32` per **group** of `gs` inputs (`gs=32` for Kimi K3; host gate requires `gs % 8 == 0`) | **stable, upstream** — Kimi K3 native routed-expert tier, **Vulkan backend only** (`c/backend_vulkan.c`, `c/shaders/qmatmul.comp`); NOT a CPU/`QT` format — `qt_resolve_fmt` never returns 7 and the Metal backend refuses it | merged [#676](https://github.com/JustVugg/colibri/issues/676)/[#705](https://github.com/JustVugg/colibri/pull/705) |
+| 6 | `e8-iq3-lattice` (E8/IQ3 lattice) | `O*ceil(I/256)*98` bytes (98-byte self-contained super-blocks: E8 lattice indices + parity signs + fp16 super-scales; `E8_QK=256`, `E8_BBYTES=98`) | none as a separate array — scales live **inside** the super-blocks; the `.qs` sidecar is a single-float tag (`ns==4` is the loader's discriminator). NOTE: stores `W@Q` (block-diagonal FWHT rotation) — activations must be rotated before the kernel | **stable, upstream** — [#465](https://github.com/JustVugg/colibri/pull/465) MERGED 2026-07-21 | dev `dce7012` |
+| 7 | `mxfp4` (no in-tree name string — dev has no stamp feature) | `O*ceil(I/2)` bytes (e2m1 nibbles, 2 packed values/byte — same nibble packing as fmt=2/4) | in the **container**: 1 **UE8M0** byte (u8 power-of-two exponent) per **group** of `gs=32` inputs; expanded to 1 `f32` per group at Vulkan upload (`c/kimi_k3.c`'s `mx4_scale` loop — the shader is float-only). Host gate: `gs >= 8 && gs % 8 == 0` (`c/backend_vulkan.c`) | **stable, upstream** — Kimi K3 native routed-expert tier, **Vulkan backend only** (`c/backend_vulkan.c`, `c/shaders/qmatmul.comp`); NOT a CPU/`QT` format — `qt_resolve_fmt` never returns 7 and the Metal backend refuses it | merged [#676](https://github.com/JustVugg/colibri/issues/676)/[#705](https://github.com/JustVugg/colibri/pull/705) |
 | **8** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) is IMPLEMENTED; **UE8M0** (1 byte/block, same block grid) is RECOGNIZED and refused by name, not yet implemented | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; developed under the PRIVATE ORDINAL BLOCK as `fmt=100`; assigned fmt=7 by the maintainer on #524, renumbered to **fmt=8** after #705 merged claiming 7 for MXFP4 while this pair was open (see "ID assignment" below) | `fmt7/fp8-passthrough` (PR 1) |
 
 With fmt 0–8 all assigned, the next free public ordinal is **9** — per the
@@ -95,7 +95,7 @@ pair's current restack, base dev `292ed4c`):
   (`quant.h:295`), `i3_rowbytes` (`quant.h:296`); kernel `matmul_i3`
   (`quant.h:354`); pack helper `pack_int3_g64` (`quant.h:956`). Allocation:
   `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:1105`).
-- **fmt=6** (`e8-iq3`) — upstream's merged code: format section header
+- **fmt=6** (`e8-iq3-lattice`) — upstream's merged code: format section header
   precedes `quant.h:1008`; constants `E8_QK=256` (`quant.h:1008`),
   `E8_SUB=32` (`quant.h:1009`), `E8_BBYTES=98` (`quant.h:1010`); row-byte
   helpers `e8_blocks`/`e8_rowbytes` (`quant.h:1011-1012`); rotation contract
@@ -109,9 +109,11 @@ pair's current restack, base dev `292ed4c`):
   branch `p.fmt == 4 || p.fmt == 7` in `c/shaders/qmatmul.comp` (e2m1 nibble
   decode, per-`gs`-group scale folded into the accumulation), host gate and
   sizing in `c/backend_vulkan.c` (`upload_tensor`'s `fmt == 4 || fmt == 7`
-  allow-list, `gs % 8 == 0`). Wired for Kimi K3's routed-expert tier
-  (`c/kimi_k3.c`); no CPU (`quant.h`) or Metal kernel exists for it, and
-  `qt_resolve_fmt` has no byte-arithmetic branch that returns 7.
+  allow-list, `gs >= 8 && gs % 8 == 0`). Wired for Kimi K3's routed-expert
+  tier (`c/kimi_k3.c`, which expands the container's per-32-group UE8M0 u8
+  exponents to the f32 group scales the shader consumes — `mx4_scale`); no
+  CPU (`quant.h`) or Metal kernel exists for it, and `qt_resolve_fmt` has
+  no byte-arithmetic branch that returns 7.
 - **fmt=8** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
   (`quant.h:446`) / `e4m3_decode` (`quant.h:480`), block size
   `FP8_BLOCK=128` (`quant.h:482`), kernel `matmul_fp8` (`quant.h:491`).
@@ -172,8 +174,14 @@ LANDMINE) also produces a UE8M0-vs-fmt=1 collision at different shapes (e.g.
 `O=1, I` in `(384,512]`), and the same small-shape corner of the fmt=6
 collision (SECOND DESIGN LANDMINE, `I=98`) has a UE8M0-scaled analogue at
 `O` in `(384,512]`. Both are handled explicitly in `qt_resolve_fmt` and
-covered by `tests/test_fp8_load.c`'s Part A3 suite. No real GLM tensor has
-these shapes; the discipline exists for untrusted containers.
+covered by `tests/test_fp8_load.c`'s Part A3/A3b suites. The
+UE8M0-vs-fmt=1 colliding family is exactly `nb == O*I && ns == O*4 &&
+ceil(O/128)*ceil(I/128) == 4*O`; at `I <= 16384` (`nblkI <= 128`)
+membership forces `O <= 32`, and every GLM-5.2 resident/routed role has
+`O >= 576` (`kv_a`'s `kv_lora+qk_rope` is the smallest — the role census
+in `c/tools/fp8_collision_census.py`, run against the real checkpoint in
+this PR's rev5 round), so no GLM-5.2 tensor is a member; the discipline
+exists for untrusted containers.
 
 ## PRIVATE ORDINAL BLOCK convention (this repo, pending upstream review)
 
@@ -269,11 +277,15 @@ handful to a few hundred tensors per model (`q_a`/`q_b`/`kv_a`/`kv_b_proj`,
 census in `c/tools/fp8_collision_census.py`), **never** the tens of
 thousands of routed-expert tensors a large MoE checkpoint carries. A
 container whose combined stamp map exceeds 4096 entries is not using this
-convention as it's designed to be used — most plausibly a malformed or
-adversarial container trying to force an unbounded ingest allocation during
-header parsing, before any size/shape validation has even run. Refusing
-loudly at that bound is the same "untrusted container, refuse rather than
-guess" discipline `qt_resolve_fmt` applies everywhere else in this feature.
+convention as it's designed to be used. To be precise about what the cap
+bounds: the `colibri.fmt` blob is JSON-parsed in full **before** the
+per-entry cap is checked, so the parse allocation itself is bounded by the
+shard-header size cap (`ST_MAX_HEADER`), not by this constant — what the
+cap bounds is the **persistent** per-tensor arrays (`fmt_name`/`fmt_val`
+strdups on `shards`) that would otherwise grow with an adversarial map,
+plus every later `st_fmt_stamp` linear scan over them. Refusing loudly at
+that bound is the same "untrusted container, refuse rather than guess"
+discipline `qt_resolve_fmt` applies everywhere else in this feature.
 
 ### Discovery-time abort surface
 

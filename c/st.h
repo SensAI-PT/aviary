@@ -246,9 +246,13 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
  * carries (tools/repack_fp8_passthrough.py never stamps routed experts). A
  * container whose combined __metadata__["colibri.fmt"] entries exceed this
  * cap is not using the convention as designed -- CAP, not a switch to a hash
- * table: refuse loudly rather than grow an unbounded array for an untrusted
- * container that might be trying to force a large ingest allocation during
- * header parsing, before any other validation has run. */
+ * table. Precisely what this bounds: the colibri.fmt blob is json_parse'd in
+ * FULL before the per-entry check below fires, so the parse allocation
+ * itself is bounded by ST_MAX_HEADER (the shard-header size cap), not by
+ * this constant -- what the cap bounds is the PERSISTENT fmt_name/fmt_val
+ * strdup arrays on `shards` (and every later st_fmt_stamp linear scan over
+ * them), which would otherwise grow with an adversarial map. Refuse loudly
+ * rather than carry an absurd stamp map forward. */
 #define ST_FMT_STAMP_MAX 4096
 
 /* Parses one shard's __metadata__["colibri.fmt"] value (a safetensors metadata
