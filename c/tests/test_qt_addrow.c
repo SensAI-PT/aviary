@@ -4,8 +4,8 @@
  * fmt 0/4/5 explicitly, then fall through assuming a PER-ROW scale (t->s[row]) followed by
  * fmt=1/2/3 (qt_addrow) or fmt=0/1/2/3/4/5 (qt_matvec_rows, via an if/else-if chain ending
  * in a bare `else`) -- nothing stopped fmt=6 (E8/IQ3, t->s is a FIXED 4-byte tag, not O
- * floats) or fmt=7 (fp8-e4m3-b128, t->s holds per-128x128-block floats, not O; t->q4 is
- * NULL) from reaching that fall-through. For fmt=7 specifically this SIGSEGVs: t->s[row]
+ * floats) or fmt=8 (fp8-e4m3-b128, t->s holds per-128x128-block floats, not O; t->q4 is
+ * NULL) from reaching that fall-through. For fmt=8 specifically this SIGSEGVs: t->s[row]
  * overreads (silently, usually not fatal on its own), then the untouched tail computes
  * `t->q4+(int64_t)row*((I+3)/4)` on a NULL t->q4 and dereferences it. For fmt=6 it silently
  * misreads the real E8/IQ3 lattice bytes as int2-packed data (same bug SHAPE as #298's CUDA
@@ -14,7 +14,7 @@
  * any fmt they don't explicitly handle, matching qt_resolve_fmt's own "refuse rather than
  * misread" discipline.
  *
- * This file: (1) proves the refusal fires for fmt=6 and fmt=7 through BOTH functions
+ * This file: (1) proves the refusal fires for fmt=6 and fmt=8 through BOTH functions
  * (fork+pipe+waitpid, this suite's established house pattern for exit(1)-terminated paths --
  * see tests/test_fp8_load.c's expect_refuse/expect_stamp_refuse); (2) proves every format
  * BOTH functions still legitimately handle (0/1/2/3/4/5) produces byte-identical results
@@ -24,10 +24,10 @@
  * would show up here, not just tautologically re-run the same code). Reachability note (not
  * a scope excuse, just context): both functions serve ONLY the kv_b absorb path
  * (attention_rows/decode call sites), and tools/repack_fp8_passthrough.py deliberately
- * excludes kv_b_proj from fmt=7 repacking -- so this fires only via a hand-slotted or
+ * excludes kv_b_proj from fmt=8 repacking -- so this fires only via a hand-slotted or
  * ambiguous-collision container, not this repo's own tooling's own output. Crash-instead-of-
  * refuse is still a real defect (spec I6: loud failure, every refusal names its condition),
- * and the fmt=7 QT surface these functions can now be handed is one this same PR pair
+ * and the fmt=8 QT surface these functions can now be handed is one this same PR pair
  * created. */
 #define main coli_glm_main_unused
 #include "../colibri.c"
@@ -191,13 +191,13 @@ static void test_byte_identity_all_formats(void){
  * expect_refuse/expect_stamp_refuse) -- must exit(1) with a "refus"-containing message,
  * never reach the caller's continuation, never crash with a signal. ---- */
 typedef void (*absorb_fn)(void);
-static void call_addrow_fmt7(void){
+static void call_addrow_fmt8(void){
     QT t; memset(&t,0,sizeof t);
     enum { O=130, I=130 };   /* the coordinator's own repro shape: nblkO=nblkI=2, nblk=4 */
     static uint8_t q8[O*I]; static float s[4];
     for(int i=0;i<O*I;i++) q8[i]=rndbyte();
     for(int i=0;i<4;i++) s[i]=0.01f;
-    t.fmt=7; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
+    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
     float acc[I]; memset(acc,0,sizeof acc);
     qt_addrow(&t,0,1.f,acc);   /* must exit(1) inside; must NOT return */
 }
@@ -211,13 +211,13 @@ static void call_addrow_fmt6(void){
     float acc[I]; memset(acc,0,sizeof acc);
     qt_addrow(&t,0,1.f,acc);
 }
-static void call_matvec_fmt7(void){
+static void call_matvec_fmt8(void){
     QT t; memset(&t,0,sizeof t);
     enum { O=130, I=130 };
     static uint8_t q8[O*I]; static float s[4];
     for(int i=0;i<O*I;i++) q8[i]=rndbyte();
     for(int i=0;i<4;i++) s[i]=0.01f;
-    t.fmt=7; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
+    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q8; t.s=s;
     static float x[I]; for(int i=0;i<I;i++) x[i]=rndsmallf();
     float y=0.f;
     qt_matvec_rows(&t,0,1,x,&y);
@@ -271,9 +271,9 @@ static int expect_refuse_call(absorb_fn fn, const char *tag){
 }
 
 static void test_refusals(void){
-    CHECK(expect_refuse_call(call_addrow_fmt7,  "qt_addrow refuses fmt=7 (was SIGSEGV)"));
+    CHECK(expect_refuse_call(call_addrow_fmt8,  "qt_addrow refuses fmt=8 (was SIGSEGV)"));
     CHECK(expect_refuse_call(call_addrow_fmt6,  "qt_addrow refuses fmt=6"));
-    CHECK(expect_refuse_call(call_matvec_fmt7,  "qt_matvec_rows refuses fmt=7"));
+    CHECK(expect_refuse_call(call_matvec_fmt8,  "qt_matvec_rows refuses fmt=8"));
     CHECK(expect_refuse_call(call_matvec_fmt6,  "qt_matvec_rows refuses fmt=6"));
 }
 

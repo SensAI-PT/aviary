@@ -15,7 +15,7 @@
  * Usage: test_fp8_e2e_loader <container_dir> [name O I]...
  * For every (name,O,I) triple, calls the REAL qt_from_disk (the identical
  * function every model load uses) and asserts:
- *   (a) fmt==7 resolved (native fp8-e4m3-passthrough, via byte-arithmetic
+ *   (a) fmt==8 resolved (native fp8-e4m3-passthrough, via byte-arithmetic
  *       inference alone -- this PR's repack tool writes no container
  *       metadata stamp, see repack_fp8_passthrough.py's module docstring);
  *   (b) the weight (q8) and scale (s) buffers are non-NULL;
@@ -53,12 +53,12 @@ int main(int argc, char **argv){
         QT t; memset(&t,0,sizeof t);
         qt_from_disk(&gm, name, O, I, 8, 0, &t);   /* THE REAL LOADER PATH -- not mocked */
 
-        if(t.fmt != 7){
-            printf("FAIL %s: fmt=%d, expected 7 (native fp8-e4m3 passthrough)\n", name, t.fmt);
+        if(t.fmt != 8){
+            printf("FAIL %s: fmt=%d, expected 8 (native fp8-e4m3 passthrough)\n", name, t.fmt);
             fails++; continue;
         }
         if(!t.q8 || !t.s){
-            printf("FAIL %s: fmt=7 but q8=%p s=%p (expected both non-NULL)\n",
+            printf("FAIL %s: fmt=8 but q8=%p s=%p (expected both non-NULL)\n",
                    name, (void*)t.q8, (void*)t.s);
             fails++; continue;
         }
@@ -77,7 +77,7 @@ int main(int argc, char **argv){
             printf("FAIL %s: non-finite dequantized value at flat index %lld\n", name, (long long)bad);
             fails++; continue;
         }
-        printf("ok %s: fmt=7 O=%d I=%d, weights+scale loaded through the real loader, all-finite\n",
+        printf("ok %s: fmt=8 O=%d I=%d, weights+scale loaded through the real loader, all-finite\n",
                name, O, I);
     }
     if(fails){ printf("fp8 e2e repack->load: %d/%d tensor(s) FAILED\n", fails, ntensors); return 1; }

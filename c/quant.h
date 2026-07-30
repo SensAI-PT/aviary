@@ -402,17 +402,20 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
     }
 }
 
-/* ---- fmt=7: native FP8-e4m3 passthrough (Z.ai GLM-5.2-FP8 read path) ------
- * PUBLIC ordinal, assigned by the maintainer on #524. This format was minted
- * fmt=6 during original development, then re-tagged fmt=100 (PRIVATE ORDINAL
- * BLOCK, see colibri.c's QT struct comment) after #465 (E8/IQ3, above) claimed
- * ordinal 6 upstream out from under it; fmt=7 is the number it graduated to at
- * merge, per the private-block convention's own "find-and-replace, zero
- * on-disk impact" promise. See qt_resolve_fmt in colibri.c ("THE DESIGN
+/* ---- fmt=8: native FP8-e4m3 passthrough (Z.ai GLM-5.2-FP8 read path) ------
+ * PUBLIC ordinal. This format was minted fmt=6 during original development,
+ * then re-tagged fmt=100 (PRIVATE ORDINAL BLOCK, see colibri.c's QT struct
+ * comment) after #465 (E8/IQ3, above) claimed ordinal 6 upstream out from
+ * under it; graduated to fmt=7 when the maintainer assigned that ordinal on
+ * #524; renumbered a second time to fmt=8 after #705 merged into dev claiming
+ * fmt=7 for MXFP4 (Kimi K3 Vulkan tier, backend_vulkan.c) while this PR was
+ * still open. Both renumbers were pure retags, per the private-block
+ * convention's own "find-and-replace, zero on-disk impact" promise: nothing
+ * on disk carries the ordinal. See qt_resolve_fmt in colibri.c ("THE DESIGN
  * LANDMINE") for the disambiguation this needs against BOTH fmt=1 (int8) and
  * fmt=6 (E8/IQ3).
  *
- * fmt=7 weight bytes are O*I raw e4m3 bytes -- byte-identical to int8 (fmt=1).
+ * fmt=8 weight bytes are O*I raw e4m3 bytes -- byte-identical to int8 (fmt=1).
  * What makes this a DIFFERENT format is the scale: one f32 per 128x128 BLOCK of
  * the [O,I] weight matrix (shape [ceil(O/128),ceil(I/128)]), not one f32 per
  * output row. Dequant is w[o,i] = e4m3_decode(byte) * scale[o/128, i/128]
@@ -438,7 +441,7 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
  * exactly like any other source of a NaN weight (fmt=0/f32 tensors are never
  * scrubbed either). The engine already has a dedicated, TESTED safety net for
  * NaN reaching the sampler (argmax_v/dist_build, see tests/test_logit_nan.c:
- * "degrade + diagnose, never silently corrupt") -- fmt=7 relies on that existing
+ * "degrade + diagnose, never silently corrupt") -- fmt=8 relies on that existing
  * downstream net rather than adding a second, redundant weight-level scrub. */
 static const float E4M3_LUT[256] = {
     0x0.0p+0f,0x1.0000000000000p-9f,0x1.0000000000000p-8f,0x1.8000000000000p-8f,0x1.0000000000000p-7f,0x1.4000000000000p-7f,0x1.8000000000000p-7f,0x1.c000000000000p-7f,

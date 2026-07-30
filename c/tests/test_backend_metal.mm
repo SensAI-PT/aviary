@@ -10,7 +10,7 @@
 #include <cmath>
 #include <vector>
 
-enum { F32=0, I8=1, I4=2, I2=3, I4G=4, FP8=7 };
+enum { F32=0, I8=1, I4=2, I2=3, I4G=4, FP8=8 };
 
 static void cpu_ref(int fmt, const void *W, const float *s, const float *x,
                     float *y, int S, int I, int O) {
@@ -80,12 +80,12 @@ static void cpu_ref_grouped(const uint8_t *q4, const float *scale, const float *
   }
 }
 
-// ---- fmt=7 (native FP8-e4m3 passthrough -- see colibri.c): own CPU reference +
+// ---- fmt=8 (native FP8-e4m3 passthrough -- see colibri.c): own CPU reference +
 // harness --------------------------------------------------------------------------
 // Independent reference decode (bit manipulation, NOT quant.h's E4M3_LUT -- this file
 // stays self-contained like the rest of its CPU references) for OCP E4M3-FN: exp==0 is
 // subnormal, exp==0xF&&mant==0x7 is the only NaN code (both signs), else normal with
-// bias 7. Must match quant.h's e4m3_decode AND the mm_gemv fmt==7 branch's in-kernel
+// bias 7. Must match quant.h's e4m3_decode AND the mm_gemv fmt==8 branch's in-kernel
 // bit manipulation exactly -- see run_fp8_lut() below for the exhaustive 256-code check
 // that proves the GPU kernel agrees with this reference (and by transitivity with the
 // CPU LUT, which was cross-checked byte-for-byte against torch.float8_e4m3fn offline).
@@ -231,7 +231,7 @@ static int run_fp8_lut(const char *name) {
 }
 
 // Confirms the documented "GEMM path optional this build" claim is actually true, not
-// just asserted in a comment: coli_metal_gemm must refuse fmt=7 (return 0, the CPU-
+// just asserted in a comment: coli_metal_gemm must refuse fmt=8 (return 0, the CPU-
 // fallback signal) so matmul_qt_ex's caller-side allowlist exclusion is backed by a
 // second, independent gate inside the Metal backend itself.
 static int run_fp8_gemm_gate(const char *name) {
@@ -242,20 +242,20 @@ static int run_fp8_gemm_gate(const char *name) {
   return ok?0:1;
 }
 
-// colibri.c's moe() has a THIRD fmt=7-adjacent Metal entry point besides the two
+// colibri.c's moe() has a THIRD fmt=8-adjacent Metal entry point besides the two
 // guarded above (bind_gemv's attn/layer-decode shaders and coli_metal_gemm) -- the
 // batched routed-expert dispatch via coli_metal_moe_block[_begin] (colibri.c's
 // MB_BUILD macro). MB_BUILD's own pointer-selection ternary does NOT special-case
-// fmt=7: if a layer's shared expert is fmt=7 and MB_BUILD's TRY_SH path picks it
+// fmt=8: if a layer's shared expert is fmt=8 and MB_BUILD's TRY_SH path picks it
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
-// (q4, NULL/stale for an fmt=7 tensor whose weights live in q8) tagged as fmt=7.
+// (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
 // `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
-// dereferenced or even resolve()'d -- so an fmt=7 submission is refused before the
+// dereferenced or even resolve()'d -- so an fmt=8 submission is refused before the
 // bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
 // holds) to prove the fence BY TEST rather than leaving it an artifact of moe_submit's
-// fmt allowlist happening not to include 7 (yet) -- same discipline
+// fmt allowlist happening not to include 8 (yet) -- same discipline
 // run_fp8_gemm_gate above applies to coli_metal_gemm's analogous exclusion.
 static int run_fp8_moe_gate(const char *name) {
   const void *bad = (const void*)(uintptr_t)0xdeadbeef;   // must NEVER be dereferenced
@@ -599,7 +599,7 @@ int main(void) {
   // tail-clipping regime grouped scales exist for), verified end-to-end through the GPU.
   fail |= run_grouped(5,   512, 64,3,1, "grouped I=512(mult64) outlier-heavy S=3");
   fail |= run_grouped(5,   201, 64,2,1, "grouped I=201(non-mult-64) outlier-heavy S=2");
-  printf("Metal fmt=7 native FP8-e4m3 passthrough tests:\n");
+  printf("Metal fmt=8 native FP8-e4m3 passthrough tests:\n");
   fail |= run_fp8_lut("fp8 LUT exactness (256/256 codes via GPU kernel)");
   fail |= run_fp8(2048,6144,1, "fp8 gate/up-shaped O=2048 I=6144 (spec example) S=1");
   fail |= run_fp8(6144,2048,1, "fp8 down-shaped O=6144 I=2048 S=1");
@@ -614,7 +614,7 @@ int main(void) {
   // scale and this shape/scale choice makes that numerically loud.
   fail |= run_fp8(384, 6144, 3, "fp8 non-square block grid nblkO=3 nblkI=48 (stride audit)");
   fail |= run_fp8_gemm_gate("fp8 GEMM entry explicitly gated off (coli_metal_gemm refuses)");
-  fail |= run_fp8_moe_gate("fp8 MB_BUILD/moe_submit entry gated off (shared-expert fmt=7 hazard)");
+  fail |= run_fp8_moe_gate("fp8 MB_BUILD/moe_submit entry gated off (shared-expert fmt=8 hazard)");
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");

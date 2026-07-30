@@ -1,4 +1,4 @@
-/* fmt=7 (native FP8-e4m3 passthrough) CPU kernel tests: LUT exactness (all 256
+/* fmt=8 (native FP8-e4m3 passthrough) CPU kernel tests: LUT exactness (all 256
  * byte codes, incl. +-0, subnormals, NaN), matmul_fp8 vs a double-precision
  * block-scale reference on block-edge (non-128-multiple O/I) shapes, a
  * non-square-block-grid case with a distinct scale per block (catches a
@@ -10,12 +10,14 @@
  * compute" header comment) -- the loader-seam (qt_resolve_fmt disambiguation,
  * qt_from_disk) is covered separately in test_fp8_load.c.
  *
- * fmt=7, PUBLIC ordinal assigned by the maintainer on #524: this format was
- * minted fmt=6 during original development of this branch, before dev's own
- * #465 (E8/IQ3) claimed that ordinal upstream; re-tagged fmt=100 (PRIVATE
- * ORDINAL BLOCK, see colibri.c's QT struct comment) from that point forward --
- * there was never a build in this branch's history where this format was
- * reachable as fmt=6 -- and graduated to fmt=7 at merge. */
+ * fmt=8, PUBLIC ordinal: this format was minted fmt=6 during original
+ * development of this branch, before dev's own #465 (E8/IQ3) claimed that
+ * ordinal upstream; re-tagged fmt=100 (PRIVATE ORDINAL BLOCK, see colibri.c's
+ * QT struct comment) from that point forward -- there was never a build in
+ * this branch's history where this format was reachable as fmt=6 -- graduated
+ * to fmt=7 when the maintainer assigned that ordinal on #524, and renumbered
+ * to fmt=8 after #705 merged claiming 7 for MXFP4 (see colibri.c's QT
+ * comment). */
 #include "../quant.h"
 #include <stdio.h>
 #include <string.h>
@@ -92,7 +94,7 @@ static void ref_matmul_fp8(double *y, double *mag, const float *x, const uint8_t
 }
 
 /* magnitude-relative Sigma|terms| oracle (the convention test_backend_metal.mm's
- * cpu_ref_grouped/run_grouped established for fmt=4 and reuses for fmt=7 on the
+ * cpu_ref_grouped/run_grouped established for fmt=4 and reuses for fmt=8 on the
  * GPU side): compare error against the sum of |terms|, not the (possibly
  * near-zero, cancellation-prone) result itself. */
 static int check_close(const float *got, const double *ref, const double *mag, int n, double tol, const char *tag){

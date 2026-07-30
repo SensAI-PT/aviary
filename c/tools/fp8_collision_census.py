@@ -29,7 +29,7 @@ Scope: RESIDENT-kind tensor roles only (o_proj, q_a/q_b_proj,
 kv_a_proj_with_mqa, kv_b_proj, dense-MLP gate/up/down, shared-expert
 gate/up/down) plus routed-expert gate/up/down for completeness -- these are
 the only roles tools/repack_fp8_passthrough.py's RESIDENT_KINDS classify()
-taxonomy could ever select for fmt=7 repacking (routed experts are excluded
+taxonomy could ever select for fmt=8 repacking (routed experts are excluded
 by that tool's own design and stay on int4-g64/E8, but are included here
 anyway since the collision predicate is a pure function of [O,I], independent
 of current on-disk format). f32/norm/router/embed/lm_head tensors are not
@@ -100,14 +100,14 @@ def classify_shape(name, cfg):
     if name.endswith("self_attn.kv_a_proj_with_mqa.weight"):
         return ("self_attn.kv_a_proj_with_mqa", kv_lora + qk_rope, D)
     if name.endswith("self_attn.kv_b_proj.weight"):
-        return ("self_attn.kv_b_proj (kvb -- excluded from fmt=7 repack, see tool docstring)",
+        return ("self_attn.kv_b_proj (kvb -- excluded from fmt=8 repack, see tool docstring)",
                  H * (qk_nope + v_head), kv_lora)
     if ".mlp.experts." in name and name.endswith("gate_proj.weight"):
-        return ("mlp.experts.*.gate_proj (routed -- excluded from fmt=7 repack)", moe_inter, D)
+        return ("mlp.experts.*.gate_proj (routed -- excluded from fmt=8 repack)", moe_inter, D)
     if ".mlp.experts." in name and name.endswith("up_proj.weight"):
-        return ("mlp.experts.*.up_proj (routed -- excluded from fmt=7 repack)", moe_inter, D)
+        return ("mlp.experts.*.up_proj (routed -- excluded from fmt=8 repack)", moe_inter, D)
     if ".mlp.experts." in name and name.endswith("down_proj.weight"):
-        return ("mlp.experts.*.down_proj (routed -- excluded from fmt=7 repack)", D, moe_inter)
+        return ("mlp.experts.*.down_proj (routed -- excluded from fmt=8 repack)", D, moe_inter)
     if "shared_experts" in name and name.endswith("gate_proj.weight"):
         return ("mlp.shared_experts.gate_proj", moe_inter, D)
     if "shared_experts" in name and name.endswith("up_proj.weight"):

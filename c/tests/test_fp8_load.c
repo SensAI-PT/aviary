@@ -1,18 +1,19 @@
-/* fmt=7 (native FP8-e4m3 passthrough) loader-seam tests.
+/* fmt=8 (native FP8-e4m3 passthrough) loader-seam tests.
  *
- * fmt=7, PUBLIC ordinal assigned by the maintainer on #524: this format was
- * minted fmt=6 during original development of this branch, before dev's own
- * #465 (E8/IQ3) claimed that ordinal upstream and merged it into dev as a
- * REAL fmt=6 (see quant.h's E8 constants and e8_ helper functions, and
- * qt_resolve_fmt's ns==4-tag early check); re-tagged fmt=100 (PRIVATE ORDINAL
- * BLOCK, see colibri.c's QT struct comment) from that point forward -- there
- * was never a build in this branch's history where this format was reachable
- * as fmt=6 -- and graduated to fmt=7 at merge.
+ * fmt=8, PUBLIC ordinal: this format was minted fmt=6 during original
+ * development of this branch, before dev's own #465 (E8/IQ3) claimed that
+ * ordinal upstream and merged it into dev as a REAL fmt=6 (see quant.h's E8
+ * constants and e8_ helper functions, and qt_resolve_fmt's ns==4-tag early
+ * check); re-tagged fmt=100 (PRIVATE ORDINAL BLOCK, see colibri.c's QT struct
+ * comment) from that point forward -- there was never a build in this branch's
+ * history where this format was reachable as fmt=6 -- graduated to fmt=7 when
+ * the maintainer assigned that ordinal on #524, and renumbered to fmt=8 after
+ * #705 merged claiming 7 for MXFP4 (see colibri.c's QT comment).
  *
- * Part A: qt_resolve_fmt disambiguation suite -- THE DESIGN LANDMINE. fmt=7
+ * Part A: qt_resolve_fmt disambiguation suite -- THE DESIGN LANDMINE. fmt=8
  * weight bytes are byte-identical to fmt=1 (int8): both are O*I raw bytes.
  * The two are told apart ONLY by the scale array's byte count (per-row O*4 for
- * fmt=1, per-128x128-block ceil(O/128)*ceil(I/128)*4 for fmt=7, THIS build's
+ * fmt=1, per-128x128-block ceil(O/128)*ceil(I/128)*4 for fmt=8, THIS build's
  * implemented f32 scale encoding). For some shapes those two counts coincide
  * exactly -- INVERSION (maintainer review, #528): qt_resolve_fmt used to
  * REFUSE (exit(1)) this ambiguous case; it now resolves to fmt=1 (the
@@ -20,8 +21,8 @@
  * collision is not hypothetical (GLM-5.2's own self_attn.o_proj.weight hits
  * it, see qt_resolve_fmt's own "REVIEW FINDING"/"INVERSION" comment) and the
  * writer side (repack_fp8_passthrough.py's _check_geometry) now refuses to
- * ever EMIT an fmt=7 container at this same shape, so an unstamped ambiguous
- * tensor reaching this function is never a genuine fmt=7 candidate. The
+ * ever EMIT an fmt=8 container at this same shape, so an unstamped ambiguous
+ * tensor reaching this function is never a genuine fmt=8 candidate. The
  * former refusal-testing convention (fork()+waitpid(), mirroring
  * tests/test_st_pread.c's exit(1)-path idiom) is kept for the OTHER
  * refusing cases below (Part A2's fmt=6 collision, Part A3's UE8M0
@@ -29,11 +30,11 @@
  * refusal) -- only the is_row&&is_blk collision in this Part flipped from
  * expect_refuse to expect_fmt(...,1,...).
  *
- * Part A2: fmt=6 (E8/IQ3, upstream #465) vs fmt=7 collision at [O<=128 or
+ * Part A2: fmt=6 (E8/IQ3, upstream #465) vs fmt=8 collision at [O<=128 or
  * O in a 128-block-count range, I=98] -- SECOND DESIGN LANDMINE. Unchanged by
  * the #528 inversion above (a different collision predicate, still refused).
  *
- * Part A3: fmt=7's scale ENCODING is a declared property, not a hardcoded
+ * Part A3: fmt=8's scale ENCODING is a declared property, not a hardcoded
  * constant -- f32 (Part A/A2 above) is what this build implements. A UE8M0
  * (1 byte/block) encoding is a REAL, distinct byte signature (the DeepSeek-V4
  * checkpoint format for this identical weight geometry) this build recognizes
@@ -42,13 +43,13 @@
  * doesn't have -- see qt_resolve_fmt's own comment).
  *
  * Part B: qt_from_disk loader-seam -- writes a real single-shard .safetensors
- * file containing an fmt=7 tensor (U8 weight + per-block F32 .qs) next to an
+ * file containing an fmt=8 tensor (U8 weight + per-block F32 .qs) next to an
  * int8 control tensor of a DIFFERENT, non-colliding shape, loads both through
- * qt_from_disk, and checks the byte-count/.qs-size inference picks fmt=7 vs
+ * qt_from_disk, and checks the byte-count/.qs-size inference picks fmt=8 vs
  * fmt=1 correctly and the loaded weights dequantize identically to a reference.
  * Mirrors tests/test_int3_load.c's structure for fmt=5.
  *
- * Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=7, plus
+ * Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=8, plus
  * qt_wire_split() -- the shared weight/scale byte-range split qt_wire_mmap
  * and qt_unwire_mmap both now call (maintainer review, #528: qt_scale_bytes()
  * existed correctly but neither call site actually used it, a defect only
@@ -212,8 +213,8 @@ static void test_disambiguation(void){
     /* --- non-degenerate golden paths (unambiguous either way) --- */
     CHECK(expect_fmt(4096,4096,(int64_t)4096*4096,4096*4,1,"plain int8 4096x4096"));
     /* spec's own worked example: [2048,6144] expert -> block scale [16,48] */
-    CHECK(expect_fmt(2048,6144,(int64_t)2048*6144,16LL*48*4,7,"fp8 2048x6144 (spec example)"));
-    CHECK(expect_fmt(384,6144,(int64_t)384*6144,3LL*48*4,7,"fp8 384x6144 non-square block grid"));
+    CHECK(expect_fmt(2048,6144,(int64_t)2048*6144,16LL*48*4,8,"fp8 2048x6144 (spec example)"));
+    CHECK(expect_fmt(384,6144,(int64_t)384*6144,3LL*48*4,8,"fp8 384x6144 non-square block grid"));
 
     /* --- REGRESSION (maintainer review, #528): GLM-5.2's own
      * self_attn.o_proj.weight, [D,H*v_head]=[6144,16384]. nblkO=ceil(6144/128)=48,
@@ -259,17 +260,17 @@ static void test_disambiguation(void){
     /* --- boundary-ADJACENT non-degenerate cases: one step past each
      * degenerate case above, both interpretations now legitimately resolve. --- */
     CHECK(expect_fmt(1,129, 129,   4, 1, "adjacent O=1 I=129 as fmt=1 (ns=row)"));
-    CHECK(expect_fmt(1,129, 129,   8, 7, "adjacent O=1 I=129 as fmt=7 (ns=block, nblkI=2)"));
+    CHECK(expect_fmt(1,129, 129,   8, 8, "adjacent O=1 I=129 as fmt=8 (ns=block, nblkI=2)"));
     CHECK(expect_fmt(2,257, 2LL*257, 8,  1, "adjacent O=2 I=257 as fmt=1 (ns=row)"));
-    CHECK(expect_fmt(2,257, 2LL*257, 12, 7, "adjacent O=2 I=257 as fmt=7 (ns=block, nblkI=3)"));
+    CHECK(expect_fmt(2,257, 2LL*257, 12, 8, "adjacent O=2 I=257 as fmt=8 (ns=block, nblkI=3)"));
 
     /* --- neither interpretation matches: garbage .qs size, must still refuse
-     * (the pre-existing generic-mismatch path, exercised through the fmt=7-aware
+     * (the pre-existing generic-mismatch path, exercised through the fmt=8-aware
      * function to confirm the new code didn't disturb it). --- */
     CHECK(expect_refuse(10,10, 100, 999, "garbage ns matches neither row nor block layout"));
 }
 
-/* ---- Part A2: fmt=6 (E8/IQ3, upstream #465, merged into dev) vs fmt=7
+/* ---- Part A2: fmt=6 (E8/IQ3, upstream #465, merged into dev) vs fmt=8
  * (this branch's fp8-e4m3-b128) collision -- SECOND DESIGN LANDMINE, see the
  * derivation in qt_resolve_fmt's own comment. e8_rowbytes(I) is the constant
  * 98 for every I in (0,256], so dev's fmt=6 tag check (ns==4 &&
@@ -280,31 +281,31 @@ static void test_disambiguation(void){
  * same as the E8 tag. An unstamped [I=98] fp8-e4m3-b128 tensor at either of
  * those shapes is therefore byte-for-byte indistinguishable from a genuine
  * fmt=6 tensor: nb AND ns both coincide, not just ns (contrast the fmt=1/
- * fmt=7 collision in Part A, where only ns ever coincides). O==1 stacks a
+ * fmt=8 collision in Part A, where only ns ever coincides). O==1 stacks a
  * THIRD candidate: fmt=1's per-row ns (O*4) is also 4 there. This build has
  * no stamp to resolve any of these -- every one refuses. */
 static void test_fmt6_fp8_collision(void){
-    /* O=64, I=98: nblkO=nblkI=1 (fmt=7, single block, f32 scales) -> ns=4;
+    /* O=64, I=98: nblkO=nblkI=1 (fmt=8, single block, f32 scales) -> ns=4;
      * e8_blocks(98)=1 -> nb=O*98=6272 for BOTH interpretations, and fmt=6's
      * .qs tag is always exactly one f32 -> ns=4 too. Must refuse. */
     int64_t nb64=(int64_t)64*98;
-    CHECK(expect_refuse(64,98, nb64, 4, "fmt=6/fmt=7(f32) collision O=64 I=98"));
-    /* boundary O=128 variant: still nblkO=1 for fmt=7 (128<=128), same collision. */
+    CHECK(expect_refuse(64,98, nb64, 4, "fmt=6/fmt=8(f32) collision O=64 I=98"));
+    /* boundary O=128 variant: still nblkO=1 for fmt=8 (128<=128), same collision. */
     int64_t nb128=(int64_t)128*98;
-    CHECK(expect_refuse(128,98, nb128, 4, "fmt=6/fmt=7(f32) collision O=128 I=98"));
+    CHECK(expect_refuse(128,98, nb128, 4, "fmt=6/fmt=8(f32) collision O=128 I=98"));
 
     /* O=1, I=98: a THIRD candidate stacks on (fmt=1 plain int8 per-row, ns==O*4==4
      * too) -- a genuine three-way ambiguity. Must refuse. */
     int64_t nb1=(int64_t)1*98;
-    CHECK(expect_refuse(1,98, nb1, 4, "fmt=1/fmt=6/fmt=7(f32) THREE-way collision O=1 I=98"));
+    CHECK(expect_refuse(1,98, nb1, 4, "fmt=1/fmt=6/fmt=8(f32) THREE-way collision O=1 I=98"));
 
-    /* O in (384,512], I=98: nblkO=4, nblkI=1, product=4 -- a fmt=7 tensor with
+    /* O in (384,512], I=98: nblkO=4, nblkI=1, product=4 -- a fmt=8 tensor with
      * UE8M0 (1 byte/block) scales also lands at ns==4*1==4 here, the SAME tag
      * fmt=6 uses. Must refuse (and, since this build doesn't implement ue8m0
      * decode at all, would refuse on that basis alone even without the fmt=6
      * collision -- this case exercises the OUTER fmt=6 guard specifically). */
     int64_t nb400=(int64_t)400*98;
-    CHECK(expect_refuse(400,98, nb400, 4, "fmt=6/fmt=7(ue8m0, 4-block) collision O=400 I=98"));
+    CHECK(expect_refuse(400,98, nb400, 4, "fmt=6/fmt=8(ue8m0, 4-block) collision O=400 I=98"));
 
     /* regression guard: a GENUINE (non-colliding) fmt=6 fixture -- I!=98, so
      * e8_rowbytes(I)==98 does NOT equal O*I -- must keep resolving to fmt=6.
@@ -317,10 +318,10 @@ static void test_fmt6_fp8_collision(void){
         "genuine fmt=6 (non-colliding) O=64 I=256 (I!=98, no collision) -> fmt=6"));
 }
 
-/* ---- Part A3: fmt=7's scale ENCODING is a declared property -- UE8M0
+/* ---- Part A3: fmt=8's scale ENCODING is a declared property -- UE8M0
  * recognized, refused by name (not implemented in this build). ---- */
 static void test_ue8m0_scale_refusal(void){
-    /* [2048,6144] (spec example shape, same as Part A's fmt=7/f32 golden
+    /* [2048,6144] (spec example shape, same as Part A's fmt=8/f32 golden
      * path): nblkO=16, nblkI=48, product=768 blocks. A UE8M0 sidecar is
      * exactly 1 byte/block -> ns=768, distinct from BOTH fmt=1's per-row
      * count (O*4=8192) and this build's f32 block-scale count (768*4=3072).
@@ -342,7 +343,7 @@ static void test_ue8m0_scale_refusal(void){
 
 /* ---- Part B: qt_from_disk loader-seam (real safetensors file) ---- */
 
-static void deq_fmt7(const QT *t, float *dq){
+static void deq_fmt8(const QT *t, float *dq){
     int64_t nblkI = fp8_nblk(t->I);
     for(int o=0;o<t->O;o++){
         int64_t blkO = o/FP8_BLOCK; const float *scl = t->s + blkO*nblkI;
@@ -410,12 +411,12 @@ static void test_loader_seam(void){
 
     QT t7; memset(&t7,0,sizeof t7);
     qt_from_disk(&gm,"w7",O7,I7,8,0,&t7);
-    CHECK(t7.fmt==7);
+    CHECK(t7.fmt==8);
     CHECK(t7.q8!=NULL && t7.s!=NULL);            /* both weight and scale allocated (qalloc, not falloc) */
     static float dq_load[O7*I7], dq_ref[O7*I7];
-    deq_fmt7(&t7,dq_load);
-    QT tr7={.fmt=7,.q8=(int8_t*)q7,.s=s7,.O=O7,.I=I7};
-    deq_fmt7(&tr7,dq_ref);
+    deq_fmt8(&t7,dq_load);
+    QT tr7={.fmt=8,.q8=(int8_t*)q7,.s=s7,.O=O7,.I=I7};
+    deq_fmt8(&tr7,dq_ref);
     CHECK(memcmp(dq_load,dq_ref,sizeof dq_ref)==0);
 
     QT t1; memset(&t1,0,sizeof t1);
@@ -430,13 +431,13 @@ static void test_loader_seam(void){
     unlink(path); rmdir(dir);
 }
 
-/* ---- Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=7 ----
+/* ---- Part C: qt_bytes()/qt_scale_bytes() byte-accounting for fmt=8 ----
  *
  * qt_bytes() must not fall through to the fmt=2 (packed int4, O*ceil(I/2)+O*4)
  * default -- for a real fp8 tensor that would undercount the resident byte
  * count by roughly half (an AUTOPIN/RAM-budget-feeding hazard). qt_wire_mmap/
  * qt_unwire_mmap must not hardcode scale_b=O*4 (per-row) either -- wrong for
- * fmt=7's per-128x128-block scale array -- hence the dedicated
+ * fmt=8's per-128x128-block scale array -- hence the dedicated
  * qt_scale_bytes() helper shared by qt_bytes() and both wire functions so
  * there is exactly one place that knows each format's scale geometry. This
  * test exercises the arithmetic directly (no qt_from_disk/disk I/O, no mlock
@@ -445,7 +446,7 @@ static void test_loader_seam(void){
  * the shapes already used elsewhere in this file plus a block-edge
  * (non-128-multiple) case. */
 static void check_fp8_bytes(int O, int I, const char *tag){
-    QT t; memset(&t,0,sizeof t); t.fmt=7; t.O=O; t.I=I; t.gs=0;
+    QT t; memset(&t,0,sizeof t); t.fmt=8; t.O=O; t.I=I; t.gs=0;
     int64_t nblkO=fp8_nblk(O), nblkI=fp8_nblk(I), nblk=nblkO*nblkI;
     int64_t want_total = (int64_t)O*I + nblk*4;
     int64_t want_scale = nblk*4;
@@ -461,9 +462,9 @@ static void check_fp8_bytes(int O, int I, const char *tag){
      * O*I raw-byte weight region -- not short (partial mlock) or long (mlock past the
      * allocation, undefined behavior) by even one byte. */
     CHECK(got_total - got_scale == (int64_t)O*I);
-    /* regression guard: the fmt=2 (packed-nibble) formula must NOT be what fmt=7
+    /* regression guard: the fmt=2 (packed-nibble) formula must NOT be what fmt=8
      * returns -- confirm the value has actually MOVED off it (catches a silent
-     * revert of the fmt==7 branch order/placement, not just a formula typo). For
+     * revert of the fmt==8 branch order/placement, not just a formula typo). For
      * O=1,I=1 the two formulas coincide by coincidence (both give 1+4=5), so that
      * shape is skipped for this particular guard -- the other three shapes below are
      * chosen to avoid the coincidence. */
@@ -483,9 +484,19 @@ static void check_fp8_bytes(int O, int I, const char *tag){
  * (fmt=1 per-row unaffected; fmt=4/5 grouped-scale formats qt_scale_bytes'
  * own comment names as previously-broken too; fmt=6 (E8/IQ3, FIX ROUND,
  * audit finding: a FIXED 4-byte tag, not O*4 -- see qt_scale_bytes' own
- * comment for why this is reachable, not dead code); fmt=7 nblk>O, the
+ * comment for why this is reachable, not dead code); fmt=8 nblk>O, the
  * shape this review round is about). */
 static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
+    /* self-guard (fix round 1, reviewer finding): the fmt ARGUMENT is the
+     * load-bearing input here, and a label that says fmt=8 with the argument
+     * left at a stale ordinal turns every assertion below into a tautology
+     * (want and got both fall to the same per-row default together). Pin the
+     * argument to the supported set so label/argument drift dies loudly at
+     * the call site instead. */
+    if(fmt!=1 && fmt!=4 && fmt!=5 && fmt!=6 && fmt!=8){
+        printf("FAIL %s: check_wire_split fmt=%d not in supported set {1,4,5,6,8} -- stale call site?\n", tag, fmt);
+        CHECK(0); return;
+    }
     QT t; memset(&t,0,sizeof t); t.fmt=fmt; t.O=O; t.I=I; t.gs=gs;
     int64_t want_scale = qt_scale_bytes(&t);
     int64_t want_weight = qt_bytes(&t) - want_scale;
@@ -499,17 +510,30 @@ static void check_wire_split(int fmt, int O, int I, int gs, const char *tag){
     CHECK(got_weight == want_weight);
     /* the regression this test exists to catch: a per-row-only scale_b==O*4
      * must NOT be what qt_wire_split returns for a format whose real scale
-     * cardinality differs from O (fmt=4/5/6/7 here) -- confirm the value has
+     * cardinality differs from O (fmt=4/5/6/8 here) -- confirm the value has
      * actually moved off that old constant, not just matched qt_scale_bytes()
      * by coincidence at a degenerate shape. */
     int64_t old_wrong_scale = (int64_t)O*4;
-    if((fmt==4 || fmt==5 || fmt==6 || fmt==7) && want_scale != old_wrong_scale)
+    if((fmt==4 || fmt==5 || fmt==6 || fmt==8) && want_scale != old_wrong_scale)
         CHECK(got_scale != old_wrong_scale);
     /* fmt=6's scale is a FIXED 4 bytes regardless of [O,I] -- assert the
      * literal value directly too, not just "moved off O*4", since a future
      * regression that made it O-dependent in some OTHER wrong way would
      * still pass the generic check above. */
     if(fmt==6) CHECK(want_scale == 4);
+    /* fmt=8: same independent-pin discipline as the fmt==6 literal above.
+     * want and got BOTH flow through the engine's qt_scale_bytes() (the test
+     * computes want from it, and qt_wire_split() calls it), so a reverted or
+     * deleted fmt==8 branch would move both sides to O*4 TOGETHER: the
+     * got==want checks stay green and the moved-off-O*4 check self-disables
+     * (its want_scale != O*4 guard goes false). Recomputing the expected
+     * block-grid value here, independently of the engine, is what makes a
+     * regression of that branch actually FAIL this test (mutation-proven,
+     * fix round 1). */
+    if(fmt==8){
+        int64_t nblk = (((int64_t)O+127)/128) * (((int64_t)I+127)/128);
+        CHECK(want_scale == nblk*4);
+    }
 }
 
 /* ---- Site-level wire regression (FIX ROUND, validator finding: mutation-
@@ -544,7 +568,7 @@ static void test_wire_site_regression(void){
     for(int i=0;i<NBLK;i++) s7[i]=0.01f+0.001f*(float)i;
 
     QT t; memset(&t,0,sizeof t);
-    t.fmt=7; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q7; t.s=s7;
+    t.fmt=8; t.O=O; t.I=I; t.gs=0; t.q8=(int8_t*)q7; t.s=s7;
 
     int64_t want_scale = qt_scale_bytes(&t);
     int64_t want_weight = qt_bytes(&t) - want_scale;
@@ -600,17 +624,17 @@ int main(void){
     test_fmt6_fp8_collision();
     test_ue8m0_scale_refusal();
     test_loader_seam();
-    check_fp8_bytes(2048,6144, "qt_bytes fmt=7 gate/up-shaped O=2048 I=6144 (spec example)");
-    check_fp8_bytes(6144,2048, "qt_bytes fmt=7 down-shaped O=6144 I=2048");
-    check_fp8_bytes(130,200,   "qt_bytes fmt=7 block edges O,I both non-mult-128");
-    check_fp8_bytes(1,1,       "qt_bytes fmt=7 degenerate 1x1");
+    check_fp8_bytes(2048,6144, "qt_bytes fmt=8 gate/up-shaped O=2048 I=6144 (spec example)");
+    check_fp8_bytes(6144,2048, "qt_bytes fmt=8 down-shaped O=6144 I=2048");
+    check_fp8_bytes(130,200,   "qt_bytes fmt=8 block edges O,I both non-mult-128");
+    check_fp8_bytes(1,1,       "qt_bytes fmt=8 degenerate 1x1");
     check_wire_split(1, 4096,4096, 0,  "qt_wire_split fmt=1 plain int8 (per-row scale, unaffected by the fix)");
     check_wire_split(4, 2048,6144, 64, "qt_wire_split fmt=4 grouped int4 (O*ceil(I/gs) scale, not O*4)");
     check_wire_split(5, 2048,6144, 0,  "qt_wire_split fmt=5 int3-g64 (O*ceil(I/64) scale, not O*4)");
     check_wire_split(6, 2048,6144, 0,  "qt_wire_split fmt=6 E8/IQ3 (FIXED 4-byte tag, not O*4=8192B)");
     check_wire_split(6, 1,1,       0,  "qt_wire_split fmt=6 E8/IQ3 degenerate O=1 (O*4 would coincidentally also be 4 -- exercises the literal-4 assert, not just the moved-off-O*4 one)");
-    check_wire_split(7, 2,16384, 0,    "qt_wire_split fmt=7 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
-    check_wire_split(7, 2048,6144, 0,  "qt_wire_split fmt=7 spec example: scale=3072B, NOT O*4=8192B");
+    check_wire_split(8, 2,16384, 0,    "qt_wire_split fmt=8 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
+    check_wire_split(8, 2048,6144, 0,  "qt_wire_split fmt=8 spec example: scale=3072B, NOT O*4=8192B");
     test_wire_site_regression();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");

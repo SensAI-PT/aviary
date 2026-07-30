@@ -18,7 +18,7 @@ test does, end to end:
      Makefile's own CFLAGS, asserted to produce zero warnings -- into a
      temp binary;
   4. run that binary against the REAL repacked output directory, asserting
-     every selected tensor loads fmt=7 through the real qt_from_disk with
+     every selected tensor loads fmt=8 through the real qt_from_disk with
      finite dequantized values (byte-arithmetic inference alone -- this PR's
      repack tool writes no container metadata stamp).
 

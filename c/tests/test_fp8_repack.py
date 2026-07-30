@@ -1,10 +1,11 @@
-"""tools/repack_fp8_passthrough.py: fmt=7 repack tool tests.
+"""tools/repack_fp8_passthrough.py: fmt=8 repack tool tests.
 
-fmt=7 is a PUBLIC ordinal, assigned by the maintainer on #524: see
-repack_fp8_passthrough.py's module docstring for the fmt=6 -> fmt=100 ->
-fmt=7 history (dev's own #465 merged a REAL fmt=6, E8/IQ3, so this tool's
-format moved to the PRIVATE ORDINAL BLOCK as fmt=100 during development
-before graduating to fmt=7 at merge).
+fmt=8 is a PUBLIC ordinal: see repack_fp8_passthrough.py's module docstring
+for the fmt=6 -> fmt=100 -> fmt=7 -> fmt=8 history (dev's own #465 merged a
+REAL fmt=6, E8/IQ3, so this tool's format moved to the PRIVATE ORDINAL BLOCK
+as fmt=100 during development; the maintainer assigned fmt=7 on #524; #705
+then merged MXFP4 as fmt=7 while this PR was open, forcing the renumber
+to fmt=8).
 
 Synthetic fixtures ONLY (tools/glm_fp8_emit.py, the exact real-checkpoint FP8
 layout that convert_fp8_to_int4.py's dequant() reads) -- no real Z.ai shard is
@@ -49,7 +50,7 @@ def _make_fixture(path, D=256, I_=384, E=4):
     """One synthetic shard covering every selection case: SELECTED resident
     kinds (attn/o/sh/dmlp), the EXCLUDED resident kind kvb (kv_b_proj -- valid
     per convert_fp8_to_int4.classify(), but the engine's CPU/CUDA MLA-absorb
-    paths have no fmt=7 case yet, so this tool must not select it -- see the
+    paths have no fmt=8 case yet, so this tool must not select it -- see the
     module docstring), routed experts (must be excluded), the router and a
     norm (f32-kept, never fp8), and embed_tokens (io kind -- excluded by kind
     even though glm_fp8_emit's simpler keep_f32() happens to FP8-quantize it,
@@ -115,10 +116,10 @@ class SelectionTest(unittest.TestCase):
     def test_kv_b_proj_excluded(self):
         """Regression guard for a gap found in self-review: kv_b_proj is a valid
         resident kind per classify(), but colibri.c's CPU absorb path
-        (qt_addrow/qt_matvec_rows) and the CUDA absorb kernels have no fmt=7
+        (qt_addrow/qt_matvec_rows) and the CUDA absorb kernels have no fmt=8
         case -- selecting it here would produce a container the engine
         silently misreads as int2. Must stay excluded until that path gains
-        fmt=7 support (separate follow-up work)."""
+        fmt=8 support (separate follow-up work)."""
         inv = rp.shard_inventory(self.shard, n_layers=5)
         names = {it["name"] for it in inv}
         self.assertNotIn("model.layers.0.self_attn.kv_b_proj.weight", names)
@@ -174,8 +175,8 @@ class SelectionTest(unittest.TestCase):
         shape family c/tests/test_fp8_load.c's test_disambiguation() sweeps. The
         engine's qt_resolve_fmt reader resolves an unstamped collision at this
         shape to fmt=1 (int8-row) rather than refusing (see colibri.c's
-        INVERSION) -- so this tool refusing to ever EMIT an fmt=7 container here
-        is what keeps that reader-side resolution correct: an fmt=7 tensor this
+        INVERSION) -- so this tool refusing to ever EMIT an fmt=8 container here
+        is what keeps that reader-side resolution correct: an fmt=8 tensor this
         tool produced at this shape would be silently read back as plain int8."""
         amb_path = os.path.join(self.tmp.name, "ambiguous.safetensors")
         O, I_ = 2, 256

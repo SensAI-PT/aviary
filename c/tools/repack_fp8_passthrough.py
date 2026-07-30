@@ -1,13 +1,15 @@
-"""fmt=7 repack tool: Z.ai GLM-5.2-FP8 shards -> the engine's native-FP8-passthrough
+"""fmt=8 repack tool: Z.ai GLM-5.2-FP8 shards -> the engine's native-FP8-passthrough
 container (byte-preserved, no dequant/requant).
 
-fmt=7 is a PUBLIC ordinal, assigned by the maintainer on #524. This tool's
-output format was minted fmt=6 during this branch's original development,
-before dev's own #465 (E8/IQ3) claimed that ordinal upstream and merged it
-into dev as a REAL fmt=6 (colibri.c's qt_resolve_fmt, quant.h's E8
-constants); re-tagged fmt=100 (PRIVATE ORDINAL BLOCK, see colibri.c's QT
-struct comment) from that point forward -- this tool has never emitted a
-container claiming ordinal 6 -- and graduated to fmt=7 at merge.
+fmt=8 is a PUBLIC ordinal. This tool's output format was minted fmt=6 during
+this branch's original development, before dev's own #465 (E8/IQ3) claimed
+that ordinal upstream and merged it into dev as a REAL fmt=6 (colibri.c's
+qt_resolve_fmt, quant.h's E8 constants); re-tagged fmt=100 (PRIVATE ORDINAL
+BLOCK, see colibri.c's QT struct comment) from that point forward -- this
+tool has never emitted a container claiming ordinal 6 -- graduated to fmt=7
+when the maintainer assigned that ordinal on #524, and renumbered to fmt=8
+after #705 merged MXFP4 as fmt=7 while this PR was open. Nothing this tool
+writes carries the ordinal, so neither renumber changed its output bytes.
 
 Unlike convert_fp8_to_int4.py (which DEQUANTIZES fp8 -> f32 -> REQUANTIZES to a
 different, lossy format), this tool copies the fp8 weight bytes AS-IS and only
@@ -15,9 +17,9 @@ renames/reshapes the scale sidecar to the engine's `.qs` convention. Same 8
 bits/weight streaming cost as the source, zero additional quantization loss.
 
 THE DESIGN LANDMINE (see qt_resolve_fmt in colibri.c, c/quant.h's E4M3_LUT
-comment): the engine tells fmt=7 (this tool's output) apart from fmt=1 (plain
+comment): the engine tells fmt=8 (this tool's output) apart from fmt=1 (plain
 int8) ONLY by scale-array geometry -- per-row for fmt=1, per-128x128-block for
-fmt=7. This tool must therefore emit .qs sidecars whose byte count is EXACTLY
+fmt=8. This tool must therefore emit .qs sidecars whose byte count is EXACTLY
 ceil(O/128)*ceil(I/128)*4, never anything that could coincide with O*4 by
 accident for the shapes it targets -- ENFORCED, not just asserted, by
 _check_geometry below (maintainer review, #528): it refuses to repack any
@@ -27,7 +29,7 @@ hypothetical: GLM-5.2's own self_attn.o_proj.weight ([6144,16384]) is a real
 instance (nblkO=48, nblkI=128, product=6144==O). It matters more now than it
 used to, because the engine's UNSTAMPED read-side collision policy resolves an
 ambiguous shape to fmt=1 rather than refusing (see qt_resolve_fmt's
-INVERSION) -- so an fmt=7 container this tool emitted at such a shape would be
+INVERSION) -- so an fmt=8 container this tool emitted at such a shape would be
 silently read back as plain int8, not caught by a read-side refusal. Avoiding
 the collision at write time is therefore load-bearing, not a redundant
 belt-and-braces check. At I=98 specifically, a single-block fp8 tensor's raw
@@ -51,25 +53,25 @@ attention projections, dense-MLP first layers, and the generic resident
 fallback) -- routed experts (kind "x" in convert_fp8_to_int4.classify) are
 EXCLUDED and stay on the existing int4-g64 streaming path; routers/norms/bias
 (kind "f32") and embed/lm_head (kind "io", BF16 in source, never FP8) are
-untouched by this tool -- carrying those into a mixed fmt=7+int4 loadout
+untouched by this tool -- carrying those into a mixed fmt=8+int4 loadout
 directory is separate, deferred "loadout index-rewrite blending" work.
 
 kv_b_proj (kind "kvb") is ALSO deliberately excluded, despite being a resident
 tensor classify() would otherwise select: colibri.c's MLA-absorption CPU path
 (qt_addrow/qt_matvec_rows, called only on l->kv_b -- the always-available
-fallback whenever the Metal fused decode kernel isn't used) has no fmt==7
-support. FIX ROUND 2 update: an fmt=7 (or fmt=6) tensor reaching either
+fallback whenever the Metal fused decode kernel isn't used) has no fmt==8
+support. FIX ROUND 2 update: an fmt=8 (or fmt=6) tensor reaching either
 function now refuses loudly (exit(1), naming the function and the fmt) --
 before that fix it was worse than "misread as int2": qt_addrow SIGSEGV'd
-outright (t->q4 is NULL for fmt=7; the untouched int2 fall-through
+outright (t->q4 is NULL for fmt=8; the untouched int2 fall-through
 dereferenced it), and only fmt=6 (t->q4 non-NULL, wrong per-row scale
 geometry) actually produced silently-wrong values. Either way, this tool
 still does not select kv_b_proj: refusing loudly at the absorb call site is
-not the same as SUPPORTING fmt=7 there (no dequant path exists, whether it
+not the same as SUPPORTING fmt=8 there (no dequant path exists, whether it
 now trips a controlled refusal or, before the fix, undefined behavior). The
 CUDA absorb kernels (coli_cuda_attention_absorb/_kvdev in backend_cuda.cu)
 are similarly int4-specific and unaffected by that fix. Repacking kv_b_proj
-to fmt=7 needs real fmt=7 CPU+CUDA absorb-path support first -- out of scope
+to fmt=8 needs real fmt=8 CPU+CUDA absorb-path support first -- out of scope
 for this build, so this tool refuses to produce a container the engine
 cannot safely read.
 
@@ -100,7 +102,7 @@ from convert_fp8_to_int4 import classify, check_or_record_params  # reuse: same 
 # experts ("x"), NOT the always-F32 set ("f32"), NOT embed/lm_head ("io" -- BF16 in
 # source, never FP8), NOT sidecars/skips ("consumed"/"skip"). "kvb" (kv_b_proj) is
 # ALSO excluded -- see the module docstring: the CPU absorb path (qt_addrow/
-# qt_matvec_rows) and the CUDA absorb kernels have no fmt=7 case yet.
+# qt_matvec_rows) and the CUDA absorb kernels have no fmt=8 case yet.
 RESIDENT_KINDS = frozenset({"sh", "o", "attn", "dmlp", "q"})
 
 BLOCK = 128
@@ -112,7 +114,7 @@ def _nblk(n):
 
 def is_repack_target(name, dtype, keys, n_layers):
     """True if `name` is a resident-kind FP8 tensor this tool should byte-preserve
-    into the fmt=7 container. `keys` is the full set of tensor names in the shard
+    into the fmt=8 container. `keys` is the full set of tensor names in the shard
     (needed to confirm the `_scale_inv` sidecar is actually present -- classify()
     alone can't tell FP8 tensors from any other dtype a resident-kind name might
     carry in a non-FP8 checkpoint variant)."""
@@ -140,7 +142,7 @@ def _check_geometry(name, O, I, nblkO, nblkI):
     own self_attn.o_proj.weight ([6144,16384]) is a REAL, non-hypothetical instance
     of this shape. The engine's reader now resolves an unstamped collision to fmt=1
     (the incumbent, decodable format) rather than refusing -- which makes it load
-    bearing that THIS tool never emits an fmt=7 container at such a shape: this
+    bearing that THIS tool never emits an fmt=8 container at such a shape: this
     docstring's own opening promise ("never anything that could coincide with O*4
     by accident") is enforced here, not just asserted."""
     exp_nblkO, exp_nblkI = _nblk(O), _nblk(I)
@@ -154,9 +156,9 @@ def _check_geometry(name, O, I, nblkO, nblkI):
             f"{name}: [{O},{I}] is an AMBIGUOUS fp8-e4m3-b128 shape -- its "
             f"block-scale byte count (nblkO*nblkI*4={nblkO*nblkI*4}) exactly "
             f"coincides with a per-row int8 scale byte count (O*4={O*4}) for the "
-            f"same [O,I]; refusing to emit an fmt=7 container the engine's "
+            f"same [O,I]; refusing to emit an fmt=8 container the engine's "
             f"qt_resolve_fmt collision policy would resolve to fmt=1 (int8-row), "
-            f"not fmt=7, on an unstamped read (THE DESIGN LANDMINE, colibri.c)")
+            f"not fmt=8, on an unstamped read (THE DESIGN LANDMINE, colibri.c)")
 
 
 def shard_inventory(path, n_layers):
@@ -232,7 +234,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--indir", required=True, help="directory of Z.ai FP8 *.safetensors shards")
-    ap.add_argument("--outdir", required=True, help="destination for repacked fmt=7 container shards")
+    ap.add_argument("--outdir", required=True, help="destination for repacked fmt=8 container shards")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--dry-run", action="store_true",
                     help="inventory only: scan headers, print selection counts, write nothing")
