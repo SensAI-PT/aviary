@@ -300,6 +300,34 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         if (v->t != J_STR) {
             fprintf(stderr, "%s: colibri.fmt entry '%s' is not a string -- malformed stamp, refusing (untrusted container)\n",
                     shard_path, inner->keys[i]); exit(1); }
+        /* DUPLICATE CLAIMS (user-ratified design, register D8): at most one
+         * DISTINCT format claim per tensor name, container-wide. An entry
+         * that repeats an already-ingested claim verbatim is tolerated and
+         * collapsed to one entry (idempotent -- a centralized-manifest
+         * writer may legally stamp the same map into every shard, and a
+         * shard may stamp tensors it does not itself contain; there is no
+         * locality constraint). An entry that CONTRADICTS an earlier claim
+         * refuses by name: a container that disagrees with itself about a
+         * tensor's format is corrupted or hostile, and the previous
+         * first-wins behavior made the outcome depend on shard enumeration
+         * order (st_scan_dir is raw readdir order, not sorted) while
+         * mis-diagnosing the real problem downstream as a stamp/inference
+         * mismatch -- or hiding it entirely when the enumeration happened
+         * to favor the agreeing claim. The refusal names the tensor and
+         * both format names; the EARLIER claim's shard file is not named
+         * (per-entry shard provenance isn't stored, and adding it just for
+         * this message would be new plumbing -- only the current shard's
+         * path is in scope here). Linear rescan per entry is O(n^2) worst
+         * case, bounded by ST_FMT_STAMP_MAX at one-time startup. */
+        int dup = -1;
+        for (int k = 0; k < S->fmt_n; k++)
+            if (!strcmp(S->fmt_name[k], inner->keys[i])) { dup = k; break; }
+        if (dup >= 0) {
+            if (!strcmp(S->fmt_val[dup], v->str)) continue;   /* agreeing duplicate: keep one */
+            fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps tensor '%s' as '%s', but an "
+                    "earlier shard's map already stamped it '%s' -- conflicting format claims, "
+                    "refusing (untrusted container)\n",
+                    shard_path, inner->keys[i], v->str, S->fmt_val[dup]); exit(1); }
         if (S->fmt_n >= ST_FMT_STAMP_MAX) {
             fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
                     "this container's shards -- stamps are a resident-tensor convention (docs/FORMATS.md), "

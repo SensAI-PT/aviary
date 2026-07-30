@@ -265,6 +265,29 @@ anything is wrong with a container; it is the default, expected state for
 everything that predates this convention (which, as of this PR, is
 everything).
 
+### Duplicate claims, locality, coverage
+
+Three rules complete the stamp's container-wide semantics (user-ratified
+this revision):
+
+- **Conflicting claims refuse.** At most one DISTINCT format claim per
+  tensor name, container-wide. If two shards' `colibri.fmt` maps (or two
+  entries anywhere in the container) stamp the same tensor name with
+  DIFFERENT format names, ingest refuses loudly at discovery time, naming
+  the tensor and both claims — a container that disagrees with itself about
+  a tensor's format is corrupted or hostile. (The previous behavior was
+  first-wins, which made the outcome depend on shard enumeration order —
+  `st_scan_dir` is raw `readdir` order — and mis-diagnosed or hid the real
+  problem.)
+- **Agreeing duplicates are tolerated** (idempotent; collapsed to one
+  entry). A centralized-manifest writer may stamp the same map into every
+  shard. There is **no locality constraint**: a shard may stamp tensors it
+  does not itself contain.
+- **No coverage requirement at load.** Unstamped tensors — and wholly
+  unstamped containers — load exactly as before this feature existed;
+  completeness of a stamping tool's coverage is a writer-side guarantee
+  (a load-time coverage diagnostic is deferred, not implied).
+
 ### Stamp-map scan bound
 
 `st_fmt_stamp_ingest` (`c/st.h`) caps the total number of stamped-tensor

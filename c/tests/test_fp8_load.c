@@ -997,6 +997,87 @@ static void test_stamp_absent(void){
     char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
 }
 
+/* ---- Duplicate stamp claims (micro-round 2, user-ratified design D8) ----
+ * At most one DISTINCT format claim per tensor name, container-wide:
+ * conflicting claims refuse at ingest (naming the tensor and both format
+ * names); agreeing duplicates are tolerated (idempotent). There is no
+ * locality constraint -- shard 2 below stamps "w", a tensor it does NOT
+ * contain, which is legal by design (centralized-manifest writers) and is
+ * exactly what makes cross-shard conflicts possible in the first place. */
+
+/* Shard 1 = write_stamp_fixture's single-tensor fp8 shard ("w" + "w.qs"),
+ * renamed into a two-shard layout; shard 2 = one tiny aux f32 tensor of its
+ * own plus a colibri.fmt map stamping "w". */
+static void write_second_stamp_shard(const char *dir, const char *meta_json_string_literal){
+    char path[300]; snprintf(path,sizeof path,"%s/model-extra.safetensors",dir);
+    static float aux[4] = {1.f,2.f,3.f,4.f};
+    char hdr[1024]; int hl;
+    hl=snprintf(hdr,sizeof hdr,
+        "{\"__metadata__\":{\"colibri.fmt\":%s},"
+        "\"aux\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}",
+        meta_json_string_literal);
+    FILE *f=fopen(path,"wb");
+    if(!f){ printf("FAIL: cannot create %s\n", path); fails++; return; }
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f); fwrite(aux,1,sizeof aux,f);
+    fclose(f);
+}
+static void rm_two_shard_fixture(const char *dir){
+    char p[300];
+    snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p);
+    snprintf(p,sizeof p,"%s/model-extra.safetensors",dir); unlink(p);
+    rmdir(dir);
+}
+static void test_stamp_conflicting_duplicate(void){
+#ifndef _WIN32
+    const char *dir="tests/tmp_fp8_stamp_conflict";
+    write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
+    write_second_stamp_shard(dir, "\"{\\\"w\\\":\\\"int8-row\\\"}\"");
+    /* refusal fires at DISCOVERY time (st_init's header-parse loop), before
+     * any tensor is resolved -- fork st_init alone and capture stderr. */
+    fflush(stdout);
+    int pipefd[2]; if(pipe(pipefd)!=0){ CHECK(0); return; }
+    pid_t pid = fork();
+    if(pid < 0){ CHECK(0); return; }
+    if(pid == 0){
+        dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
+        static Model gm; memset(&gm,0,sizeof gm);
+        st_init(&gm.S, dir);                   /* must exit(1) inside the ingest */
+        _exit(42);                              /* surviving discovery is the bug */
+    }
+    close(pipefd[1]);
+    char err[2048]={0}; size_t eoff=0; ssize_t n;
+    while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
+    close(pipefd[0]);
+    int status=0; waitpid(pid,&status,0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
+    if(!ok) printf("FAIL stamp-conflict: expected exit(1) at discovery, got status=%d, stderr=%.300s\n", status, err);
+    CHECK(ok);
+    /* the refusal must NAME the tensor and BOTH claims (either shard may be
+     * enumerated first -- readdir order -- so assert both names, not roles). */
+    CHECK(strstr(err,"conflicting format claims")!=NULL);
+    CHECK(strstr(err,"'w'")!=NULL);
+    CHECK(strstr(err,"fp8-e4m3-b128")!=NULL && strstr(err,"int8-row")!=NULL);
+    CHECK(strstr(err,"refus")!=NULL);
+    rm_two_shard_fixture(dir);
+#else
+    printf("skipped on Windows (no fork): stamp-conflict refusal\n");
+#endif
+}
+static void test_stamp_agreeing_duplicate(void){
+    const char *dir="tests/tmp_fp8_stamp_dupok";
+    write_stamp_fixture(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
+    write_second_stamp_shard(dir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
+    static Model gm; memset(&gm,0,sizeof gm);
+    st_init(&gm.S, dir);                        /* agreeing duplicate: no refusal */
+    CHECK(gm.S.fmt_n == 1);                     /* collapsed to ONE entry, not two */
+    QT t; memset(&t,0,sizeof t);
+    qt_from_disk(&gm,"w",8,256,8,0,&t);
+    CHECK(t.fmt==8);                            /* loads exactly as single-stamped */
+    CHECK(t.q8!=NULL && t.s!=NULL);
+    rm_two_shard_fixture(dir);
+}
+
 /* ---- Stamp-map scan bound (maintainer review, #529): st_fmt_stamp_ingest
  * (st.h) caps the number of stamped-tensor entries it will ingest across a
  * container's shards at ST_FMT_STAMP_MAX and refuses (exit(1)) past it --
@@ -1129,6 +1210,8 @@ int main(void){
     test_stamp_mismatching();
     test_stamp_unrecognized_name();
     test_stamp_absent();
+    test_stamp_conflicting_duplicate();
+    test_stamp_agreeing_duplicate();
     test_stamp_map_cap_boundary_ok();
     test_stamp_map_cap_exceeded();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
