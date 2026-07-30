@@ -19,6 +19,7 @@ from resource_plan import (
     parse_ssd_cache,
     physical_cpu_count,
     read_ssd_probe,
+    ssd_probe_state,
 )
 
 
@@ -151,11 +152,32 @@ class ResourcePlanTest(unittest.TestCase):
             checked += 1
         self.assertGreaterEqual(checked, 40, "vector file suspiciously short")
 
+    def test_ssd_probe_state_classifies_every_case(self):
+        # #386 r2, F10: doctor/plan wording keys off these states -- a cache
+        # that exists but is not trusted must never read "no cached probe yet".
+        self.assertEqual(ssd_probe_state(self.model), ("absent", None))
+        self._write_v2_cache("14.322")
+        self.assertEqual(ssd_probe_state(self.model), ("ok", 14.322))
+        self._write_v2_cache("14.322", dev=os.stat(self.model).st_dev + 1)
+        self.assertEqual(ssd_probe_state(self.model), ("foreign", None))
+        (self.model / ".coli_ssd").write_text("14.322\n")
+        self.assertEqual(ssd_probe_state(self.model), ("legacy", None))
+        (self.model / ".coli_ssd").write_text("inf\n")
+        self.assertEqual(ssd_probe_state(self.model), ("garbage", None))
+
     def test_ssd_probe_surfaces_in_plan_and_format(self):
         self._write_v2_cache("14.3")
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
         self.assertEqual(plan["ssd_probe_gbs"], 14.3)
+        self.assertEqual(plan["ssd_probe_state"], "ok")
         self.assertIn("14.3 GB/s", format_plan(plan))
+
+    def test_ssd_probe_pending_states_surface_in_format(self):
+        (self.model / ".coli_ssd").write_text("14.3\n")   # legacy
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
+        self.assertIsNone(plan["ssd_probe_gbs"])
+        self.assertEqual(plan["ssd_probe_state"], "legacy")
+        self.assertIn("legacy cache pending engine upgrade", format_plan(plan))
 
     def test_ssd_probe_absent_from_plan_and_format_when_not_cached(self):
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)

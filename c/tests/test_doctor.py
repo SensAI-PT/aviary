@@ -162,6 +162,24 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["storage.ssd_probe"]["status"], "pass")
         self.assertEqual(checks["storage.ssd_probe"]["details"]["gbs"], 14.3)
 
+    def test_ssd_probe_wording_names_why_a_cache_is_pending(self):
+        # #386 r2, F10: "no cached probe yet" is a lie when a file exists --
+        # each untrusted state names what will actually happen instead.
+        cases = (
+            ("14.3\n", "legacy cache pending engine upgrade"),
+            (f"v2 14.3 {os.stat(self.model).st_dev + 1}\n", "cache from another volume"),
+            ("not-a-number\n", "unreadable cache"),
+        )
+        for content, expected in cases:
+            (self.model / ".coli_ssd").write_text(content)
+            check = self.checks_by_id(self.report())["storage.ssd_probe"]
+            self.assertEqual(check["status"], "skip", content)
+            self.assertIn(expected, check["summary"], content)
+            self.assertNotIn("no cached probe yet", check["summary"], content)
+        (self.model / ".coli_ssd").unlink()
+        check = self.checks_by_id(self.report())["storage.ssd_probe"]
+        self.assertIn("no cached probe yet", check["summary"])
+
     def test_ssd_probe_check_never_emits_json_infinity(self):
         # float("inf") used to sail through the old reader; json.dumps renders
         # it as the bare literal Infinity, which is not JSON -- machine

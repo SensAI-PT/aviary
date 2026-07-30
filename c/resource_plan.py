@@ -177,23 +177,54 @@ def parse_ssd_cache(data):
     return (None, None, None)
 
 
-def read_ssd_probe(model_dir):
-    """Read the cached F_NOCACHE storage probe the C engine writes to
+def ssd_probe_state(model_dir):
+    """Classify the cached F_NOCACHE storage probe the C engine writes to
     <model>/.coli_ssd on its first Metal+darwin startup (colibri.c
     coli_ssd_probe_cached, issue #379). Read-only: never re-measures, never
     guesses -- mirrors S4's "read-and-display only" contract for `coli
-    doctor`/`coli plan`. Returns the measured GB/s as a float, or None.
-    Trust matches the engine exactly: only a v2 cache whose recorded st_dev
-    still matches the model dir's volume counts -- a legacy bare number or a
-    cache carried to another drive is one the engine will re-measure, so
-    surfacing it here would show a number the engine no longer believes."""
+    doctor`/`coli plan`. Returns (state, gbs):
+      ("ok", gbs)        v2 cache recorded on THIS volume -- the one case the
+                         engine itself would trust
+      ("legacy", None)   pre-v2 bare number; the engine re-probes + upgrades
+      ("foreign", None)  v2 from another volume (st_dev mismatch); re-probed
+      ("garbage", None)  a file exists but fails the strict grammar
+      ("absent", None)   no cache file at all
+    The distinctions matter for wording (#386 r2, F10): "no cached probe yet"
+    is a lie when a file exists. The read is bounded to 65 bytes (F13): the
+    strict grammar caps a well-formed cache at 64, so byte 65 alone already
+    convicts -- no reason to slurp an arbitrarily large impostor file."""
     try:
-        kind, gbs, dev = parse_ssd_cache((Path(model_dir) / ".coli_ssd").read_bytes())
-        if kind == "v2" and dev == os.stat(model_dir).st_dev:
-            return gbs
-        return None
+        with open(Path(model_dir) / ".coli_ssd", "rb") as fh:
+            data = fh.read(65)
     except OSError:
-        return None
+        return ("absent", None)
+    kind, gbs, dev = parse_ssd_cache(data)
+    if kind == "v2":
+        try:
+            if dev == os.stat(model_dir).st_dev:
+                return ("ok", gbs)
+        except OSError:
+            pass
+        return ("foreign", None)
+    if kind == "legacy":
+        return ("legacy", None)
+    return ("garbage", None)
+
+
+def read_ssd_probe(model_dir):
+    """The measured GB/s as a float when the engine itself would trust the
+    cache (ssd_probe_state "ok"), else None."""
+    return ssd_probe_state(model_dir)[1]
+
+
+# What doctor/plan say for a cache that exists but is not trusted (#386 r2,
+# F10): each state names what will actually happen, never "no cached probe
+# yet" while a file sits right there.
+SSD_PROBE_PENDING = {
+    "legacy": "legacy cache pending engine upgrade; re-measured on the next Metal+darwin start",
+    "foreign": "cache from another volume; the engine will re-probe here",
+    "garbage": "unreadable cache; the engine will re-probe",
+}
 
 
 def discover_gpus():
@@ -561,6 +592,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
 
     tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
                       plan_has_metal=False)
+    probe_state, probe_gbs = ssd_probe_state(info["path"])
 
     return {
         "version": 2,
@@ -592,9 +624,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         ],
         "warnings": warnings,
         # #379: read-only surfacing of the cached Metal-cache storage probe, if
-        # the engine has already measured this model dir. None before the first
-        # Metal+darwin startup -- never re-measured or guessed here.
-        "ssd_probe_gbs": read_ssd_probe(info["path"]),
+        # the engine has already measured this model dir. gbs is None unless
+        # the engine itself would trust the cache; the state says WHY (#386 r2,
+        # F10) -- never re-measured or guessed here.
+        "ssd_probe_gbs": probe_gbs,
+        "ssd_probe_state": probe_state,
     }
 
 
@@ -667,6 +701,8 @@ def format_plan(plan):
         lines.append("VRAM   no NVIDIA device detected · CPU path")
     if plan.get("ssd_probe_gbs") is not None:
         lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
+    elif plan.get("ssd_probe_state") in SSD_PROBE_PENDING:
+        lines.append(f"ssd    {SSD_PROBE_PENDING[plan['ssd_probe_state']]}")
     lines.append(f"limit  {plan['expected_bottleneck']}")
     hit = plan.get("projected_hit_rate", 0)
     lines.append(f"hit    {hit:.0%} projected expert residency")
