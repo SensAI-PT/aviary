@@ -111,6 +111,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>      /* open(/dev/null) in Part G's sweep probe */
 #endif
 
 /* Shadow definitions for the seam above -- must come after the #include so
@@ -619,6 +620,135 @@ static void test_wire_site_regression(void){
 #endif
 }
 
+/* ---- Part F (micro-round 2): Metal fused-path POSITIVE allowlist ----
+ * The two fused-decode gates (attention_rows / layer_forward_rows) are only
+ * reachable at model scale (GLM-5.2 dims + a live Metal context), so the
+ * honest toy-scale decomposition is: (1) unit-test the predicate's truth
+ * table -- metal_fused_fmt_ok is defined unconditionally in colibri.c for
+ * exactly this reason -- and (2) pin, by reading colibri.c's own source,
+ * that BOTH gate sites actually consult the predicate on every fused-path
+ * tensor and that the old fail-open `l-><t>.fmt!=8` idiom is gone. The pin
+ * is a source-text assertion, disclosed as such: it proves wiring, not
+ * runtime routing; the truth table proves the routing decision itself. */
+static void test_metal_fused_allowlist(void){
+    /* (1) truth table: admits EXACTLY the shader's explicit integer-format
+     * set {1,2,3,4} (fmt=3 was legal-and-correct on the fused path before
+     * the allowlist existed; fmt=0 never actually fused -- WP_ hands the
+     * shader a NULL q4 for it). A negative-guard regression (e.g.
+     * `return fmt!=8;`) admits 5/6 -- the silent-f32-misread hazard -- and
+     * fails here. */
+    for(int fmt=-1; fmt<=9; fmt++){
+        int want = (fmt==1 || fmt==2 || fmt==3 || fmt==4);
+        if(metal_fused_fmt_ok(fmt) != want)
+            printf("FAIL metal_fused_fmt_ok(%d)=%d, want %d\n", fmt, metal_fused_fmt_ok(fmt), want);
+        CHECK(metal_fused_fmt_ok(fmt) == want);
+    }
+    CHECK(!metal_fused_fmt_ok(100));   /* private-block ordinals stay out too */
+    /* (2) grep-pin: run_tests.py runs us with cwd=c/ (Part B's fixtures rely
+     * on the same fact). 11 per-tensor call sites = 4 (attention_rows:
+     * q_a/q_b/kv_a/o) + 7 (layer_forward_rows: those + sh_gate/sh_up/sh_down). */
+    FILE *f = fopen("colibri.c", "r");
+    if(!f){ printf("FAIL Part F grep-pin: cannot open colibri.c (cwd not c/?)\n"); CHECK(0); return; }
+    static char src[16*1024*1024];
+    size_t n = fread(src, 1, sizeof(src)-1, f); src[n]=0; fclose(f);
+    CHECK(n > 100000);                      /* sanity: we read the real file */
+    int calls=0; const char *p=src;
+    while((p=strstr(p,"metal_fused_fmt_ok(l->"))!=NULL){ calls++; p++; }
+    if(calls!=11) printf("FAIL Part F grep-pin: %d metal_fused_fmt_ok(l->...) call sites, want 11\n", calls);
+    CHECK(calls==11);
+    /* the old fail-open idiom must be gone from the gate sites (the CUDA
+     * eligibility guard's `w->fmt!=8` is a different site and untouched). */
+    CHECK(strstr(src,"l->q_a.fmt!=8")==NULL);
+    CHECK(strstr(src,"l->sh_gate.fmt!=8")==NULL);
+}
+
+/* ---- Part G (micro-round 2): fmt=7 is unreachable as a qt_resolve_fmt
+ * return value -- property sweep. The fmt=7 ordinal belongs to dev's MXFP4
+ * (Vulkan tier, never a QT format); matmul_qt_ex's int4 tail is therefore
+ * unreachable for it, and this sweep is the RAN half of that argument (the
+ * other half is the producer enumeration in the PR verification matrix:
+ * every QT.fmt producer is qt_resolve_fmt, qt_alloc's 0/1/2/3/5 ladder, or
+ * a literal 1..6/8 assignment). Sweep a representative + adversarial
+ * (O, I, nb, ns) grid across every byte-count class the resolver knows
+ * (row formats, grouped, int3-g64, E8/IQ3, fp8 f32/ue8m0, collision-family
+ * members, degenerate dims) and assert every non-refusing resolution is in
+ * {1,2,3,4,5,6,8} -- never 7, never anything else. */
+static int resolved_fmt_probe(int O, int I, int64_t nb, int64_t ns){
+#ifndef _WIN32
+    fflush(stdout);   /* a refusing child exits via exit(1), which flushes
+                       * inherited stdio -- don't let it replay our buffer */
+    int pipefd[2]; if(pipe(pipefd)!=0) return -2;
+    pid_t pid = fork();
+    if(pid < 0) return -2;
+    if(pid == 0){
+        int devnull = open("/dev/null", O_WRONLY);
+        if(devnull>=0) dup2(devnull,2);                 /* silence refusal chatter */
+        close(pipefd[0]);
+        int gs=0;
+        int fmt = qt_resolve_fmt("sweep", O, I, nb, ns, &gs);
+        unsigned char b = (unsigned char)fmt;
+        ssize_t wr = write(pipefd[1], &b, 1); (void)wr;
+        _exit(0);
+    }
+    close(pipefd[1]);
+    unsigned char b=0; ssize_t got = read(pipefd[0], &b, 1);
+    close(pipefd[0]);
+    int status=0; waitpid(pid,&status,0);
+    if(WIFEXITED(status) && WEXITSTATUS(status)==0 && got==1) return (int)b;
+    if(WIFEXITED(status) && WEXITSTATUS(status)==1) return -1;   /* refused */
+    return -2;                                                    /* crash/protocol: always a failure */
+#else
+    (void)O;(void)I;(void)nb;(void)ns;
+    return -3;                                                    /* sweep skipped on Windows */
+#endif
+}
+static void test_fmt7_unreachable_sweep(void){
+#ifndef _WIN32
+    static const int Os[] = {1,2,3,24,32,33,64,98,127,128,129,130,384,400,576,2048};
+    static const int Is[] = {1,64,98,128,129,200,256,257,384,400,512,1024,6144,16384,33000};
+    int probes=0, resolved=0, refused=0;
+    for(size_t oi=0; oi<sizeof(Os)/sizeof(Os[0]); oi++){
+        for(size_t ii=0; ii<sizeof(Is)/sizeof(Is[0]); ii++){
+            int O=Os[oi], I=Is[ii];
+            int64_t nblk = fp8_nblk(O)*fp8_nblk(I);
+            /* every (nb, ns) class the resolver's ladder can see, incl. the
+             * adversarial cross-wired ones (row-shaped ns on block-shaped nb
+             * and vice versa): */
+            const int64_t cand[][2] = {
+                { (int64_t)O*I,              (int64_t)O*4 },        /* int8-row shaped   */
+                { (int64_t)O*I,              nblk*4       },        /* fp8 f32 block     */
+                { (int64_t)O*I,              nblk         },        /* fp8 ue8m0 block   */
+                { (int64_t)O*((I+1)/2),      (int64_t)O*4 },        /* int4-row          */
+                { (int64_t)O*((I+3)/4),      (int64_t)O*4 },        /* int2-row          */
+                { (int64_t)O*((I+1)/2),      (int64_t)O*((I+63)/64)*4 }, /* int4-grouped g64 */
+                { (int64_t)O*i3_rowbytes(I), (int64_t)O*i3_groups(I)*4 },/* int3-g64      */
+                { (int64_t)O*e8_rowbytes(I), 4 },                   /* E8/IQ3 tag        */
+                { (int64_t)O*I,              4 },                   /* cross-wired tag   */
+                { (int64_t)O*I,              0 },                   /* degenerate ns     */
+                { 0,                          (int64_t)O*4 },       /* degenerate nb     */
+            };
+            for(size_t c=0; c<sizeof(cand)/sizeof(cand[0]); c++){
+                int f = resolved_fmt_probe(O, I, cand[c][0], cand[c][1]);
+                probes++;
+                if(f==-2){ printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld: crash/protocol error\n",
+                                  O,I,(long long)cand[c][0],(long long)cand[c][1]); CHECK(0); continue; }
+                if(f==-1){ refused++; continue; }
+                resolved++;
+                int ok = (f==1||f==2||f==3||f==4||f==5||f==6||f==8);
+                if(!ok) printf("FAIL sweep O=%d I=%d nb=%lld ns=%lld: resolved to fmt=%d (outside {1,2,3,4,5,6,8})\n",
+                               O,I,(long long)cand[c][0],(long long)cand[c][1],f);
+                CHECK(ok);
+                CHECK(f != 7);
+            }
+        }
+    }
+    /* the sweep must have actually exercised both arms, or it proved nothing. */
+    CHECK(probes >= 2000 && resolved >= 100 && refused >= 100);
+#else
+    printf("skipped on Windows (no fork): fmt=7 unreachability sweep\n");
+#endif
+}
+
 int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
@@ -636,6 +766,8 @@ int main(void){
     check_wire_split(8, 2,16384, 0,    "qt_wire_split fmt=8 nblk(128) >> O(2): scale=512B, NOT O*4=8B");
     check_wire_split(8, 2048,6144, 0,  "qt_wire_split fmt=8 spec example: scale=3072B, NOT O*4=8192B");
     test_wire_site_regression();
+    test_metal_fused_allowlist();
+    test_fmt7_unreachable_sweep();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;

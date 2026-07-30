@@ -2932,6 +2932,31 @@ done:
 }
 #endif
 
+/* POSITIVE allowlist for the two fused Metal decode gates below
+ * (attention_rows / layer_forward_rows): only the mm_gemv shader's explicit
+ * INTEGER-format branches (fmt 1/2/3/4) may enter the fused path -- the
+ * exact set that was BOTH admitted by the old negative guard AND computed
+ * correctly. Anything else falls back to the CPU path (correct, slower).
+ * INVARIANT this predicate names: a NEGATIVE guard (the previous
+ * `fmt!=8` form) is fail-OPEN for every format it doesn't name --
+ * bind_gemv (backend_metal.mm) has no fmt allowlist of its own, and the
+ * mm_gemv shader's dispatch chain ends in an unconditional f32 fallback
+ * branch, so a resident fmt=5 or fmt=6 tensor slipping through would have
+ * its REAL weight bytes (they live in q4, which is exactly what the WP_()
+ * macro hands the kernel) silently misread as f32 garbage, with no error.
+ * This form is fail-CLOSED: a future format is excluded until someone
+ * proves it on the fused path and adds it here. fmt=3 (int2) is included
+ * because it was legal-and-correct here before this change (explicit
+ * mm_gemv branch, real q4 bytes) -- excluding it would be this change's
+ * only regression. fmt=0 (f32) stays excluded: it never actually fused --
+ * WP_() hands the shader q4, which is NULL for fmt=0 (weights live in qf)
+ * -- so admitting it would be dead permissiveness, not a preserved
+ * behavior. fmt=5/6 (misread hazard), fmt=8 (NULL-q4 variant), and every
+ * future format remain excluded.
+ * Defined unconditionally (not #ifdef COLI_METAL) so the CPU test build
+ * can unit-test the truth table (tests/test_fp8_load.c Part F). */
+static inline int metal_fused_fmt_ok(int fmt){ return fmt==1 || fmt==2 || fmt==3 || fmt==4; }
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -2946,24 +2971,28 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
      * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s].
-     * fmt!=8 guards (q_a/q_b/kv_a/o): STALE-COMMENT FIX -- this PR's own mm_gemv
-     * Metal shader (backend_metal.mm) DOES have a real fmt==8 branch (fp8-e4m3
-     * decode + per-128x128-block scale); the shader is not the gap. The actual
-     * blocker is the WP_() macro two lines below: it picks q8 only for fmt==1,
-     * else q4 -- and q4 is NULL/unallocated for fmt=8 (same convention as fmt=1,
-     * see the QT struct comment), so an fmt=8 tensor reaching
-     * coli_metal_attn_decode would hand the kernel a NULL weight pointer, not a
-     * misread-as-f32 shader. Fail closed to the CPU path below instead
-     * (matmul_qt_ex there dispatches fmt=8 correctly via matmul_fp8); fixing
-     * WP_() and actually wiring fmt=8 through bind_gemv/coli_metal_attn_decode is
-     * a deferred follow-up (see this PR's GPU-path note), not done in this
-     * round. kv_b is already pinned to fmt==2 above for an unrelated reason (its
-     * absorb kernel is int4-only); these four checks are the same discipline
-     * extended to the tensors that flow through the shared per-fmt shader. */
+     * metal_fused_fmt_ok(q_a/q_b/kv_a/o): POSITIVE allowlist (fmt 1/2/4, see the
+     * predicate's own comment above attention_rows). Previously these were
+     * negative fmt!=8 guards -- fail-OPEN for everything they didn't name: for
+     * fmt=8 specifically the WP_() macro two lines below picks q8 only for
+     * fmt==1, else q4 -- and q4 is NULL/unallocated for fmt=8 (same convention
+     * as fmt=1, see the QT struct comment), so an fmt=8 tensor reaching
+     * coli_metal_attn_decode would hand the kernel a NULL weight pointer; for
+     * fmt=5/6 the hazard is WORSE -- their real weight bytes live in q4, so
+     * WP_() hands the shader a valid pointer and mm_gemv's terminal f32
+     * fallback branch silently misreads them as f32 garbage. The allowlist
+     * fails CLOSED to the CPU path below for all of them (matmul_qt_ex there
+     * dispatches every format correctly, incl. fmt=8 via matmul_fp8); wiring
+     * fmt=8 through bind_gemv/coli_metal_attn_decode stays a deferred
+     * follow-up (see this PR's GPU-path note). kv_b is already pinned to
+     * fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
+     * these four checks are the same discipline extended to the tensors that
+     * flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
-       && l->q_a.fmt!=8 && l->q_b.fmt!=8 && l->kv_a.fmt!=8 && l->o.fmt!=8){
+       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
+       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
@@ -5169,23 +5198,28 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows.
-     * fmt!=8 guards (q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): same fail-closed discipline
-     * as attention_rows, extended to the shared-expert MLP this fused kernel also
-     * covers. STALE-COMMENT FIX -- the mm_gemv shader these bind_gemv calls dispatch
-     * through DOES have a real fmt==8 branch (this PR's own Metal kernel commit); the
-     * actual gap is the WP_() macro below, which picks q8 only for fmt==1 and q4
-     * (NULL/unallocated for fmt=8) otherwise, so none of these seven bind_gemv-routed
-     * tensors can safely carry fmt=8 through this fused path yet -- CPU below
-     * dispatches fmt=8 correctly via matmul_qt_ex/matmul_fp8. Fixing WP_() and wiring
-     * fmt=8 through bind_gemv is the same deferred follow-up noted in attention_rows,
-     * not done in this round. */
+     * metal_fused_fmt_ok(q_a/q_b/kv_a/o/sh_gate/sh_up/sh_down): POSITIVE allowlist
+     * (fmt 1/2/4), same fail-closed discipline as attention_rows, extended to the
+     * shared-expert MLP this fused kernel also covers. The mm_gemv shader these
+     * bind_gemv calls dispatch through has a real fmt==8 branch (this PR's own
+     * Metal kernel commit), but the WP_() macro below picks q8 only for fmt==1
+     * and q4 (NULL/unallocated for fmt=8) otherwise, so none of these seven
+     * bind_gemv-routed tensors can safely carry fmt=8 through this fused path
+     * yet -- and a fmt=5/6 tensor's REAL q4 bytes would be silently misread by
+     * the shader's terminal f32 fallback (see the predicate's comment). CPU
+     * below dispatches every format correctly, incl. fmt=8 via
+     * matmul_qt_ex/matmul_fp8. Fixing WP_() and wiring fmt=8 through bind_gemv
+     * is the same deferred follow-up noted in attention_rows, not done in this
+     * round. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
        && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
-       && l->q_a.fmt!=8 && l->q_b.fmt!=8 && l->kv_a.fmt!=8 && l->o.fmt!=8
-       && l->sh_gate.fmt!=8 && l->sh_up.fmt!=8 && l->sh_down.fmt!=8){
+       && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
+       && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)
+       && metal_fused_fmt_ok(l->sh_gate.fmt) && metal_fused_fmt_ok(l->sh_up.fmt)
+       && metal_fused_fmt_ok(l->sh_down.fmt)){
         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
