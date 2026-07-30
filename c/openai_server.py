@@ -1151,17 +1151,47 @@ def read_engine_turn(stream, sentinel, on_bytes):
     }
 
 
+# Engines whose cap argv understands the "0 = platform-auto" sentinel
+# (colibri.c coli_resolve_cap resolves it Metal/darwin/SSD-aware, #379).
+_SENTINEL_CAP_ENGINES = ("colibri", "glm")
+
+
+def cap_for_engine(executable, cap):
+    """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
+
+    cap 0 means different things across today's engines -- platform-auto in
+    colibri.c (coli_resolve_cap), RAM-auto in inkling.c (cap <= 0 fits the
+    expert LRU to available RAM), while the coli wrapper historically forced 8
+    on every engine. This shim INTERNALIZES that external inconsistency at the
+    one funnel every engine launch passes through: a non-glm engine receives
+    the legacy 8 when the user gave no explicit cap, an explicit --cap N
+    passes through to any engine, and the glm engine receives the 0 sentinel
+    to resolve platform-aware. Keyed on the engine binary's identity, not the
+    chat-template arch: COLI_ENGINE can route an inkling-arch model to the glm
+    binary, and it is the binary that interprets the argv.
+
+    MOOTING TRIGGER: upstream unifies cap-sentinel semantics across engines
+    -> this shim must be removed and re-derived."""
+    if cap != 0:
+        return cap
+    name = Path(executable).name.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return 0 if name in _SENTINEL_CAP_ENGINES else 8
+
+
 class Engine:
-    # cap=0 = "not explicitly set": the engine resolves it (8 historically, 1 on
-    # Metal+darwin+fast SSD -- colibri.c coli_resolve_cap, #379). Same sentinel as
-    # the --cap flags in coli and main() below, so programmatic callers that
+    # cap=0 = "not explicitly set": the glm engine resolves it (8 historically,
+    # 1 on Metal+darwin+fast SSD -- colibri.c coli_resolve_cap, #379), while
+    # non-glm engines get the legacy 8 via cap_for_engine above. Same sentinel
+    # as the --cap flags in coli and main() below, so programmatic callers that
     # never pass cap get the same auto behavior as the CLI.
     def __init__(self, executable, model, cap=0, max_tokens=1024, env=None, kv_slots=1):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
-            [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, bufsize=0,
+            [str(executable), str(cap_for_engine(executable, cap))], env=child_env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()

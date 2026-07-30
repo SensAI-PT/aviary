@@ -14,8 +14,8 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, conversation_cache_slot, generation_options,
-                           parse_tool_calls, read_engine_turn,
+                           _engine_error, cap_for_engine, conversation_cache_slot,
+                           generation_options, parse_tool_calls, read_engine_turn,
                            render_chat, render_chat_kimi, serve,
                            split_thinking_reply, stop_policy)
 
@@ -590,6 +590,45 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
+
+class CapSentinelShimTest(unittest.TestCase):
+    # #379 cap-sentinel shim: cap 0 is "platform-auto" only to the glm engine
+    # (colibri.c coli_resolve_cap); inkling reads cap <= 0 as "fit the expert
+    # LRU to all available RAM" (inkling.c), so leaking the sentinel to a
+    # non-glm engine silently changes its memory behavior. Engine() is the one
+    # funnel every launch passes through -- coli serve, coli chat's local
+    # server, openai_server.py --model, and programmatic callers -- so the
+    # translation is pinned HERE, at the argv it actually emits.
+    def _spawn_argv(self, executable, **kwargs):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine(executable, "model", **kwargs)
+            engine.close()
+        return popen.call_args[0][0]
+
+    def test_non_glm_engine_gets_legacy_8_for_the_sentinel(self):
+        for executable in ("inkling", "/opt/libexec/colibri/inkling",
+                           "kimi_k3", "kimi_k3.exe", "olmoe"):
+            self.assertEqual(self._spawn_argv(executable), [executable, "8"],
+                             f"sentinel leaked to {executable}")
+
+    def test_glm_engine_keeps_the_platform_auto_sentinel(self):
+        for executable in ("glm", "glm.exe", "colibri", "/repo/c/colibri"):
+            self.assertEqual(self._spawn_argv(executable), [executable, "0"],
+                             f"sentinel lost for {executable}")
+
+    def test_explicit_cap_passes_through_to_any_engine(self):
+        self.assertEqual(self._spawn_argv("inkling", cap=5), ["inkling", "5"])
+        self.assertEqual(self._spawn_argv("colibri", cap=5), ["colibri", "5"])
+
+    def test_cap_for_engine_is_the_single_translation_point(self):
+        self.assertEqual(cap_for_engine("inkling", 0), 8)
+        self.assertEqual(cap_for_engine("kimi_k3", 0), 8)
+        self.assertEqual(cap_for_engine("colibri", 0), 0)
+        self.assertEqual(cap_for_engine("glm", 0), 0)
+        self.assertEqual(cap_for_engine("inkling", 3), 3)
+        self.assertEqual(cap_for_engine("glm", 3), 3)
 
 
 class HTTPTest(unittest.TestCase):

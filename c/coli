@@ -740,8 +740,12 @@ def cmd_chat(a):
         model_id="kimi-k3-colibri" if arch=="kimi" else "inkling-colibri"
         banner(f"chat · {model_id} · local server")
         import openai_server
+        # --cap rides along so an explicit `coli chat --cap N` reaches the
+        # engine; the 0-default sentinel is translated per engine inside
+        # openai_server (cap_for_engine, #379: non-glm engines get legacy 8).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
+             "--cap",str(a.cap),
              "--host","127.0.0.1","--port","8000","--max-tokens",str(a.ngen)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -1050,8 +1054,10 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
-    # 0 = not explicitly set: the engine picks (8 historically; 1 on Metal+darwin+fast
-    # SSD, #379 -- an honest F_NOCACHE probe measures "fast", cached in <model>/.coli_ssd).
+    # 0 = not explicitly set: the glm engine picks (8 historically; 1 on Metal+darwin+
+    # fast SSD, #379 -- an honest F_NOCACHE probe measures "fast", cached in
+    # <model>/.coli_ssd), while non-glm engines get the legacy 8 (the 0 sentinel means
+    # "RAM-auto" to inkling, not "engine default" -- openai_server.cap_for_engine).
     # An explicit --cap always wins; see colibri.c's coli_resolve_cap().
     common.add_argument("--cap", type=int, default=0, help="cache slots/layer (0=auto)")
     common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
