@@ -84,7 +84,9 @@ class ResourcePlanTest(unittest.TestCase):
     def _write_v2_cache(self, gbs="14.322", dev=None):
         if dev is None:
             dev = os.stat(self.model).st_dev
-        (self.model / ".coli_ssd").write_text(f"v2 {gbs} {dev}\n")
+        # byte-exact: text mode would CRLF-translate on Windows and the strict
+        # reader would (correctly) reject the fixture as garbage
+        (self.model / ".coli_ssd").write_bytes(f"v2 {gbs} {dev}\n".encode("ascii"))
 
     def test_ssd_probe_missing_file_returns_none(self):
         self.assertIsNone(read_ssd_probe(self.model))
@@ -103,15 +105,15 @@ class ResourcePlanTest(unittest.TestCase):
         # Pre-v2 caches were written before cold-range steering existed, so the
         # value may be page-cache contamination; the engine re-probes and
         # upgrades, and until then there is no number worth surfacing.
-        (self.model / ".coli_ssd").write_text("14.322\n")
+        (self.model / ".coli_ssd").write_bytes(b"14.322\n")
         self.assertIsNone(read_ssd_probe(self.model))
 
     def test_ssd_probe_unparsable_file_returns_none(self):
-        (self.model / ".coli_ssd").write_text("not-a-number\n")
+        (self.model / ".coli_ssd").write_bytes(b"not-a-number\n")
         self.assertIsNone(read_ssd_probe(self.model))
 
     def test_ssd_probe_empty_file_returns_none(self):
-        (self.model / ".coli_ssd").write_text("")
+        (self.model / ".coli_ssd").write_bytes(b"")
         self.assertIsNone(read_ssd_probe(self.model))
 
     def test_ssd_probe_grammar_matches_c_reader_vectors(self):
@@ -160,9 +162,9 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(ssd_probe_state(self.model), ("ok", 14.322))
         self._write_v2_cache("14.322", dev=os.stat(self.model).st_dev + 1)
         self.assertEqual(ssd_probe_state(self.model), ("foreign", None))
-        (self.model / ".coli_ssd").write_text("14.322\n")
+        (self.model / ".coli_ssd").write_bytes(b"14.322\n")
         self.assertEqual(ssd_probe_state(self.model), ("legacy", None))
-        (self.model / ".coli_ssd").write_text("inf\n")
+        (self.model / ".coli_ssd").write_bytes(b"inf\n")
         self.assertEqual(ssd_probe_state(self.model), ("garbage", None))
 
     def test_ssd_probe_surfaces_in_plan_and_format(self):
@@ -173,7 +175,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertIn("14.3 GB/s", format_plan(plan))
 
     def test_ssd_probe_pending_states_surface_in_format(self):
-        (self.model / ".coli_ssd").write_text("14.3\n")   # legacy
+        (self.model / ".coli_ssd").write_bytes(b"14.3\n")   # legacy
         plan = build_plan(self.model, available_memory=16 * GB, available_disk=1)
         self.assertIsNone(plan["ssd_probe_gbs"])
         self.assertEqual(plan["ssd_probe_state"], "legacy")

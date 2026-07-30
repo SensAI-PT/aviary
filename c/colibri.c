@@ -7831,7 +7831,8 @@ static double coli_ssd_probe_cached(const char *snap_dir){
     snprintf(cpath,sizeof(cpath),"%s/.coli_ssd",snap_dir);
     struct stat dst;
     unsigned long long cur_dev = stat(snap_dir,&dst)==0 ? (unsigned long long)dst.st_dev : 0;
-    FILE *f=fopen(cpath,"r");
+    FILE *f=fopen(cpath,"rb");                   /* exact bytes: never let a text-mode
+                                                  * layer eat the \r the grammar rejects */
     if(f){
         char buf[COLI_SSD_CACHE_MAX+2];
         size_t n=fread(buf,1,sizeof(buf),f);

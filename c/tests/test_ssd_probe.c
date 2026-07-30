@@ -212,14 +212,14 @@ static void run_steering(void){
 #ifdef __APPLE__
 static void write_file(const char *dir, const char *name, const char *data){
     char p[1400]; snprintf(p,sizeof(p),"%s/%s",dir,name);
-    FILE *f=fopen(p,"w");
+    FILE *f=fopen(p,"wb");                       /* exact bytes -- these fixtures feed a strict parser */
     if(!f){ perror(p); failures++; return; }
     fputs(data,f); fclose(f);
 }
 
 static int read_file(const char *dir, const char *name, char *out, size_t outsz){
     char p[1400]; snprintf(p,sizeof(p),"%s/%s",dir,name);
-    FILE *f=fopen(p,"r");
+    FILE *f=fopen(p,"rb");
     if(!f) return -1;
     size_t n=fread(out,1,outsz-1,f); out[n]=0; fclose(f);
     return (int)n;
@@ -266,7 +266,7 @@ static void run_cached_decisions(void){
      * write any .coli_ssd */
     {
         char p[1400]; snprintf(p,sizeof(p),"%s/out-00000.safetensors",dirbuf);
-        FILE *f=fopen(p,"w");
+        FILE *f=fopen(p,"wb");
         if(f){
             char *mb=malloc(1024*1024);
             memset(mb,0xA5,1024*1024);

@@ -36,6 +36,9 @@ garbage	9.5\s\n
 garbage	9.5\t\n
 garbage	9.5\r\n
 garbage	9.5\n\n
+# CRLF is not a line ending here -- the format is exact bytes, and a Windows
+# text-mode writer once smuggled \r into fixtures (CI, 2026-07): pinned forever
+garbage	v2 14.322 123\r\n
 # --- garbage: strtod-isms the strict grammar bans ------------------------
 garbage	inf\n
 garbage	-inf\n
