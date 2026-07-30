@@ -17,16 +17,16 @@ coordination alone.
 
 This registry (and the metadata stamp it documents) is PR 2 of a two-PR pair:
 PR 1 (`fmt7/fp8-passthrough`) shipped the CPU read path, repack tool, Metal
-kernel, and collision/refusal logic for `fmt=7`. **Post-INVERSION** (the
+kernel, and collision/refusal logic for `fmt=8`. **Post-INVERSION** (the
 #528 review round's fix, folded into PR 1 before this PR stacked on it): an
-UNSTAMPED tensor at the fmt=1-vs-fmt=7 ambiguous shape (THE DESIGN LANDMINE)
+UNSTAMPED tensor at the fmt=1-vs-fmt=8 ambiguous shape (THE DESIGN LANDMINE)
 no longer refuses — it resolves to `int8-row`, the incumbent,
 already-on-disk, decodable format, and the writer (`repack_fp8_passthrough.py`)
-refuses to ever EMIT an `fmt=7` container at that same ambiguous shape, so an
+refuses to ever EMIT an `fmt=8` container at that same ambiguous shape, so an
 unstamped collision is never silently misread either way. This PR stacks on
 top of that and adds the stamp (writer + reader): a stamp's role here is
-letting a genuinely-STAMPED `fmt=7` tensor at an ambiguous shape still be
-read as `fmt=7` (overriding the unstamped-case default) — and, for every
+letting a genuinely-STAMPED `fmt=8` tensor at an ambiguous shape still be
+read as `fmt=8` (overriding the unstamped-case default) — and, for every
 tensor generally, confirming a stamped identity agrees with byte-arithmetic
 inference (TRUST-VERIFY-REFUSE) — plus this registry document, as their own
 reviewable unit per the maintainer's request on
@@ -35,15 +35,15 @@ discussion separate from the CPU+Metal implementation.
 
 ## Known formats
 
-Every row below is verified against branch `fmt7/stamp-registry-rev1` (base
-commit `696ce96`, this document's own commit stacked directly on it), itself
-restacked on the revised `fmt7/fp8-passthrough-rev1` (base `a77421d`, the
-#528 review round's INVERSION/qt_wire_split/stale-comment fixes), which is
-in turn based on dev `9baae9b` (post-#465-merge, post-#526) — no cross-tree
-line-number mixing. Every `c/colibri.c` line number in this document reflects
-that restack; re-verify them again if this branch is rebased further. The
-fmt=6 rows are upstream's own merged code (this branch's only fmt=6-adjacent
-change is the collision handling inside `qt_resolve_fmt`, `c/colibri.c`).
+Every row below is verified against this PR pair's current restack: the
+stamp+registry series (#529) stacked directly on the fp8-passthrough series
+(#528), which is in turn based on dev `292ed4c` (post-#465, post-#457
+Metal grouped-GEMV merge, post-#705 Vulkan/Kimi-K3 MXFP4 merge) — no
+cross-tree line-number mixing. Every `c/colibri.c`/`c/quant.h` line number
+in this document reflects that restack; re-verify them again if this branch
+is rebased further. The fmt=6 and fmt=7 rows are upstream's own merged code
+(this branch's only fmt=6-adjacent change is the collision handling inside
+`qt_resolve_fmt`, `c/colibri.c`; it does not touch fmt=7/MXFP4 at all).
 
 `qt_resolve_fmt` (`c/colibri.c`) is the authoritative reader: it infers a
 tensor's format from byte arithmetic alone (weight-byte count + scale-byte
@@ -63,60 +63,74 @@ the bytes alone say.
 | 4 | `int4-grouped` | `O*ceil(I/2)` bytes (`q4`, same packed layout as fmt=2) | 1 `f32` per **group** of `gs` inputs, `O*ceil(I/gs)` entries | stable, upstream | `498ab0c` / merged PR [#242](https://github.com/JustVugg/colibri/pull/242) |
 | 5 | `int3-g64` | `O*ceil(I/64)*24` bytes (`q4`; 24B/group = 16B low-plane + 8B high-plane, `I3_GROUP=64`/`I3_GBYTES=24`) | 1 `f32` per **64-input group**, `O*ceil(I/64)` entries | stable, upstream | `5e42e70` |
 | 6 | `e8-iq3` (E8/IQ3 lattice) | `O*ceil(I/256)*98` bytes (98-byte self-contained super-blocks: E8 lattice indices + parity signs + fp16 super-scales; `E8_QK=256`, `E8_BBYTES=98`) | none as a separate array — scales live **inside** the super-blocks; the `.qs` sidecar is a single-float tag (`ns==4` is the loader's discriminator). NOTE: stores `W@Q` (block-diagonal FWHT rotation) — activations must be rotated before the kernel | **stable, upstream** — [#465](https://github.com/JustVugg/colibri/pull/465) MERGED 2026-07-21 | dev `dce7012` |
-| **7** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) is IMPLEMENTED; **UE8M0** (1 byte/block, same block grid) is RECOGNIZED and refused by name, not yet implemented | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; PUBLIC ordinal assigned by the maintainer on #524 (developed under the PRIVATE ORDINAL BLOCK as `fmt=100`) | `fmt7/fp8-passthrough` (PR 1) |
+| 7 | `mxfp4` (no in-tree name string — dev has no stamp feature) | `O*ceil(I/2)` bytes (e2m1 nibbles, 2 packed values/byte — same nibble packing as fmt=2/4) | 1 `f32` per **group** of `gs` inputs (`gs=32` for Kimi K3; host gate requires `gs % 8 == 0`) | **stable, upstream** — Kimi K3 native routed-expert tier, **Vulkan backend only** (`c/backend_vulkan.c`, `c/shaders/qmatmul.comp`); NOT a CPU/`QT` format — `qt_resolve_fmt` never returns 7 and the Metal backend refuses it | merged [#676](https://github.com/JustVugg/colibri/issues/676)/[#705](https://github.com/JustVugg/colibri/pull/705) |
+| **8** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) is IMPLEMENTED; **UE8M0** (1 byte/block, same block grid) is RECOGNIZED and refused by name, not yet implemented | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; developed under the PRIVATE ORDINAL BLOCK as `fmt=100`; assigned fmt=7 by the maintainer on #524, renumbered to **fmt=8** after #705 merged claiming 7 for MXFP4 while this pair was open (see "ID assignment" below) | `fmt7/fp8-passthrough` (PR 1) |
 
-With fmt=6 and fmt=7 both assigned, the next free public ordinal is **8** —
-the (separate, future) entropy-tier proposal mentioned in earlier drafts of
-this document would naturally land there, but per the convention below it
-isn't claimed here; the maintainer assigns at merge.
+With fmt 0–8 all assigned, the next free public ordinal is **9** — per the
+convention below it isn't claimed here; an ID is only settled at merge.
 
-Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers, branch
-`fmt7/stamp-registry-rev1` @ this commit, base dev `9baae9b`):
+**ID assignment.** An ordinal is claimed by the first merge into dev that
+ships it — there is no reservation mechanism, and an assignment made on an
+open PR or issue thread does not survive a competing merge (this pair's own
+format was assigned 7 on #524, then #705 merged MXFP4 as fmt=7 first, and
+this format moved to 8). Before picking an ordinal — or relying on one —
+proposers must scan both dev and the open PRs. This registry is the
+coordination point: a row lands here when the format lands in dev.
 
-- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:910`
+Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers at this PR
+pair's current restack, base dev `292ed4c`):
+
+- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:1105`
   (`bits>=16→fmt=0`, `bits>=5→fmt=1`, `bits>=4→fmt=2`, else `fmt=3`).
   Kernels: `matmul_q` (`quant.h:105`, fmt=1), `matmul_i4` (`quant.h:125`,
   fmt=2), `matmul_i2` (`quant.h:251`, fmt=3); pack/quantize helpers
-  `quantize_rows` (`quant.h:871`, fmt=1) and `pack_int2` (`quant.h:923`,
-  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c:164`.
+  `quantize_rows` (`quant.h:928`, fmt=1) and `pack_int2` (`quant.h:980`,
+  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c:183`.
 - **fmt=4** (`int4-grouped`) — kernel `matmul_i4_grouped`, `quant.h:168`;
   group size `gs` is per-tensor, not fixed at 64 (contrast fmt=5). Byte-count:
-  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:164`); scale-count split:
-  `qt_scale_bytes`, `c/colibri.c:223`.
+  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:183`); scale-count split:
+  `qt_scale_bytes`, `c/colibri.c:263`.
 - **fmt=5** (`int3-g64`) — group size is fixed (`I3_GROUP=64`,
   `quant.h:293`; `I3_GBYTES=24`, `quant.h:294`); helpers `i3_groups`
   (`quant.h:295`), `i3_rowbytes` (`quant.h:296`); kernel `matmul_i3`
-  (`quant.h:302`); pack helper `pack_int3_g64` (`quant.h:899`). Allocation:
-  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:910`).
+  (`quant.h:354`); pack helper `pack_int3_g64` (`quant.h:956`). Allocation:
+  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:1105`).
 - **fmt=6** (`e8-iq3`) — upstream's merged code: format section header
-  precedes `quant.h:951`; constants `E8_QK=256` (`quant.h:951`),
-  `E8_SUB=32` (`quant.h:952`), `E8_BBYTES=98` (`quant.h:953`); row-byte
-  helpers `e8_blocks`/`e8_rowbytes` (`quant.h:954-955`); rotation contract
-  documented at `quant.h:1248` ("fmt=6 stores W@Q, so activations must be
+  precedes `quant.h:1008`; constants `E8_QK=256` (`quant.h:1008`),
+  `E8_SUB=32` (`quant.h:1009`), `E8_BBYTES=98` (`quant.h:1010`); row-byte
+  helpers `e8_blocks`/`e8_rowbytes` (`quant.h:1011-1012`); rotation contract
+  documented at `quant.h:1305` ("fmt=6 stores W@Q, so activations must be
   transformed before"). Loader discriminator, upstream form (dev, ns==4 tag
   check at the top of `qt_resolve_fmt`): this branch's SECOND DESIGN
-  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c:1161`) hardens that check
+  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c:1356`) hardens that check
   against the degenerate collisions below without changing any genuine-fmt=6
   outcome.
-- **fmt=7** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
-  (`quant.h:389`) / `e4m3_decode` (`quant.h:423`), block size
-  `FP8_BLOCK=128` (`quant.h:425`), kernel `matmul_fp8` (`quant.h:434`).
+- **fmt=7** (`mxfp4`, upstream's merged code) — Vulkan-only decode: shader
+  branch `p.fmt == 4 || p.fmt == 7` in `c/shaders/qmatmul.comp` (e2m1 nibble
+  decode, per-`gs`-group scale folded into the accumulation), host gate and
+  sizing in `c/backend_vulkan.c` (`upload_tensor`'s `fmt == 4 || fmt == 7`
+  allow-list, `gs % 8 == 0`). Wired for Kimi K3's routed-expert tier
+  (`c/kimi_k3.c`); no CPU (`quant.h`) or Metal kernel exists for it, and
+  `qt_resolve_fmt` has no byte-arithmetic branch that returns 7.
+- **fmt=8** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
+  (`quant.h:446`) / `e4m3_decode` (`quant.h:480`), block size
+  `FP8_BLOCK=128` (`quant.h:482`), kernel `matmul_fp8` (`quant.h:491`).
   Disambiguation from fmt=1 ("THE DESIGN LANDMINE" — the two formats'
   weight bytes are byte-identical and can only be told apart by
   scale-array geometry, which is ambiguous for some small shapes) and the
   fmt=6 collision ("SECOND DESIGN LANDMINE") both live in `qt_resolve_fmt`
-  (`c/colibri.c:1161`), which now also consults an optional `stamped_name`
+  (`c/colibri.c:1356`), which now also consults an optional `stamped_name`
   parameter (this PR): for the fmt=6 collision, a stamp resolves what an
-  absent stamp still refuses; for the fmt=1-vs-fmt=7 collision, an absent
+  absent stamp still refuses; for the fmt=1-vs-fmt=8 collision, an absent
   stamp already resolves to `int8-row` since the #528 INVERSION, and a
-  stamp's role there is instead letting a genuinely-stamped `fmt=7` tensor
+  stamp's role there is instead letting a genuinely-stamped `fmt=8` tensor
   override that default — see "The metadata stamp" below for the exact
   rule in both cases. FMT_NAMES table (name string <-> fmt int):
-  `c/colibri.c:1121`.
+  `c/colibri.c:1316`.
 
-## Scale encoding is a declared property (fmt=7)
+## Scale encoding is a declared property (fmt=8)
 
-fmt=7's byte layout for the WEIGHTS (`O*I` raw e4m3 bytes) is fixed. Its
+fmt=8's byte layout for the WEIGHTS (`O*I` raw e4m3 bytes) is fixed. Its
 scale sidecar's ENCODING is not — it's a property of the format that a
 container can carry one of several ways, the same identity ("fp8-e4m3-b128",
 128×128-block scaling) admitting more than one physical byte layout for the
@@ -125,7 +139,7 @@ scale array:
 - **f32** — 4 bytes/block, `ceil(O/128)*ceil(I/128)` `float`s. This is the
   value **this PR pair implements**: Z.ai's GLM-5.2-FP8 checkpoints ship
   `weight_scale_inv` this way, and `tools/repack_fp8_passthrough.py` /
-  `matmul_fp8` / the Metal `mm_gemv` fmt=7 branch all read and write it.
+  `matmul_fp8` / the Metal `mm_gemv` fmt=8 branch all read and write it.
 - **UE8M0** — 1 byte/block, a power-of-two exponent (dtype `F8_E8M0`), same
   `ceil(O/128)*ceil(I/128)` block grid. **DeepSeek-V4 ships this identical
   weight geometry (FP8 E4M3, 128×128 blocks) with UE8M0 scales instead of
@@ -150,7 +164,7 @@ scale array:
   `qt_resolve_fmt`'s own comments for the exact cases.
 
 Collision-checked against every other format's `ns` (scale-byte) arithmetic
-reachable from fmt=7's `nb==O*I` weight-byte branch: realistically distinct
+reachable from fmt=8's `nb==O*I` weight-byte branch: realistically distinct
 for GLM-sized shapes (`ceil(O/128)*ceil(I/128)` is orders of magnitude
 smaller than `O*4` for any real matrix), but not categorically distinct — the
 same small-`O` regime that produces the f32-vs-fmt=1 collision (THE DESIGN
@@ -165,13 +179,14 @@ these shapes; the discipline exists for untrusted containers.
 
 To avoid a repeat of the #465 collision, in-flight branches in this repo mint
 format ordinals from a **private block starting at 100**, never from the
-public 0-7 range, and never claim a specific public ordinal in a Feature
-Request. The convention (already applied twice: fmt=6's original proposal
-briefly held it before #465 claimed the number upstream, and this PR pair's
-own fmt=7 moved from the collided `fmt=6` to `fmt=100` and then graduated to
-the maintainer-assigned `fmt=7`):
+public 0-8 range, and never claim a specific public ordinal in a Feature
+Request. The convention (already applied twice — both times to this same
+format: its original proposal briefly held `fmt=6` before #465 claimed that
+number upstream, so it moved to `fmt=100`; it graduated to the
+maintainer-assigned `fmt=7` on #524, and then #705 merged MXFP4 as fmt=7
+first, moving it again to `fmt=8`):
 
-- **0-7 stays upstream's namespace.** A branch never assigns itself an
+- **0-8 stays upstream's namespace.** A branch never assigns itself an
   ordinal in that range, even provisionally.
 - **100+ is scratch space.** Any branch may claim the next unused 100+
   integer for local development and testing. Since the ordinal is a
@@ -179,7 +194,7 @@ the maintainer-assigned `fmt=7`):
   byte-arithmetic inference above), renumbering it later is a pure
   find-and-replace with zero on-disk or cross-version compatibility impact
   — nothing outside the binary's own compiled code ever observes the
-  number, as this branch's own fmt=100 → fmt=7 renumbering demonstrated.
+  number, as this branch's own fmt=100 → fmt=7 → fmt=8 renumberings demonstrated.
 - **A container never advertises a private ordinal.** What a container (or
   a Feature Request) advertises is the format's **NAME** — a string like
   `fp8-e4m3-b128` — never the integer. The real, public ordinal is assigned
@@ -211,13 +226,13 @@ reference implementation of this proposal:
   INVERSION already made the unstamped default (see above): inference alone
   decides, exactly as it does today for every container that predates this
   feature. What a stamp adds differs by which collision it's breaking a tie
-  on: for the **fmt=6-vs-fmt=7** collision (SECOND DESIGN LANDMINE), an
+  on: for the **fmt=6-vs-fmt=8** collision (SECOND DESIGN LANDMINE), an
   unstamped tensor at that shape still refuses unconditionally — a stamp
   naming the correct candidate **resolves** it instead, exactly as
-  originally designed. For the **fmt=1-vs-fmt=7** collision (THE DESIGN
+  originally designed. For the **fmt=1-vs-fmt=8** collision (THE DESIGN
   LANDMINE), the INVERSION means an unstamped tensor at that shape no
   longer refuses at all — a stamp's role there is letting a genuinely
-  stamped `fmt=7` tensor still be read as `fmt=7` (overriding the unstamped
+  stamped `fmt=8` tensor still be read as `fmt=8` (overriding the unstamped
   default of `int8-row`), not resolving a refusal that no longer happens.
   See `qt_resolve_fmt`'s own documentation for the exact rule in both
   cases, including the cases where even a correct stamp still can't resolve
@@ -312,7 +327,7 @@ assignment at all.
    it against `qt_resolve_fmt`'s existing disambiguation logic for
    collisions with formats already in the table. If the format's scale (or
    any other secondary array) can legitimately carry more than one physical
-   encoding — as fmt=7's now can — say so explicitly and declare which
+   encoding — as fmt=8's now can — say so explicitly and declare which
    encoding(s) the implementation actually reads and writes, so a future
    encoder for the same format NAME doesn't have to guess or fork off a new
    name unnecessarily.
@@ -323,7 +338,9 @@ assignment at all.
    branch's private 100+ number is find-and-replaced to it as part of
    landing — a mechanical, zero-risk step precisely because nothing on disk
    or in a released container ever depended on the private number, exactly
-   as fmt=7's `fmt=100 → fmt=7` renumbering was.
+   as this format's own `fmt=100 → fmt=7 → fmt=8` renumberings were. Note
+   that even a maintainer-assigned ordinal on an open PR is not settled
+   until MERGE (see "ID assignment" above).
 4. **Stamp containers via `__metadata__`** (see "The metadata stamp" above)
    so tooling that produces the format's containers can self-describe, and
    readers can verify-or-refuse rather than trust byte arithmetic alone.
@@ -338,8 +355,10 @@ assignment at all.
   standard stamp key, or is a different shape preferred (e.g. one key per
   tensor instead of one JSON blob) if this pattern is adopted project-wide?
 - ~~How should #465 and this branch's FP8 proposal be sequenced?~~ Resolved
-  by events: #465 merged 2026-07-21 as fmt=6, fmt=7 assigned to this
-  proposal 2026-07-22 on #524.
+  by events: #465 merged 2026-07-21 as fmt=6; fmt=7 assigned to this
+  proposal 2026-07-22 on #524, then claimed by #705's MXFP4 merge while
+  this pair was open — this proposal now lands as fmt=8 (see "ID
+  assignment" above).
 - ~~Should scale encoding be a hardcoded constant or a declared,
   per-container property?~~ Decided by the maintainer on #524, prompted by
   the DeepSeek-V4 datapoint above: it's a declared property. f32 is this PR

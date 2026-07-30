@@ -112,7 +112,7 @@ int main(void){
          *    per-row vs grouped is not distinguishable from byte counts alone.
          *    stamped_name=NULL throughout below: this suite predates and is orthogonal
          *    to the fp8 metadata-stamp feature -- none of these calls touch the
-         *    fmt=1-vs-fmt=7 or fmt=6-vs-fmt=7 collisions the stamp parameter exists
+         *    fmt=1-vs-fmt=8 or fmt=6-vs-fmt=8 collisions the stamp parameter exists
          *    to resolve, so a NULL stamp cannot change any of this suite's outcomes. */
         if(I>256){ int gs=-1;
           int64_t ns_g64=(int64_t)O*i3_groups(I)*4, ns_row=(int64_t)O*4;
