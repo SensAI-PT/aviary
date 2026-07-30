@@ -359,10 +359,15 @@ static void run_sparse_veto(void){
     free(mb);
     ftruncate(fd,(off_t)400*1024*1024);                  /* + 300 MB of holes */
     close(fd);
+    /* Precondition read RAW from stat, deliberately NOT via the gate function
+     * under test (a mutated gate must not be able to self-disable this arm):
+     * the fixture is 100 MB real of 400 MB, so anything under half allocated
+     * proves the filesystem kept the hole. */
     struct stat st;
-    if(stat(p,&st)==0 && !coli_ssd_probe_underallocated((long long)st.st_blocks*512,(long long)st.st_size)){
+    long long alloc = stat(p,&st)==0 ? (long long)st.st_blocks*512 : -1;
+    if(alloc<0 || alloc*2 >= (long long)st.st_size){
         fprintf(stderr,"note: filesystem allocated the ftruncate hole (blocks*512=%lld); skipping sparse e2e\n",
-                (long long)st.st_blocks*512);
+                alloc);
     }else{
         int veto=COLI_SSD_VETO_NONE;
         double raw=coli_ssd_probe_raw(dirbuf,&veto);
@@ -374,7 +379,59 @@ static void run_sparse_veto(void){
         CHECK(read_file(dirbuf,".coli_ssd",back,sizeof(back))==-1,
               "sparse probe must not write .coli_ssd (found: %s)",back);
     }
+    /* Precedence pin: a shard that is BOTH under-allocated and below the
+     * window floor reports SPARSE -- the allocation check runs first, and
+     * "finish the download" is the actionable advice of the two. */
+    {
+        int fd2=open(p,O_WRONLY|O_CREAT|O_TRUNC,0644);
+        if(fd2>=0){
+            char five[5*1024*1024];
+            memset(five,0x3C,sizeof(five));
+            write(fd2,five,sizeof(five));                /* 5 MB real data */
+            ftruncate(fd2,(off_t)30*1024*1024);          /* sparse AND small */
+            close(fd2);
+            long long alloc2 = stat(p,&st)==0 ? (long long)st.st_blocks*512 : -1;
+            if(alloc2>=0 && alloc2*2<(long long)st.st_size){
+                int veto2=COLI_SSD_VETO_NONE;
+                coli_ssd_probe_raw(dirbuf,&veto2);
+                CHECK(veto2==COLI_SSD_VETO_SPARSE,
+                      "sparse+small shard must report SPARSE (allocation first), got %d",veto2);
+            }
+        }
+    }
     unlink(p);
+    char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
+    unlink(cp); rmdir(dirbuf);
+}
+
+/* F4: the picker must return the LARGEST shard, not the readdir-first match
+ * -- a stray small shard in the dir would otherwise starve the probe below
+ * the 64 MB floor forever while a full-size neighbor sits untouched. Unit
+ * half pins the contract on pick_shard directly; e2e half proves the probe
+ * then measures where a first-match picker would veto SMALL. */
+static void run_largest_shard(void){
+    char dirbuf[1200];
+    if(!make_scratch_dir(dirbuf,sizeof(dirbuf))) return;
+    char small[1400], large[1400];
+    snprintf(small,sizeof(small),"%s/aaa-small.safetensors",dirbuf);
+    snprintf(large,sizeof(large),"%s/zzz-large.safetensors",dirbuf);
+    if(write_cold_mb(small,30)!=0 || write_cold_mb(large,72)!=0){
+        perror("largest-shard fixture"); failures++;
+        unlink(small); unlink(large); rmdir(dirbuf); return;
+    }
+    char picked[1280];
+    coli_ssd_probe_pick_shard(dirbuf,picked,sizeof(picked));
+    CHECK(!strcmp(picked,large),"picker must choose the largest shard: got '%s'",picked);
+    if(resident_share(large,0,(long long)72*1024*1024)<0.05){
+        int veto=COLI_SSD_VETO_NONE;
+        double gbs=coli_ssd_probe_raw(dirbuf,&veto);
+        CHECK(veto==COLI_SSD_VETO_NONE,
+              "with a 72MB cold shard present the probe must not veto: got %d",veto);
+        CHECK(gbs>0,"with a 72MB cold shard present the probe must measure: got %.3f",gbs);
+    }else{
+        fprintf(stderr,"note: large shard not cold, skipping largest-shard e2e half\n");
+    }
+    unlink(small); unlink(large);
     char cp[1400]; snprintf(cp,sizeof(cp),"%s/.coli_ssd",dirbuf);
     unlink(cp); rmdir(dirbuf);
 }
@@ -466,6 +523,7 @@ int main(void){
     run_cached_decisions();
     run_sparse_veto();
     run_small_veto();
+    run_largest_shard();
     run_steering_pin();
 #endif
     if(failures){
