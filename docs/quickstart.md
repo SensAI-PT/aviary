@@ -27,6 +27,26 @@ CPU-only by default.
 
 ## 1. Install the build tools
 
+> **Shortcut — skip sections 1 and 2 entirely.** Prebuilt archives are published
+> for **Linux, macOS and Windows** on the
+> [Releases page](https://github.com/JustVugg/colibri/releases): unpack one,
+> install [Python 3](https://www.python.org/downloads/), and jump straight to
+> [step 3](#3-get-the-model). The engine ships ready to run and the `coli`
+> launcher finds it next to itself — no compiler, no renaming, no configuration.
+>
+> ```bash
+> mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+> python3 coli info        # engine ready ✓
+> ```
+>
+> Build from source instead if you want the fastest binary for *your* CPU
+> (`ARCH=native` unlocks the vector instructions your chip actually has), or if
+> you plan to hack on the engine.
+>
+> **On ARM64 Linux (AWS Graviton, Ampere, Raspberry Pi, aarch64 VMs) there is no
+> shortcut**: the published Linux archive is x86_64 only. Build from source —
+> sections 1 and 2 work unchanged, and the engine needs no ARM-specific flags.
+
 ### Linux (Ubuntu / Debian)
 
 ```bash
@@ -35,7 +55,16 @@ sudo apt install -y build-essential git python3
 ```
 
 `build-essential` gives you `gcc`, `make`, and OpenMP (libgomp) — everything the
-engine needs.
+engine needs. The same line works on aarch64: the engine is portable C with
+OpenMP and no x86-only intrinsics, so `./setup.sh` builds it on ARM64 without
+source changes or extra flags (verified on AWS Graviton4, Ubuntu 24.04, gcc 13).
+
+> **Moving a build to another machine?** The engine links `libgomp.so.1` at run
+> time. A host that has never had a compiler installed — a minimal cloud image, a
+> fresh container, a restored volume attached to a new instance — may not carry
+> it, and the engine then exits at startup before printing anything. Install the
+> runtime package alone (`sudo apt install -y libgomp1`); `coli doctor` names the
+> missing library.
 
 ### Windows
 
@@ -48,23 +77,17 @@ Inside you'll find:
 
 | File | What it is |
 |---|---|
-| `colibri-<version>-windows-x86_64.exe` | **the engine** — the C program that actually runs the model |
+| `colibri.exe` | **the engine** — the C program that actually runs the model |
 | `coli` | the command-line launcher (`chat`, `serve`, `convert`, `doctor`, …) |
-| `openai_server.py`, `resource_plan.py`, `doctor.py` | Python support for the API server and placement planner |
+| `openai_server.py`, `resource_plan.py`, `doctor.py`, `autotune.py` | Python support for the API server, placement planner, diagnostics, and measured tuning |
 
-Two setup steps:
-
-1. **Rename the engine to `glm.exe`** so the launcher can find it (it looks for a
-   binary named `glm`):
-   ```powershell
-   Rename-Item colibri-*-windows-x86_64.exe glm.exe
-   ```
-2. **Install Python 3** from [python.org](https://www.python.org/downloads/) — the
-   `coli` launcher and the API gateway are Python scripts (the engine itself is
-   pure C and needs nothing).
+One setup step: **install Python 3** from
+[python.org](https://www.python.org/downloads/) — the `coli` launcher and the
+API gateway are Python scripts (the engine itself is pure C and needs nothing).
+No renaming, no configuration: the launcher finds `colibri.exe` next to itself.
 
 Then continue to [step 3](#3-get-the-model). Prefer to skip the launcher? You can
-run the engine directly — `.\glm.exe` reads the model path from the `SNAP`
+run the engine directly — `.\colibri.exe` reads the model path from the `SNAP`
 environment variable (see [docs/windows.md](windows.md)) — but `coli chat` is the
 easy path.
 
@@ -112,11 +135,18 @@ You have two paths.
 
 ### Easiest — download a ready-made int4 container
 
-A pre-converted **GLM-5.2 int4** model is on Hugging Face. **Use the version
-with the int8 MTP heads** (the plain int4 heads disable speculative decoding —
-see [#8](https://github.com/JustVugg/colibri/issues/8)):
+A pre-converted **GLM-5.2 int4** model is on Hugging Face. Use the
+**group-scaled (gs64)** container with the **int8 MTP head**:
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+Group scales matter: the older per-row int4 containers
+(`mateogrgic/…-int4-with-int8-mtp`, `jlnsrk/…`) measure ~9pp worse on quality
+benchmarks and are the root cause of the think-mode loops and never-terminating
+generations in [#455](https://github.com/JustVugg/colibri/issues/455) — the
+gs64 container cured every failing case in that report. (The int8 MTP head is
+also required: plain int4 heads disable speculative decoding, see
+[#8](https://github.com/JustVugg/colibri/issues/8).)
 
 Download it into a folder on a fast disk, e.g. `/nvme/glm52_i4` (Linux/macOS) or
 `D:\glm52_i4` (Windows). It is about **372 GB**, so make sure you have the space.
@@ -130,8 +160,9 @@ never needs the full ~756 GB on disk at once:
 ./coli convert --model /nvme/glm52_i4
 ```
 
-This step uses Python and runs only once. Safe to interrupt and re-run — it
-resumes where it left off.
+This produces a group-scaled (gs64) container — the same quality-validated
+format as the recommended download. This step uses Python and runs only once.
+Safe to interrupt and re-run — it resumes where it left off.
 
 ---
 

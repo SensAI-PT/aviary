@@ -10,7 +10,7 @@ cd c
 make cuda-test CUDA=1                  # q8/q4/q2/f32 kernel correctness
 make CUDA=1
 # optional dense-path experiment (hot experts are configured below)
-COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+COLI_CUDA=1 COLI_GPU=0 CUDA_DENSE=1 SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 ```
 
 Requirements: Linux, an NVIDIA driver, and a CUDA Toolkit under
@@ -26,19 +26,19 @@ A measured `PIN` profile promotes its hottest experts into a persistent VRAM
 tier while keeping the rest in RAM:
 
 ```bash
-STATS=stats.txt SNAP=/nvme/glm52_i4 ./glm 64 4 4   # collect routing frequencies first
+STATS=stats.txt SNAP=/nvme/glm52_i4 ./colibri 64 4 4   # collect routing frequencies first
 COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=16 \
-PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./glm 64 4 4
+PIN=stats.txt PIN_GB=160 SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 
 # multi-GPU expert tier, 150 GB total budget across six 32 GB devices
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=150 \
 CUDA_DENSE=1 PIN=stats.txt PIN_GB=300 RAM_GB=226 \
-SNAP=/nvme/glm52_i4 ./glm 64 4 4
+SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 
 # large-RAM host: fill safe VRAM, then keep every remaining expert in RAM
 COLI_CUDA=1 COLI_GPUS=0,1,2,3,4,5 CUDA_EXPERT_GB=auto \
 CUDA_DENSE=1 COLI_CUDA_ATTN=1 PIN=stats.txt PIN_GB=all RAM_GB=auto \
-SNAP=/nvme/glm52_i4 ./glm 64 4 4
+SNAP=/nvme/glm52_i4 ./colibri 64 4 4
 ```
 
 Selected experts are uploaded during startup, so capacity failures occur before
@@ -65,6 +65,57 @@ dispatch (`COLI_CUDA_TC_W4A16=1`), 96-token greedy decode measured
 **5.8–6.8 tok/s** (TTFT ~13 s; 1571-token prefill ~122 s then 4.2 tok/s).
 Full experiment log: [experiments/glm52-6x5090-2026-07-12.md](experiments/glm52-6x5090-2026-07-12.md).
 These are host-specific capacity results, not portable defaults.
+
+## Experimental lossless compressed expert tier
+
+An optional [DietGPU](https://github.com/facebookresearch/dietgpu) ANS tier keeps
+warm int4 experts compressed in VRAM and decodes the selected tensors directly
+to reusable device scratch before grouped expert matmul. It does not quantize,
+prune, substitute, or move expert weights over PCIe during decode.
+
+This path is disabled in normal builds. DietGPU must first be built as shared
+libraries, then supplied explicitly:
+
+```bash
+make CUDA=1 COLI_ANS=1 DIETGPU_ROOT=/opt/dietgpu
+```
+
+Create the sidecar once using the same model, hot-expert profile, device set,
+and placement budget intended for inference:
+
+```bash
+COLI_CUDA=1 COLI_GPUS=0,1,2,3 CUDA_EXPERT_GB=auto \
+PIN=stats.txt PIN_GB=all CUDA_RAW_EXPERTS=2500 \
+COLI_ANS_SIDECAR=/models/glm52-experts.ans COLI_ANS_PACK=1 \
+SNAP=/models/glm52-int4 ./colibri 1 4 4
+```
+
+Remove `COLI_ANS_PACK` to load the sidecar. Records are checked against the
+expected format, dimensions, raw size, codec bound, and file length. A sidecar
+is tied to its exact expert placement order; changing the model, profile,
+budgets, raw-prefix size, or device set requires repacking it.
+On Linux, `COLI_ANS_DIRECT=1` uses aligned direct reads while retaining the same
+sidecar format. `COLI_ANS_PROFILE=1` prints a one-line load-time breakdown.
+
+On a 6× RTX 5090 host with GLM-5.2 int4, a 2,500-expert raw tier plus 8,128
+compressed experts increased VRAM capacity from 9,335 to 10,628 experts
+(+13.9%). The original controlled runs measured 6.19→7.12 tok/s over 32 tokens
+(+15.0%), and 6.75→7.31 tok/s over 128 tokens (+8.3%). A later fixed-token
+revalidation on current `dev` measured a smaller 8.17→8.54 tok/s median gain
+(+4.5%) against the full 176.6 GB raw tier. Pinned asynchronous staging reduced
+placement from 197 to 157 seconds; aligned direct reads reduced it further to
+80–103 seconds across two runs, with the 110 GB archive read accounting for
+18.94–19.23 seconds.
+
+The archive itself is lossless: every decoded weight byte is verified against
+the original tensor and incompressible records are rejected. That does **not**
+guarantee identical generated text versus the raw-tier placement. Moving more
+experts from CPU execution into CUDA changes floating-point accumulation order;
+a current greedy A/B diverged after a near tie even though both weight paths
+were byte-exact. Treat output identity as a measured workload result, not a
+property of the compression format. The archived DietGPU dependency therefore
+remains an experimental build-time option. Live `REPIN` is disabled because it
+would invalidate the sidecar's fixed expert order.
 
 ## The GPU-resident pipeline (`COLI_CUDA_PIPE`)
 
