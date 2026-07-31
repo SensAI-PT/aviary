@@ -690,9 +690,9 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
-    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
+        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
     }
 #endif
 #ifdef COLI_CUDA
@@ -1185,7 +1185,20 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
-            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            /* METAL: t->s must be page-aligned + coli_metal_register'd like every other
+             * fmt's scale buffer (qsalloc, used by fmt 1/2/3 just below/above), or
+             * bind_gemv/coli_metal_gemm's resolve(t->s,...) can never find it and the
+             * whole GPU dispatch silently CPU-falls-back (safe, but defeats the point of
+             * wiring fmt=4 into the shader at all). falloc() here was a plain malloc --
+             * O*ng floats never registered -- found while tracing the per-row-scale path
+             * this stage extends to per-group; fixed alongside it.
+             * Trade-off (this site is NOT #ifdef COLI_METAL): on a CPU-only build this
+             * swaps falloc's checked-exit overflow/OOM guard for qalloc's unchecked
+             * malloc -- same hole qsalloc already has for fmt 1/2/3, so consistency,
+             * not a new class; noted rather than silent. fmt=5's group scales (just
+             * below) still use falloc and so remain Metal-inert -- pre-existing,
+             * inconsistent after this change, a candidate for whoever wires fmt=5. */
+            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -2605,11 +2618,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
             int ok = coli_metal_attn_decode(x,
-                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
-                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
-                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
                 WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
-                WP_(l->o), l->o.s, l->o.fmt,
+                WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
             #undef WP_
             if(ok){ m->t_attn += now_s()-ta0; return; }
@@ -4815,14 +4828,14 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
             double ta0=now_s();
             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
             int ok = coli_metal_layer_decode(x, l->in_ln, l->post_ln,
-                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
-                WP_(l->q_b), l->q_b.s, l->q_b.fmt,
-                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
+                WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
+                WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
                 WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
-                WP_(l->o), l->o.s, l->o.fmt,
-                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt,
-                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,
-                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
+                WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
+                WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt, l->sh_gate.gs,
+                WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,   l->sh_up.gs,
+                WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt, l->sh_down.gs,
                 l->router, l->router_bias,
                 c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
                 m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
