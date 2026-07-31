@@ -939,7 +939,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -951,7 +951,23 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
                 !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
+        any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
+    }
+    /* The grouped kernels decode formats 0..4 only.  Sending fmt=6 through
+     * grouped_hidden's element decoder reads the 98-byte E8 blocks as int2 and
+     * runs past the real row stride on GLM-sized tensors.  Keep the proven E8
+     * expert kernel until a native grouped E8 kernel exists. */
+    if(any_e8){
+        int off=0;
+        for(int c=0;c<count;c++){
+            if(!coli_cuda_expert_mlp(gates[c],ups[c],downs[c],
+                    y+(size_t)off*D,x+(size_t)off*D,rows[c])) return 0;
+            off+=rows[c];
+        }
+        { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+          g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+        return 1;
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
@@ -1100,7 +1116,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
-    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1;
+    int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -1110,8 +1126,10 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
                  g->gs,u->gs,d->gs};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
+    if(any_e8) return 0;                       /* sync path uses expert_mlp safely */
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
