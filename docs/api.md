@@ -41,10 +41,12 @@ sequences. The extension
 
 The server is deliberately text-only and serves one generation at a time: the
 744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Image/audio input, log probabilities,
-and token penalties return an explicit error
-rather than being silently ignored. The default bind address is localhost; set
-`COLI_API_KEY` before exposing the server beyond the machine.
+instead of loading duplicate model copies. Tool-calling **is** supported on this
+path — pass OpenAI `tools` and (optionally) `tool_choice`, mirroring the
+Anthropic endpoint below. Image/audio input, log probabilities, and token
+penalties return an explicit error rather than being silently ignored. The
+default bind address is localhost; set `COLI_API_KEY` before exposing the
+server beyond the machine.
 
 When a reverse proxy or MagicDNS hostname preserves a public `Host` header,
 trust that exact hostname with repeatable `--allowed-host` options. The
