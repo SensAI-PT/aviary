@@ -15,6 +15,9 @@ c/colibri.exe
 c/glm
 c/glm.exe
 c/olmoe
+c/inkling
+c/kimi_k3
+c/kimi_k3.exe
 c/olmoe.exe
 c/iobench
 c/iobench.exe
@@ -31,6 +34,8 @@ c/tests/test_*
 !c/tests/test_*.mm
 !c/tests/test_*.py
 result
+c/tests/test_cap_precedence
+c/tests/test_cap_precedence.exe
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
@@ -68,3 +73,5 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+.idea
+c/tiny_inkling/
