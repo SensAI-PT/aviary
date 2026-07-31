@@ -216,20 +216,20 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-# Gates: every tests/test_*.c that has a build rule further down. Derived with a
-# wildcard rather than hand-listed, because TEST_BINS used to be ONE long shared line:
-# any two PRs that each added a test conflicted in the Makefile by construction, even
-# when they touched entirely unrelated code. #386 hit exactly that twice while being
-# rebased. Adding a gate now means adding your .c plus its own rule below -- nobody
-# edits a line somebody else is also editing.
+# Gates are exactly the tests that have a build rule further down -- derived from those
+# rules, so adding a gate means adding your tests/test_*.c and its rule, and nothing else.
+# There is no shared list to conflict on.
 #
-# TEST_EXCLUDE is for test_*.c that are deliberately NOT default gates:
-#   test_uring      Linux-only, appended conditionally just below
-#   test_vk_mxfp4   needs a Vulkan build (VK=1) to link the backend
-#   test_fse, test_tok, test_tok_kimi   no build rule below; never were gates
-TEST_EXCLUDE = test_uring test_vk_mxfp4 test_fse test_tok test_tok_kimi
-TEST_NAMES   = $(filter-out $(TEST_EXCLUDE),$(basename $(notdir $(wildcard tests/test_*.c))))
-TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(TEST_NAMES)))
+# This replaced a single hand-written TEST_BINS line. c/Makefile appears in most open PRs,
+# and any two that each added a test conflicted on that line by construction; #386 hit it
+# twice while being rebased. A first attempt (#731) globbed tests/test_*.c, which was wrong
+# in the other direction: it promoted files that deliberately have no rule (a branch's
+# work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
+# they fail to link. Having a rule is the honest definition of "this is a gate".
+TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
+# test_uring has a rule but is Linux-only; it is appended conditionally just below.
+TEST_EXCLUDE = test_uring
+TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
