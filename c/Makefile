@@ -214,7 +214,20 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_rans$(EXE) tests/test_corpus_draft$(EXE) tests/test_pilot_ring$(EXE)
+# Gates: every tests/test_*.c that has a build rule further down. Derived with a
+# wildcard rather than hand-listed, because TEST_BINS used to be ONE long shared line:
+# any two PRs that each added a test conflicted in the Makefile by construction, even
+# when they touched entirely unrelated code. #386 hit exactly that twice while being
+# rebased. Adding a gate now means adding your .c plus its own rule below -- nobody
+# edits a line somebody else is also editing.
+#
+# TEST_EXCLUDE is for test_*.c that are deliberately NOT default gates:
+#   test_uring      Linux-only, appended conditionally just below
+#   test_vk_mxfp4   needs a Vulkan build (VK=1) to link the backend
+#   test_fse, test_tok, test_tok_kimi   no build rule below; never were gates
+TEST_EXCLUDE = test_uring test_vk_mxfp4 test_fse test_tok test_tok_kimi
+TEST_NAMES   = $(filter-out $(TEST_EXCLUDE),$(basename $(notdir $(wildcard tests/test_*.c))))
+TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(TEST_NAMES)))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
