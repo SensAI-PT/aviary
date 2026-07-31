@@ -912,12 +912,12 @@ typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch
 static _Thread_local QScratch g_qscratch;
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     if(xn>g_qscratch.xq_cap){
-        int8_t *p=realloc(g_qscratch.xq,xn);
+        int8_t *p=(int8_t*)realloc(g_qscratch.xq,xn);
         if(!p){ fprintf(stderr,"OOM quant scratch\n"); exit(1); }
         g_qscratch.xq=p; g_qscratch.xq_cap=xn;
     }
     if(sn>g_qscratch.sx_cap){
-        float *p=realloc(g_qscratch.sx,sn*sizeof(float));
+        float *p=(float*)realloc(g_qscratch.sx,sn*sizeof(float));
         if(!p){ fprintf(stderr,"OOM quant scales\n"); exit(1); }
         g_qscratch.sx=p; g_qscratch.sx_cap=sn;
     }

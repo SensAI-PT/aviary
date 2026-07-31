@@ -3729,6 +3729,18 @@ static int router_best_or_fallback(int best, int kk, int E, int layer){
     return kk<E ? kk : 0;
 }
 
+#ifdef COLI_METAL
+/* Rotate the Metal-staged gate/up input rows for fmt=6 (Q^T x). Duplicate rows
+ * (same source s) are copied from the first rotated instance: O(p^2) scan, p<=65. */
+static void metal_stage_rot_e8(float *mxg, const int *mrows, int p, int D){
+    for(int i=0;i<p;i++){
+        int j=-1; for(int k=0;k<i;k++) if(mrows[k]==mrows[i]){ j=k; break; }
+        if(j>=0) memcpy(mxg+(int64_t)i*D, mxg+(int64_t)j*D, (size_t)D*sizeof(float));
+        else e8_rot_rows(mxg+(int64_t)i*D, 1, D);
+    }
+}
+#endif
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -4153,6 +4165,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * the first block) to the GPU BEFORE loading the missed experts from disk, so the
          * preads run while the GPU computes; the missed subset follows in a second submit.
          * Per-subset CPU fallback on unresolved slab / bad fmt / GPU fault. */
+        /* fmt=6 stores W@Q, so the staged gate/up input must be rotated (Q^T x) before
+         * upload. Rotate each distinct source row once, copy to duplicates — a decode
+         * batch's rows all share s, so this is one FWHT per token in practice. The down
+         * input is rotated on-GPU by moe_fwht inside moe_submit. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
         int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
@@ -4198,6 +4214,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             MB_BUILD(0, base==0 && !g_pre_sh);
             if(nbb>0){
                 double t0=now_s();
+                if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
                 if(mh){ cpu_res=0; mh_shared=sh_in; }
@@ -4260,6 +4277,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
             if(nbb>0){
                 double t0=now_s();
+                if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
             } else cpu_miss=0;
