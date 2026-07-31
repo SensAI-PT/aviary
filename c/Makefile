@@ -509,6 +509,11 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
+# the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
+tests/test_ablate$(EXE): tests/test_ablate.c abl.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
