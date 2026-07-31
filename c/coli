@@ -1034,6 +1034,11 @@ def cmd_bench(a):
 
 def cmd_convert(a):
     banner("convert")
+    # here --model is the DESTINATION the converted weights are written to, not an
+    # existing snapshot, so it needs its own wording rather than need_model's.
+    if not a.model:
+        sys.exit(f"{C.yel}no output directory given.{C.r}\n"
+                 f"  --model <dir> is where the converted model is written")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
