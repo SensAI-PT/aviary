@@ -12,7 +12,11 @@ from tools.mirror_plan import (RECEIPT, MirrorError, create_plan, discover_shard
 class MirrorPlannerTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        # .resolve(): on macOS /var is a symlink to /private/var, so mkdtemp hands
+        # back /var/folders/... while mirror_plan resolves every path it is given
+        # (discover_shards, create_plan). Comparing a resolved path from the tool
+        # against an unresolved one built here fails on macOS and passes on Linux.
+        self.root = Path(self.temporary.name).resolve()
         self.model = self.root / "model"
         self.mirror = self.root / "mirror"
         self.split = self.root / "split"
