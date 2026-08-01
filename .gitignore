@@ -75,3 +75,6 @@ c/olmoe_merged/
 c/olmoe_i4/
 .idea
 c/tiny_inkling/
+
+# Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
+.claude/
