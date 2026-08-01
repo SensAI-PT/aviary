@@ -32,6 +32,10 @@
 #include <unistd.h>
 #endif
 #include "st.h"
+#ifdef _OPENMP
+#include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
+#endif
+#include "omp_tune.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1085,6 +1089,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

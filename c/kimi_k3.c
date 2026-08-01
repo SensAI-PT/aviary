@@ -80,6 +80,7 @@
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+#include "omp_tune.h"
 #include "route_trace.h"                 /* shared routing telemetry (#700) */
 
 /* ---------- config ---------- */
@@ -1564,6 +1565,7 @@ static void serve_loop(Model *m, Tok *T){
 }
 
 int main(int argc, char **argv){
+    coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
     if(!serving&&argc<2){
         fprintf(stderr,"usage: %s <model_dir> [prompt] [--ids \"1 2 3\"] [--ngen N]\n",argv[0]);
