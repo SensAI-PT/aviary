@@ -17,12 +17,90 @@ only — never `#ifdef __HIP__` (or CUDA-specific code) in `backend_cuda.cu`.
 |---|---|---|---|
 | CUDA (`CUDA=1`) | Linux x86-64 | CUDA toolkit (nvcc), `CUDA_HOME=/usr/local/cuda` default | `make -C c glm CUDA=1 [CUDA_ARCH=native\|sm_XX]` |
 | HIP (`HIP=1`) | Linux x86-64 | ROCm (hipcc), `ROCM_HOME=/opt/rocm` default; tested on ROCm 7.2 | `make -C c glm HIP=1 [HIP_ARCH=native\|gfxXXXX]` |
+| HIP DLL (`HIP_DLL=1`) — **experimental, build only** | Windows x86-64 | HIP SDK (hipcc) + a compatible MSVC x64 host toolchain; `HIP_SDK_ROOT` from `HIP_PATH` | `make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN` → `c/coli_hip.dll` |
 
 `CUDA=1` and `HIP=1` are mutually exclusive and both opt-in: the default build
-remains pure, dependency-free CPU. Both are refused on non-Linux with an early
-`$(error)`. `*_ARCH=native` targets the local GPU; pass an explicit arch when
-distributing or on machines with an unsupported iGPU visible to the runtime
-(and mask iGPUs at runtime with `HIP_VISIBLE_DEVICES=<ordinal>` on ROCm).
+remains pure, dependency-free CPU. Both are **directly linked** paths and remain
+Linux-only, refused elsewhere with an early `$(error)`. The Windows HIP path is
+selected separately as `HIP_DLL=1` and does not go through `HIP=1`; on Windows
+`CUDA_DLL=1` and `HIP_DLL=1` are likewise mutually exclusive. `*_ARCH=native`
+targets the local GPU; pass an explicit arch when distributing or on machines
+with an unsupported iGPU visible to the runtime (and mask iGPUs at runtime with
+`HIP_VISIBLE_DEVICES=<ordinal>` on ROCm). On Windows `HIP_ARCH` **must** be an
+explicit `gfxNNNN` — see below.
+
+### Windows HIP DLL (experimental)
+
+Mirrors the Windows CUDA split: MinGW gcc cannot compile `.cu`, and Windows
+hipcc targets the MSVC ABI, so the backend is built into a standalone
+`coli_hip.dll` instead of being linked into the host. The same
+`c/backend_cuda.cu` and the same `coli_cuda_*` ABI the Linux HIP path already
+reuses are used unchanged.
+
+**Build support only.** The host does not yet load `coli_hip.dll` at runtime —
+see [Limitations](#windows-hip-limitations).
+
+The two halves are built separately.
+
+*Host build mode* — prepares the host for the DLL split. Needs **no HIP SDK**
+and **no `HIP_ARCH`**, because it only compiles `c/backend_loader.c` and links
+`colibri.exe`; `amdhip64` is never linked into the host:
+
+```sh
+make -C c colibri.exe HIP_DLL=1
+```
+
+*Backend DLL* — requires a selected SDK and an explicit architecture:
+
+```sh
+make -C c hip-dll \
+    HIP_DLL=1 \
+    HIP_SDK_ROOT=<sdk-root> \
+    HIP_ARCH=gfxNNNN
+```
+
+It produces `c/coli_hip.dll`; the linker may also emit `c/coli_hip.lib` (and
+`.exp`/`.pdb` on toolchains that generate them). All are ignored by git and
+removed by `make -C c clean`.
+
+#### SDK selection variables
+
+No install location is hardcoded. `HIP_SDK_ROOT` defaults from the `HIP_PATH`
+environment variable the Windows HIP SDK installer sets; pass it explicitly for
+a relocated or source-built SDK (for example from `rocm-sdk path --root`). Every
+component can be overridden independently, because packaged layouts do not all
+keep runtime, development and device files under one root:
+
+| variable | default | selects |
+|---|---|---|
+| `HIP_SDK_ROOT` | `$(HIP_PATH)` | SDK root (`--hip-path`) |
+| `HIP_BIN_DIR` | `$(HIP_SDK_ROOT)/bin` | directory holding `hipcc` |
+| `HIP_INCLUDE_DIR` | `$(HIP_SDK_ROOT)/include` | headers (`-I`) |
+| `HIP_LIB_DIR` | `$(HIP_SDK_ROOT)/lib` | `amdhip64` import library (`-L`) |
+| `HIP_DEVICE_LIB_PATH` | `$(HIP_SDK_ROOT)/lib/llvm/amdgcn/bitcode` | device bitcode (`--rocm-device-lib-path`) |
+| `HIPCC` | `$(HIP_BIN_DIR)/hipcc.exe` | compiler driver |
+| `HIP_ARCH` | *(none — must be explicit)* | `--offload-arch=` |
+
+`--hip-path` pins the SDK deliberately: a machine can carry both a
+driver-installed HIP SDK and a source-built one, and clang otherwise injects the
+former on its own, which silently mixes headers from one tree with the import
+library and device bitcode from the other.
+
+`HIP_ARCH=native` is rejected on Windows: `rocm_agent_enumerator` is not
+available there, so there is nothing to resolve `native` against.
+
+<a id="windows-hip-limitations"></a>
+#### Limitations
+
+- **Build support only.** This documents compilation, not completed runtime
+  integration. The host cannot yet load `coli_hip.dll`; runtime DLL-name
+  selection is deferred.
+- Deterministic `amdhip64_7.dll` runtime selection is **not** part of this
+  build slice.
+- There is **no hosted CI coverage** for the Windows HIP build — no hosted
+  runner provides a Windows HIP toolchain. `engine-hip-syntax` covers the Linux
+  HIP compile only.
+- Validation therefore requires a suitable local Windows AMD/HIP environment.
 
 ## Runtime configuration (identical for both vendors)
 

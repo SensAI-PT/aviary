@@ -781,7 +781,17 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     {
         const char *t = std::getenv("TEMP");
         struct stat st;
+        /* Same test on both hosts; only the CRT spelling differs. The MSVC CRT
+         * (Windows hipcc's host pass) has no S_ISDIR and no unsetenv — it spells
+         * the directory bit _S_IFDIR/_S_IFMT and clears a variable by assigning
+         * an empty value. This is an OS/CRT difference, NOT a vendor one, so it
+         * stays a _WIN32 branch and adds no CUDA-vs-HIP conditional. */
+#ifdef _WIN32
+        if (t && *t && (stat(t, &st) != 0 ||
+                        (st.st_mode & _S_IFMT) != _S_IFDIR)) _putenv_s("TEMP", "");
+#else
         if (t && *t && (stat(t, &st) != 0 || !S_ISDIR(st.st_mode))) unsetenv("TEMP");
+#endif
     }
 #endif
     int available = 0;

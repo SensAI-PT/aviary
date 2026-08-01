@@ -112,6 +112,7 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 
 ## Reference: build flags & warmup
 
+```sh
 # AVX-VNNI: Intel Alder Lake+ (and Meteor Lake+) CPUs have a 128-bit int8
 # dot-product instruction (VPDPBUSD) the engine can use for ~1.3x faster
 # quantized matmul. The x86-64-v3 default (portable AVX2) compiles it out;
@@ -179,3 +180,76 @@ available.
 **Measured on a single RTX 5070 Ti + Core Ultra 9 (32 GB RAM):** CPU-only 0.63
 → CUDA attention+dense 0.72 → **1.07 tok/s** with the GPU-resident pipeline at
 decode ([#273](https://github.com/JustVugg/colibri/issues/273), merged in #274).
+
+## AMD GPU (experimental, build only)
+
+The AMD sibling of the CUDA split above, and the same reasoning: MinGW gcc
+cannot compile `.cu`, and Windows hipcc targets the MSVC ABI, so the backend is
+built into a standalone `coli_hip.dll` rather than linked into the host. The
+same `c/backend_cuda.cu` and the same `coli_cuda_*` ABI the Linux HIP path
+already reuses are used unchanged — see [GPU_BACKENDS.md](../GPU_BACKENDS.md).
+
+> **This is build support, not a working GPU tier yet.** The host does not load
+> `coli_hip.dll` at runtime, so there is no end-to-end AMD GPU inference on
+> Windows today. Building the DLL verifies that it compiles, exports and links;
+> wiring it into the engine is separate follow-up work.
+
+### What you need
+
+| Piece | Why |
+|---|---|
+| Windows x86-64 | the target platform |
+| A compatible **MSVC x64 host toolchain** | hipcc brings its own clang front end but still needs the MSVC linker and Windows SDK; build from a shell with the MSVC environment set (`vcvars64.bat`, or an "x64 Native Tools Command Prompt") |
+| A **Windows HIP SDK** providing `hipcc`, the HIP headers, the `amdhip64` import library and the device bitcode | compiles and links the backend |
+| Your GPU's **architecture name** (`gfxNNNN`) | must be stated explicitly — see below |
+
+MinGW-w64 `make` and `gcc` from §0 are still what build the host.
+
+### Build
+
+Two halves, built separately. The host build needs **no HIP SDK at all** — it
+only compiles `c/backend_loader.c` and links `colibri.exe`, and never links
+`amdhip64`:
+
+```powershell
+# 1. Host build mode (no SDK, no HIP_ARCH needed):
+make -C c colibri.exe HIP_DLL=1
+
+# 2. The backend DLL, from a shell with the MSVC environment set:
+make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN
+```
+
+`HIP_SDK_ROOT` defaults from the `HIP_PATH` environment variable the HIP SDK
+installer sets, so it can be omitted when that is already correct. Pass it
+explicitly for a relocated or source-built SDK — that is preferable to editing
+your machine-wide `HIP_PATH`. Each component (`HIP_BIN_DIR`, `HIP_INCLUDE_DIR`,
+`HIP_LIB_DIR`, `HIP_DEVICE_LIB_PATH`, `HIPCC`) can be overridden on its own for
+split layouts; the full list is in
+[GPU_BACKENDS.md](../GPU_BACKENDS.md#sdk-selection-variables).
+
+Generated artifacts: `c/coli_hip.dll`, plus `c/coli_hip.lib` if the linker emits
+an import library (and `.exp`/`.pdb` on toolchains that produce them). All are
+git-ignored and removed by `make -C c clean`.
+
+> **Validated on:** AMD Radeon 8060S (`gfx1151`) with a source-built HIP SDK and
+> Visual Studio 2022 (MSVC 14.44). Other SDK versions and MSVC toolchains are
+> expected to work but have not been exercised — there is **no hosted CI
+> coverage** for this path, because no hosted runner ships a Windows HIP
+> toolchain.
+
+### AMD failure index
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `choose CUDA_DLL=1 or HIP_DLL=1, not both` | both runtime-DLL modes selected; the host resolves one DLL name | pick one per build |
+| `Windows HIP build: no HIP SDK selected` | `hip-dll` requested with neither `HIP_PATH` nor `HIP_SDK_ROOT` set (`HIP_PATH` is not visible in every shell — an MSYS2 login shell drops it) | pass `HIP_SDK_ROOT=<sdk-root>` |
+| `Windows HIP build: HIP_ARCH is empty` | no architecture given | pass `HIP_ARCH=gfxNNNN` |
+| `Windows HIP build: set an explicit HIP_ARCH=gfxNNNN` | `HIP_ARCH=native` on Windows; `rocm_agent_enumerator` does not exist there, so there is nothing to resolve `native` against | name the arch, e.g. `HIP_ARCH=gfx1151` |
+| `hipcc not found at "..."` / `HIP include dir not found` / `amdhip64.lib missing under "..."` / `device bitcode dir not found` | the selected SDK root does not have the expected layout | fix `HIP_SDK_ROOT`, or override just the component named in the message (`HIP_INCLUDE_DIR`, `HIP_LIB_DIR`, `HIP_DEVICE_LIB_PATH`, `HIPCC`) |
+| `rocwmma/rocwmma.hpp missing under "..."` | the SDK lacks the rocWMMA component | install it, or point `HIP_INCLUDE_DIR` at a tree that has it |
+| A no-SDK error from a **host-only** build | none — the host build is SDK-independent by design | `make -C c colibri.exe HIP_DLL=1` needs no SDK and no `HIP_ARCH`; if you see an SDK error here, you asked for the `hip-dll` target |
+| Built the DLL but the GPU never engages | expected today | runtime loading of `coli_hip.dll` is not implemented yet; the engine stays on the CPU path |
+
+SDK paths containing spaces are supported — every SDK-derived path the recipe
+passes to the compiler is quoted. If you supply one yourself, quote it:
+`HIP_SDK_ROOT="<path with spaces>"`.
