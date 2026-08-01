@@ -1430,9 +1430,9 @@ static void model_state_reset(Model *m){
 }
 
 static int serve_stdin_readable(void){
-    fd_set r; struct timeval tv={0,0};
-    FD_ZERO(&r); FD_SET(0,&r);
-    return select(1,&r,NULL,NULL,&tv)>0;
+    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
+     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
+    return coli_stdin_readable();
 }
 
 static int serve_read_req(ServeReq *q, const char *active){
