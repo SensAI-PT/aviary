@@ -1,8 +1,10 @@
-"""Integration tests for COLI_CUDA auto-enable and CUDA_EXPERT_GB auto-size.
+"""Integration tests for the COLI_CUDA opt-in and CUDA_EXPERT_GB auto-size.
 
 These tests run the compiled ``colibri`` binary and verify
-the three COLI_CUDA modes (unset / auto-detect, 0 / forced-CPU, 1 / hard-fail)
-and the CUDA_EXPERT_GB auto-size behavior.
+the three COLI_CUDA modes (unset / not requested, 0 / forced-CPU, 1 / hard-fail)
+and the CUDA_EXPERT_GB auto-size behavior. The engine itself never enables the
+GPU on its own: setting COLI_CUDA=1 for the user is the ``coli`` launcher's
+job, and running the binary directly — as these tests do — bypasses it.
 
 Prerequisites (tests skip gracefully when unmet):
 - Compiled ``colibri`` binary (any build — CUDA or CPU-only)
@@ -116,14 +118,21 @@ class CudaStartupTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, cap="1", env=None, timeout=30):
+    def _run(self, cap="1", env=None, timeout=30, unset=()):
         """Run the colibri binary directly with a minimal model.
 
         The binary will fail during model_init (fake weights) but CUDA
         init messages are emitted first.
+
+        ``unset`` names environment variables to drop from the child, so a
+        test can assert on a variable being *absent* without an ambient value
+        in the invoking shell quietly invalidating the scenario. Removal runs
+        last, and the default removes nothing.
         """
         model = _minimal_model(self.tmp.name)
         merged = {**os.environ, "SNAP": str(model), **(env or {})}
+        for key in unset:
+            merged.pop(key, None)
         return subprocess.run(
             [str(COLIBRI), cap],
             env=merged, cwd=str(HERE), text=True, capture_output=True,
@@ -173,27 +182,52 @@ class CudaStartupTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("[CUDA] requested backend is unavailable", result.stderr)
 
-    # --- COLI_CUDA unset : auto-detect ---------------------------------
+    # --- COLI_CUDA unset : not requested, silent CPU --------------------
 
     def test_cuda_unset_without_gpu_falls_back_to_cpu(self):
-        """No GPU: auto-detect prints fallback message, does not crash."""
-        if not _HAS_CUDA_BINARY:
-            self.skipTest("CPU-only binary has no auto-detect path")
-        if _HAS_GPU:
-            self.skipTest("GPU present; cannot simulate auto-detect fallback")
-        result = self._run()
-        self.assertNotEqual(result.returncode, 2)
-        self.assertIn("auto-detect: backend unavailable", result.stderr)
+        """COLI_CUDA unset: the GPU is never requested, so the engine says nothing.
 
-    def test_cuda_unset_with_gpu_enables_cuda(self):
-        """GPU present: auto-detect enables CUDA, prints mode line."""
+        The engine is strictly opt-in — c/colibri.c enters its CUDA block only
+        for a truthy COLI_CUDA, so unset and 0 behave identically and no
+        backend load is attempted. Windows auto-enable lives in the separate
+        ``coli`` launcher, which this test bypasses by running the binary
+        directly; asserting a launcher message here would be asserting against
+        the wrong component.
+        """
         if not _HAS_CUDA_BINARY:
-            self.skipTest("CPU-only binary")
-        if not _HAS_GPU:
-            self.skipTest("no GPU available")
-        result = self._run()
+            self.skipTest("CPU-only binary; the CUDA block is compiled out")
+        if _HAS_GPU:
+            self.skipTest("GPU present; cannot prove the not-requested path stays quiet")
+        result = self._run(unset=("COLI_CUDA", "COLI_GPU", "COLI_GPUS"))
         self.assertNotEqual(result.returncode, 2)
-        self.assertIn("[CUDA] mode:", result.stderr)
+        self.assertNotIn("[CUDA]", result.stderr or "")
+        self.assertNotIn("not found; GPU tier disabled", result.stderr or "")
+
+    def test_cuda_unset_with_gpu_stays_on_cpu(self):
+        """A detected GPU does not opt the engine into CUDA by itself.
+
+        The companion above proves the quiet path with no GPU; this proves the
+        GPU's presence changes nothing. COLI_CUDA remains the explicit
+        engine-level switch, so with it unset c/colibri.c never enters the CUDA
+        block and never prints a mode line — no matter what hardware is
+        installed. The ``coli`` launcher may set COLI_CUDA=1 on the user's
+        behalf, but this test invokes the engine binary directly and so must
+        not see launcher behaviour.
+        """
+        if not _HAS_CUDA_BINARY:
+            self.skipTest("CPU-only binary; the CUDA block is compiled out")
+        if not _HAS_GPU:
+            self.skipTest("no GPU available; the with-GPU half is unprovable")
+        result = self._run(unset=("COLI_CUDA", "COLI_GPU", "COLI_GPUS"))
+        err = result.stderr or ""
+        self.assertNotEqual(result.returncode, 2)
+        self.assertNotIn("[CUDA]", err)
+        self.assertNotIn("[CUDA] mode:", err)
+        self.assertNotIn("coli_cuda.dll not found", err)
+        self.assertNotIn("requested backend is unavailable", err)
+        # Reached model validation, so the engine skipped GPU setup rather
+        # than failing inside it.
+        self.assertIn("this engine requires n_group=1", err)
 
     # --- CUDA_EXPERT_GB explicit zero ----------------------------------
 
@@ -304,11 +338,16 @@ class LoaderBackendSelectionTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_isolated(self, key, timeout=60):
+    def _run_isolated(self, key, timeout=60, unset=()):
         """Copy one host into an empty dir and run it with the GPU requested.
 
         The directory holds the executable and the throwaway model only — no
         backend DLL — so the loader's not-found path is the one exercised.
+
+        ``unset`` names environment variables to drop from the child *after*
+        the defaults are applied, which is how a caller opts out of the
+        ``COLI_CUDA=1`` request set below and tests the not-requested contract
+        instead. The default removes nothing, so existing callers are unchanged.
         """
         # One sandbox per host, so a test may exercise both in a single method.
         sandbox = Path(self.tmp.name) / ("bin_" + key)
@@ -317,6 +356,8 @@ class LoaderBackendSelectionTest(unittest.TestCase):
         shutil.copy2(self._hosts[key], exe)
         model = _minimal_model(str(sandbox))
         merged = {**os.environ, "SNAP": str(model), "COLI_CUDA": "1"}
+        for name in unset:
+            merged.pop(name, None)
         return subprocess.run(
             [str(exe), "1"],
             env=merged, cwd=str(sandbox), text=True, errors="replace",
@@ -339,6 +380,28 @@ class LoaderBackendSelectionTest(unittest.TestCase):
         err = self._run_isolated("hip").stderr or ""
         self.assertIn("[HIP] coli_hip.dll not found", err)
         self.assertNotIn("coli_cuda.dll", err)
+
+    def test_cuda_dll_host_with_coli_cuda_unset_stays_on_cpu(self):
+        """CUDA_DLL host, COLI_CUDA absent: no request, no loader, no message.
+
+        This is the opt-in contract that ``CudaStartupTest`` can only assert
+        when a CUDA host happens to be the resident binary — here it always
+        runs, because the host is built by this class and the sandbox
+        guarantees no backend DLL. Nothing consults nvidia-smi, a GPU, a CUDA
+        SDK or coli_cuda.dll: with COLI_CUDA removed the engine never reaches
+        the loader at all, and continues to model validation on the CPU path.
+        """
+        result = self._run_isolated(
+            "cuda", unset=("COLI_CUDA", "COLI_GPU", "COLI_GPUS"))
+        err = result.stderr or ""
+        self.assertNotEqual(result.returncode, 2)
+        self.assertNotIn("[CUDA]", err)
+        self.assertNotIn("coli_cuda.dll not found", err)
+        self.assertNotIn("requested backend is unavailable", err)
+        # Reachability oracle: the throwaway fixture is rejected by model
+        # validation, which proves execution got past GPU setup rather than
+        # exiting inside it.
+        self.assertIn("this engine requires n_group=1", err)
 
     def test_backend_miss_is_not_silent_and_does_no_gpu_work(self):
         """Both hosts fail closed the same way: exit 2, no GPU touched."""
