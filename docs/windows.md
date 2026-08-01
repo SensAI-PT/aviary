@@ -181,7 +181,7 @@ available.
 → CUDA attention+dense 0.72 → **1.07 tok/s** with the GPU-resident pipeline at
 decode ([#273](https://github.com/JustVugg/colibri/issues/273), merged in #274).
 
-## AMD GPU (experimental, build only)
+## AMD GPU (experimental)
 
 The AMD sibling of the CUDA split above, and the same reasoning: MinGW gcc
 cannot compile `.cu`, and Windows hipcc targets the MSVC ABI, so the backend is
@@ -189,10 +189,13 @@ built into a standalone `coli_hip.dll` rather than linked into the host. The
 same `c/backend_cuda.cu` and the same `coli_cuda_*` ABI the Linux HIP path
 already reuses are used unchanged — see [GPU_BACKENDS.md](../GPU_BACKENDS.md).
 
-> **This is build support, not a working GPU tier yet.** The host does not load
-> `coli_hip.dll` at runtime, so there is no end-to-end AMD GPU inference on
-> Windows today. Building the DLL verifies that it compiles, exports and links;
-> wiring it into the engine is separate follow-up work.
+> **Still experimental: no validated end-to-end AMD GPU inference on Windows.**
+> The host now has a complete runtime-loading path — it resolves and loads
+> `coli_hip.dll`, and enforces which HIP runtime that DLL binds to — but none
+> of it has been exercised against real hardware yet. Nothing here claims
+> working inference, verified token generation, or upstream acceptance. Real
+> `gfx1151` validation is the next step, and until it happens treat this as a
+> developer-facing path only. The CPU path is unaffected and always available.
 
 ### What you need
 
@@ -236,6 +239,57 @@ git-ignored and removed by `make -C c clean`.
 > expected to work but have not been exercised — there is **no hosted CI
 > coverage** for this path, because no hosted runner ships a Windows HIP
 > toolchain.
+
+### Runtime setup (experimental, developer-facing)
+
+Running a HIP host needs two things in place. Both are checked before any GPU
+work starts, and anything that cannot be proven disables the GPU tier rather
+than guessing — the engine continues on the CPU path.
+
+**1. `coli_hip.dll` next to `colibri.exe`.** The HIP host loads *only* that
+exact absolute path. There is deliberately no bare-name fallback and no
+System32 search: a fallback could let some other `coli_hip.dll` satisfy the
+load and quietly undo the runtime check below.
+
+**2. `COLI_HIP_RUNTIME_DIR` naming the HIP runtime.** An absolute path to the
+directory containing `amdhip64_7.dll`:
+
+```powershell
+$env:COLI_HIP_RUNTIME_DIR = "C:\path\to\hip\bin"
+$env:COLI_CUDA = "1"
+.\colibri.exe
+```
+
+Relative, drive-relative (`C:runtime`) and rooted-without-drive (`\runtime`)
+values are rejected, because resolving them against the current directory is
+exactly the ambiguity the setting exists to remove. Spaces, non-ASCII
+characters and a trailing separator are all fine.
+
+Why it is mandatory: Windows resolves a DLL import by **base name** against
+whatever is already loaded, and a machine can easily carry more than one
+`amdhip64_7.dll` (a system-wide ROCm install plus whatever you unpacked). Left
+to chance, the backend binds to whichever one happened to load first. So the
+loader refuses to start the GPU tier when it finds:
+
+- a **different** `amdhip64_7.dll` already loaded than the one configured
+- **more than one** `amdhip64_7.dll` loaded, even if one of them is the right
+  file — which module an import binds to is decided by load order
+- a loaded-module list it could not read, or a file whose identity it could
+  not establish
+
+Files are compared by **physical identity**, not by path text, so reaching the
+configured runtime through a hard link or a differently-spelled path is
+accepted.
+
+One limitation stated plainly: the runtime is verified *after* it is mapped.
+`LoadLibraryExW` takes a path rather than an open handle, so a file swapped
+between validation and loading is **detected, not prevented**. Long paths
+beyond `MAX_PATH` no longer hit a fixed buffer in the loader, but whether they
+work still depends on your process manifest and Windows policy, and that has
+not been validated on hardware here.
+
+**CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
+entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
 
 ### AMD failure index
 

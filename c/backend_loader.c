@@ -42,6 +42,7 @@
  * and the diagnostic label differ. */
 #ifdef COLI_HIP_DLL
 #define COLI_BACKEND_DLL "coli_hip.dll"
+#define COLI_BACKEND_DLL_W L"coli_hip.dll"   /* the HIP host loads it wide */
 #define COLI_VENDOR_TAG  "[HIP]"
 #else
 #define COLI_BACKEND_DLL "coli_cuda.dll"
@@ -123,6 +124,14 @@ static struct {
     int loaded;        /* 1 = load attempted (success or fail), 0 = not yet */
     int available;     /* 1 = DLL loaded and all symbols resolved */
     HMODULE dll;
+#ifdef COLI_HIP_DLL
+    /* The one explicit reference this loader holds on the configured
+     * amdhip64_7.dll. Non-NULL IS the ownership flag — it is set only after
+     * everything below it succeeded, and released only in shutdown. The
+     * backend's own import table also references the runtime, but that
+     * reference belongs to the backend, not to us. */
+    HMODULE hip_runtime;
+#endif
     fn_init            init;
     fn_shutdown        shutdown;
     fn_device_count    device_count;
@@ -288,81 +297,54 @@ static int coli_hip_env_dup(wchar_t **out, DWORD *err){
     return -1;
 }
 
-/* 1 when the configured runtime directory is usable, 0 (with a diagnostic
- * naming the specific problem) otherwise. Validation only — see the block
- * comment above. */
-static int coli_hip_runtime_dir_ok(void){
-    wchar_t *dir = NULL, *file = NULL;
+/* The validated directory, owned by the caller, or NULL after a diagnostic
+ * naming the specific problem. Only the DIRECTORY is settled here; the runtime
+ * file beneath it is joined, classified and identified in one step further
+ * down, once the identity helpers are in scope. */
+static wchar_t *coli_hip_runtime_dir_value(void){
+    wchar_t *dir = NULL;
     DWORD err = 0, attrs;
     size_t len;
-    int rc, ok = 0;
+    int rc;
 
     rc = coli_hip_env_dup(&dir, &err);
     if(rc == 0){
         fprintf(stderr, COLI_VENDOR_TAG " COLI_HIP_RUNTIME_DIR is not set; "
                         "set it to the directory containing amdhip64_7.dll. "
                         "GPU tier disabled (CPU path remains active).\n");
-        return 0;
+        return NULL;
     }
     if(rc < 0){
         fprintf(stderr, COLI_VENDOR_TAG " could not read COLI_HIP_RUNTIME_DIR "
                         "(error %lu); GPU tier disabled "
                         "(CPU path remains active).\n", (unsigned long)err);
-        return 0;
+        return NULL;
     }
 
     len = wcslen(dir);
     if(len == 0){
         coli_hip_reject("COLI_HIP_RUNTIME_DIR is empty", NULL);
-        goto done;
+        goto fail;
     }
     if(!coli_hip_path_is_absolute(dir)){
         coli_hip_reject("COLI_HIP_RUNTIME_DIR must be an absolute path", dir);
-        goto done;
+        goto fail;
     }
 
     attrs = GetFileAttributesW(dir);
     if(attrs == INVALID_FILE_ATTRIBUTES){
         coli_hip_reject("COLI_HIP_RUNTIME_DIR does not exist", dir);
-        goto done;
+        goto fail;
     }
     if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
         coli_hip_reject("COLI_HIP_RUNTIME_DIR is not a directory", dir);
-        goto done;
+        goto fail;
     }
+    return dir;
 
-    /* Append the runtime filename under one separator. A value the user ended
-     * with a slash must not become a doubled separator: that reads as a UNC
-     * root after a drive letter and would fail for a reason unrelated to the
-     * real configuration. */
-    file = (wchar_t *)malloc((len + 1 + wcslen(COLI_HIP_RUNTIME_FILE) + 1) *
-                             sizeof(wchar_t));
-    if(!file){
-        fprintf(stderr, COLI_VENDOR_TAG " out of memory validating "
-                        "COLI_HIP_RUNTIME_DIR; GPU tier disabled "
-                        "(CPU path remains active).\n");
-        goto done;
-    }
-    wcscpy(file, dir);
-    if(!coli_hip_is_sep(dir[len - 1])) wcscat(file, L"\\");
-    wcscat(file, COLI_HIP_RUNTIME_FILE);
-
-    attrs = GetFileAttributesW(file);
-    if(attrs == INVALID_FILE_ATTRIBUTES){
-        coli_hip_reject("amdhip64_7.dll not found in COLI_HIP_RUNTIME_DIR", file);
-        goto done;
-    }
-    if(attrs & FILE_ATTRIBUTE_DIRECTORY){
-        coli_hip_reject("amdhip64_7.dll is a directory, not a file", file);
-        goto done;
-    }
-
-    ok = 1;
-
-done:
-    free(file);
+fail:
     free(dir);
-    return ok;
+    return NULL;
 }
 #endif /* COLI_HIP_DLL */
 
@@ -421,18 +403,18 @@ static void coli_win_error_phrase(DWORD code, char *buf, size_t n){
  * physical file identity rather than on path text. Paths are kept only to tell
  * a human which file we meant.
  *
- * These functions have external linkage but appear in no header, are never
- * exported, and live in backend_loader.o, which links into the host executable
- * only — coli_hip.dll and coli_cuda.dll are built from backend_cuda.cu and
- * never see this file. External linkage rather than `static` is deliberate:
- * unused static functions would warn, and the warning would be noise rather
- * than a finding while the wiring is still a slice away. */
+ * These functions are file-static and appear in no header: they live in
+ * backend_loader.o, which links into the host executable only — coli_hip.dll
+ * and coli_cuda.dll are built from backend_cuda.cu and never see this file.
+ * The whole block is compiled only where something consumes it, so a CUDA host
+ * carries none of it. */
+#if defined(COLI_HIP_DLL) || defined(COLI_LOADER_TEST_API)
 
 #define COLI_W32_RUNTIME_BASENAME L"amdhip64_7.dll"
 #define COLI_W32_PATH_START  512u   /* wchar_t; grows, never a correctness bound */
 #define COLI_W32_PATH_ROUNDS 8      /* 512 -> 65536 wchar_t before giving up */
 
-int coli_win32_loader_is_sep(wchar_t c){ return c == L'\\' || c == L'/'; }
+static int coli_win32_loader_is_sep(wchar_t c){ return c == L'\\' || c == L'/'; }
 
 /* --- physical file identity ------------------------------------------
  *
@@ -452,7 +434,7 @@ typedef struct {
     DWORD       bh_index_low;
 } ColiW32FileId;
 
-int coli_win32_loader_identity_valid(const ColiW32FileId *id){
+static int coli_win32_loader_identity_valid(const ColiW32FileId *id){
     return id && (id->have_id_info || id->have_by_handle);
 }
 
@@ -464,7 +446,7 @@ int coli_win32_loader_identity_valid(const ColiW32FileId *id){
  * would be indistinguishable from a real one. When no shared format exists the
  * answer is "unknown" — never a text comparison, which would reject hard links
  * to the very file that was configured. */
-int coli_win32_loader_identity_equal(const ColiW32FileId *a, const ColiW32FileId *b){
+static int coli_win32_loader_identity_equal(const ColiW32FileId *a, const ColiW32FileId *b){
     if(!a || !b) return -1;
     if(a->have_id_info && b->have_id_info)
         return (a->idi_volume == b->idi_volume &&
@@ -489,7 +471,7 @@ static int coli_w32_grow_ok(size_t cap){
  * GetModuleFileNameW signals truncation by returning the buffer size AND
  * setting ERROR_INSUFFICIENT_BUFFER; the length alone cannot be trusted,
  * which is why the error code is cleared first and then consulted. */
-wchar_t *coli_win32_loader_module_path(HMODULE mod, DWORD *err){
+static wchar_t *coli_win32_loader_module_path(HMODULE mod, DWORD *err){
     size_t cap = COLI_W32_PATH_START;
     int round;
     if(err) *err = 0;
@@ -518,7 +500,7 @@ wchar_t *coli_win32_loader_module_path(HMODULE mod, DWORD *err){
     return NULL;
 }
 
-wchar_t *coli_win32_loader_exe_path(DWORD *err){
+static wchar_t *coli_win32_loader_exe_path(DWORD *err){
     return coli_win32_loader_module_path(NULL, err);
 }
 
@@ -528,7 +510,7 @@ wchar_t *coli_win32_loader_exe_path(DWORD *err){
  * and this string is only ever shown to a human. The VOLUME_NAME_DOS form is
  * returned as Windows gives it, including any \\?\ prefix: stripping that
  * prefix can change how a path is interpreted, so it is left intact. */
-wchar_t *coli_win32_loader_final_path(HANDLE handle, DWORD *err){
+static wchar_t *coli_win32_loader_final_path(HANDLE handle, DWORD *err){
     size_t cap = COLI_W32_PATH_START;
     int round;
     if(err) *err = 0;
@@ -559,7 +541,7 @@ wchar_t *coli_win32_loader_final_path(HANDLE handle, DWORD *err){
 /* <dir> + one separator + <child>. Purely textual: nothing is resolved,
  * expanded or searched for. A value already ending in a separator does not
  * gain a second one, because "C:\x\\y" reads as a UNC root. */
-wchar_t *coli_win32_loader_join(const wchar_t *dir, const wchar_t *child, DWORD *err){
+static wchar_t *coli_win32_loader_join(const wchar_t *dir, const wchar_t *child, DWORD *err){
     size_t dl, cl, need;
     int sep;
     wchar_t *out;
@@ -583,7 +565,7 @@ wchar_t *coli_win32_loader_join(const wchar_t *dir, const wchar_t *child, DWORD 
  * needs no read permission and cannot disturb a mapped module. Full sharing
  * means the probe never blocks anyone else, and FILE_FLAG_BACKUP_SEMANTICS
  * lets the same call work if the target turns out to be a directory. */
-int coli_win32_loader_probe(const wchar_t *path, ColiW32FileId *id,
+static int coli_win32_loader_probe(const wchar_t *path, ColiW32FileId *id,
                             wchar_t **final_path, DWORD *err){
     HANDLE h;
     FILE_ID_INFO fii;
@@ -650,7 +632,7 @@ typedef struct {
     ColiW32Module *items;
 } ColiW32Inventory;
 
-void coli_win32_loader_inventory_free(ColiW32Inventory *inv){
+static void coli_win32_loader_inventory_free(ColiW32Inventory *inv){
     size_t i;
     if(!inv) return;
     for(i = 0; i < inv->count; i++){
@@ -677,7 +659,7 @@ static wchar_t *coli_w32_wdup(const wchar_t *s){
  * it must never be mistaken for "nothing is loaded", because the two lead to
  * opposite decisions. Reference counts are untouched — the HMODULEs recorded
  * here are observations, not owned references. */
-int coli_win32_loader_inventory(const wchar_t *basename, ColiW32Inventory *out){
+static int coli_win32_loader_inventory(const wchar_t *basename, ColiW32Inventory *out){
     int attempt;
     if(!out) return COLI_W32_INV_ALLOC_FAILED;
     memset(out, 0, sizeof *out);
@@ -777,7 +759,7 @@ enum {
     COLI_BIND_REJECT_UNVERIFIABLE
 };
 
-int coli_win32_loader_decide(int configured_valid, int inventory_status,
+static int coli_win32_loader_decide(int configured_valid, int inventory_status,
                              size_t count, const int *match_equality){
     if(!configured_valid)                    return COLI_BIND_REJECT_UNVERIFIABLE;
     if(inventory_status != COLI_W32_INV_OK)  return COLI_BIND_REJECT_UNVERIFIABLE;
@@ -808,7 +790,7 @@ typedef struct {
 } ColiW32ConfiguredRuntime;
 
 /* Idempotent, and safe on a zero-initialised object. */
-void coli_win32_loader_configured_free(ColiW32ConfiguredRuntime *cr){
+static void coli_win32_loader_configured_free(ColiW32ConfiguredRuntime *cr){
     if(!cr) return;
     free(cr->path);
     free(cr->final_path);
@@ -817,7 +799,7 @@ void coli_win32_loader_configured_free(ColiW32ConfiguredRuntime *cr){
     cr->valid = 0;
 }
 
-int coli_win32_loader_configured(const wchar_t *dir, ColiW32ConfiguredRuntime *out){
+static int coli_win32_loader_configured(const wchar_t *dir, ColiW32ConfiguredRuntime *out){
     DWORD err = 0;
     if(!out) return 0;
     memset(out, 0, sizeof *out);
@@ -958,22 +940,325 @@ int coli_loader_test_inventory(const wchar_t *configured_path,
     return inv.status;
 }
 #endif /* COLI_LOADER_TEST_API */
+#endif /* COLI_HIP_DLL || COLI_LOADER_TEST_API */
+
+#ifdef COLI_HIP_DLL
+/* ============ Fail-closed HIP runtime binding =============================
+ *
+ * A HIP host may only reach GPU work if it can show that the amdhip64_7.dll
+ * bound to coli_hip.dll is exactly the one COLI_HIP_RUNTIME_DIR names. Anything
+ * it cannot show — a different runtime already loaded, two of them, an
+ * enumeration that did not complete — disables the GPU tier instead of
+ * guessing. The CPU path stays available throughout.
+ *
+ * Honest limit: the runtime is verified AFTER it is mapped. LoadLibraryExW
+ * takes a path, not an open handle, so a rename between identifying the file
+ * and loading it cannot be prevented — only detected, which the post-load
+ * inventory does. Nothing here is atomic and nothing claims to be. */
+
+/* Everything the loader learned about the configured runtime, valid for the
+ * length of one initialisation attempt. */
+static int coli_hip_configure(ColiW32ConfiguredRuntime *out){
+    wchar_t *dir;
+    DWORD attrs;
+    int ok;
+
+    memset(out, 0, sizeof *out);
+    dir = coli_hip_runtime_dir_value();     /* diagnoses its own failures */
+    if(!dir) return 0;
+
+    /* One join, then classify what it landed on. The path survives a failed
+     * probe precisely so these messages can name it. */
+    ok = coli_win32_loader_configured(dir, out);
+    free(dir);
+    if(!out->path){
+        fprintf(stderr, COLI_VENDOR_TAG " could not build the amdhip64_7.dll "
+                        "path under COLI_HIP_RUNTIME_DIR (error %lu); GPU tier "
+                        "disabled (CPU path remains active).\n",
+                (unsigned long)out->error);
+        return 0;
+    }
+    /* Classified independently of the probe: identity inspection opens with
+     * backup semantics and therefore SUCCEEDS on a directory, so "is it a
+     * file" has to be asked separately or a directory named amdhip64_7.dll
+     * would sail through and fail much later as an opaque access error. */
+    attrs = GetFileAttributesW(out->path);
+    if(attrs == INVALID_FILE_ATTRIBUTES){
+        coli_hip_reject("amdhip64_7.dll not found in COLI_HIP_RUNTIME_DIR", out->path);
+    } else if(attrs & FILE_ATTRIBUTE_DIRECTORY){
+        coli_hip_reject("amdhip64_7.dll is a directory, not a file", out->path);
+    } else if(!ok){
+        /* A real file whose identity could not be read: nothing downstream
+         * could be proven, so this is a refusal too. */
+        coli_hip_reject("the identity of amdhip64_7.dll could not be established",
+                        out->path);
+    } else {
+        return 1;
+    }
+    coli_win32_loader_configured_free(out);
+    return 0;
+}
+
+/* Name a runtime in a message: the canonical path when we have one, otherwise
+ * whatever the module list gave us. */
+static void coli_hip_report_module(const char *label, const ColiW32Module *m){
+    const wchar_t *shown = m->final_path ? m->final_path :
+                          (m->path ? m->path : m->entry_path);
+    char *utf8 = shown ? coli_hip_utf8(shown) : NULL;
+    fprintf(stderr, COLI_VENDOR_TAG "   %s: %s\n", label,
+            utf8 ? utf8 : "<path unavailable>");
+    free(utf8);
+}
+
+static void coli_hip_report_configured(const ColiW32ConfiguredRuntime *cfg){
+    const wchar_t *shown = cfg->final_path ? cfg->final_path : cfg->path;
+    char *utf8 = shown ? coli_hip_utf8(shown) : NULL;
+    fprintf(stderr, COLI_VENDOR_TAG "   configured: %s\n",
+            utf8 ? utf8 : "<path unavailable>");
+    free(utf8);
+}
+
+/* Exactly one amdhip64_7.dll, it is the configured file, and it is the module
+ * this loader holds a reference to. Anything else fails closed. *stage* names
+ * the moment so a reader can tell a bad starting state from one the backend
+ * created. */
+static int coli_hip_verify_bound(const ColiW32ConfiguredRuntime *cfg,
+                                 HMODULE expected, const char *stage){
+    ColiW32Inventory inv;
+    int ok = 0;
+
+    coli_win32_loader_inventory(COLI_W32_RUNTIME_BASENAME, &inv);
+    if(inv.status != COLI_W32_INV_OK){
+        fprintf(stderr, COLI_VENDOR_TAG " %s: the loaded-module list could not "
+                        "be read (status %d, error %lu); GPU tier disabled "
+                        "(CPU path remains active).\n",
+                stage, inv.status, (unsigned long)inv.error);
+    } else if(inv.count != 1){
+        size_t i;
+        fprintf(stderr, COLI_VENDOR_TAG " %s: expected exactly one "
+                        "amdhip64_7.dll, found %u; GPU tier disabled "
+                        "(CPU path remains active).\n",
+                stage, (unsigned)inv.count);
+        coli_hip_report_configured(cfg);
+        for(i = 0; i < inv.count; i++) coli_hip_report_module("loaded", &inv.items[i]);
+    } else if(!inv.items[0].path){
+        fprintf(stderr, COLI_VENDOR_TAG " %s: the path of the loaded "
+                        "amdhip64_7.dll is unavailable; GPU tier disabled "
+                        "(CPU path remains active).\n", stage);
+    } else if(inv.items[0].module != expected){
+        fprintf(stderr, COLI_VENDOR_TAG " %s: the loaded amdhip64_7.dll is not "
+                        "the module this process referenced; GPU tier disabled "
+                        "(CPU path remains active).\n", stage);
+        coli_hip_report_configured(cfg);
+        coli_hip_report_module("loaded", &inv.items[0]);
+    } else if(coli_win32_loader_identity_equal(&cfg->id, &inv.items[0].id) != 1){
+        fprintf(stderr, COLI_VENDOR_TAG " %s: the loaded amdhip64_7.dll is not "
+                        "the configured file; GPU tier disabled "
+                        "(CPU path remains active).\n", stage);
+        coli_hip_report_configured(cfg);
+        coli_hip_report_module("loaded", &inv.items[0]);
+    } else {
+        ok = 1;
+    }
+    coli_win32_loader_inventory_free(&inv);
+    return ok;
+}
+
+/* Decide against what is already loaded, then take one explicit reference to
+ * the configured file. Returns the owned HMODULE, or NULL after diagnosing.
+ *
+ * Both acceptable decisions end in the same LoadLibraryExW on the same exact
+ * absolute path: when the module is already present that call returns the
+ * existing handle and raises its reference count, so "loaded it" and "adopted
+ * it" produce one uniform ownership rule and one uniform release. */
+static HMODULE coli_hip_acquire_runtime(const ColiW32ConfiguredRuntime *cfg){
+    ColiW32Inventory inv;
+    int *equality = NULL;
+    HMODULE runtime = NULL;
+    int decision;
+    size_t i;
+
+    coli_win32_loader_inventory(COLI_W32_RUNTIME_BASENAME, &inv);
+    if(inv.status == COLI_W32_INV_OK && inv.count > 0){
+        equality = (int *)malloc(inv.count * sizeof *equality);
+        if(!equality){
+            fprintf(stderr, COLI_VENDOR_TAG " out of memory comparing loaded "
+                            "runtimes; GPU tier disabled "
+                            "(CPU path remains active).\n");
+            coli_win32_loader_inventory_free(&inv);
+            return NULL;
+        }
+        for(i = 0; i < inv.count; i++)
+            equality[i] = coli_win32_loader_identity_equal(&cfg->id, &inv.items[i].id);
+    }
+
+    decision = coli_win32_loader_decide(cfg->valid, inv.status, inv.count, equality);
+    switch(decision){
+    case COLI_BIND_REJECT_WRONG_RUNTIME:
+        fprintf(stderr, COLI_VENDOR_TAG " a different amdhip64_7.dll is already "
+                        "loaded in this process; GPU tier disabled "
+                        "(CPU path remains active).\n");
+        coli_hip_report_configured(cfg);
+        coli_hip_report_module("already loaded", &inv.items[0]);
+        break;
+    case COLI_BIND_REJECT_MULTIPLE_RUNTIMES:
+        fprintf(stderr, COLI_VENDOR_TAG " %u different amdhip64_7.dll modules "
+                        "are already loaded in this process; which one an import "
+                        "binds to is not ours to choose. GPU tier disabled "
+                        "(CPU path remains active).\n", (unsigned)inv.count);
+        coli_hip_report_configured(cfg);
+        for(i = 0; i < inv.count; i++)
+            coli_hip_report_module("already loaded", &inv.items[i]);
+        break;
+    case COLI_BIND_REJECT_UNVERIFIABLE:
+        fprintf(stderr, COLI_VENDOR_TAG " the loaded amdhip64_7.dll state could "
+                        "not be established (status %d, error %lu); GPU tier "
+                        "disabled (CPU path remains active).\n",
+                inv.status, (unsigned long)inv.error);
+        coli_hip_report_configured(cfg);
+        break;
+    default: {
+        /* NEED_EXACT_LOAD and REUSE_EXACT_MATCH take the same action. The path
+         * is absolute and exact: no PATH, no current directory, no System32,
+         * and never a bare name. */
+        DWORD err;
+        runtime = LoadLibraryExW(cfg->path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if(!runtime){
+            char phrase[160];
+            err = GetLastError();
+            coli_win_error_phrase(err, phrase, sizeof phrase);
+            fprintf(stderr, COLI_VENDOR_TAG " the configured amdhip64_7.dll "
+                            "could not be loaded: %s; GPU tier disabled "
+                            "(CPU path remains active).\n", phrase);
+            coli_hip_report_configured(cfg);
+            break;
+        }
+        if(!coli_hip_verify_bound(cfg, runtime, "runtime verification")){
+            FreeLibrary(runtime);
+            runtime = NULL;
+        }
+        break;
+    }
+    }
+    free(equality);
+    coli_win32_loader_inventory_free(&inv);
+    return runtime;
+}
+
+/* <executable directory>\coli_hip.dll, Unicode and dynamically sized, loaded
+ * by absolute path only. There is deliberately no bare-name fallback: a
+ * fallback that can reach System32 would let some other coli_hip.dll satisfy
+ * the load and quietly undo the runtime contract above. */
+static HMODULE coli_hip_load_backend(void){
+    DWORD err = 0, attrs;
+    wchar_t *exe, *candidate = NULL, *slash, *p;
+    HMODULE backend = NULL;
+    char phrase[160], *shown;
+
+    exe = coli_win32_loader_exe_path(&err);
+    if(!exe){
+        coli_win_error_phrase(err, phrase, sizeof phrase);
+        fprintf(stderr, COLI_VENDOR_TAG " the executable path could not be "
+                        "determined: %s; GPU tier disabled "
+                        "(CPU path remains active).\n", phrase);
+        return NULL;
+    }
+    /* Trim to the directory, keeping the separator so a drive root stays
+     * "C:\" rather than becoming the drive-relative "C:". */
+    slash = NULL;
+    for(p = exe; *p; p++) if(coli_win32_loader_is_sep(*p)) slash = p;
+    if(!slash){
+        fprintf(stderr, COLI_VENDOR_TAG " the executable path has no directory "
+                        "component; GPU tier disabled "
+                        "(CPU path remains active).\n");
+        free(exe);
+        return NULL;
+    }
+    slash[1] = L'\0';
+
+    candidate = coli_win32_loader_join(exe, COLI_BACKEND_DLL_W, &err);
+    if(!candidate){
+        coli_win_error_phrase(err, phrase, sizeof phrase);
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL " path could not be "
+                        "built: %s; GPU tier disabled "
+                        "(CPU path remains active).\n", phrase);
+        free(exe);
+        return NULL;
+    }
+
+    backend = LoadLibraryExW(candidate, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if(!backend){
+        err = GetLastError();                 /* before anything else runs */
+        coli_win_error_phrase(err, phrase, sizeof phrase);
+        attrs = GetFileAttributesW(candidate);
+        shown = coli_hip_utf8(candidate);
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL " could not be "
+                        "loaded; GPU tier disabled (CPU path remains active).\n");
+        fprintf(stderr, COLI_VENDOR_TAG "   candidate %s: %s; load failed with %s\n",
+                shown ? shown : "<unprintable path>",
+                attrs == INVALID_FILE_ATTRIBUTES ? "does not exist" :
+                (attrs & FILE_ATTRIBUTE_DIRECTORY) ? "exists but is a directory" :
+                "exists as a file",
+                phrase);
+        free(shown);
+    }
+    free(candidate);
+    free(exe);
+    return backend;
+}
+#endif /* COLI_HIP_DLL */
 
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
  * that return the cached result. The engine treats a 0 return as "CUDA
  * unavailable" and falls back to the CPU path without aborting. */
 static int coli_cuda_load(void){
+#ifdef COLI_HIP_DLL
+    ColiW32ConfiguredRuntime cfg;
+    HMODULE runtime = NULL;      /* owned here until the final transfer */
+#endif
     if(g_cuda.loaded) return g_cuda.available;
+    /* Set before any work, and never cleared: one attempt per process.
+     *
+     * COLI_HIP_RUNTIME_DIR is start-up configuration, and a wrong or ambiguous
+     * set of loaded runtimes cannot be repaired from inside a running process
+     * — a retry would re-run a deterministic failure against the same module
+     * state. It is also what keeps this function safe without a lock: see the
+     * single-entry note below. */
     g_cuda.loaded = 1;
 
 #ifdef COLI_HIP_DLL
-    /* Configuration gate: refuse before touching the filesystem search order,
-     * so a misconfigured host fails with a message about its configuration
-     * rather than about a DLL it was never going to find. */
-    if(!coli_hip_runtime_dir_ok()) return 0;
-#endif
-
+    /* No synchronisation here, and that is a traced conclusion rather than an
+     * assumption: coli_cuda_load has exactly two callers, coli_cuda_init and
+     * coli_cuda_attention_project_ragged. colibri.c calls init on the main
+     * thread before model initialisation and therefore before any worker
+     * thread exists, and the ragged path is reachable only after that init
+     * succeeded. If a third caller ever appears, or the guard in colibri.c
+     * moves, this needs an explicit lock instead. */
+    if(!coli_hip_configure(&cfg)) return 0;
+    runtime = coli_hip_acquire_runtime(&cfg);
+    if(!runtime){
+        coli_win32_loader_configured_free(&cfg);
+        return 0;
+    }
+    g_cuda.dll = coli_hip_load_backend();
+    if(!g_cuda.dll){
+        FreeLibrary(runtime);
+        coli_win32_loader_configured_free(&cfg);
+        return 0;
+    }
+    /* The backend is mapped, which pulled in its own dependencies. Ask again:
+     * if loading it introduced a second amdhip64_7.dll, or displaced the one
+     * we referenced, nothing below this point can be trusted. */
+    if(!coli_hip_verify_bound(&cfg, runtime, "post-backend verification")){
+        FreeLibrary(g_cuda.dll);
+        g_cuda.dll = NULL;
+        FreeLibrary(runtime);
+        coli_win32_loader_configured_free(&cfg);
+        return 0;
+    }
+    coli_win32_loader_configured_free(&cfg);
+#else
     /* Load the backend DLL from the engine's OWN directory, by absolute path —
      * never a bare name. LoadLibraryA(COLI_BACKEND_DLL) searches the current
      * working directory (and, without SafeDllSearchMode, other writable dirs):
@@ -1039,7 +1324,8 @@ static int coli_cuda_load(void){
         } else {
             /* The MAX_PATH-bounded construction above is the only way to get
              * here; it is a real limitation, so say so instead of implying the
-             * file was looked for and missed. Retiring it is W1-B2d's job. */
+             * file was looked for and missed. The HIP host no longer has it —
+             * its path is built dynamically — but CUDA's flow is unchanged. */
             fprintf(stderr, COLI_VENDOR_TAG "   candidate path could not be constructed "
                             "(executable directory unavailable or longer than MAX_PATH); "
                             "no primary load was attempted\n");
@@ -1048,6 +1334,16 @@ static int coli_cuda_load(void){
                 fallback_msg);
         return 0;
     }
+#endif /* COLI_HIP_DLL */
+
+    /* A mandatory symbol is missing: the backend goes, and so does the runtime
+     * reference the HIP path acquired. The CUDA build expands the release to
+     * nothing, so its behaviour is byte-for-byte what it was. */
+#ifdef COLI_HIP_DLL
+    #define COLI_RELEASE_RUNTIME_ON_FAIL FreeLibrary(runtime);
+#else
+    #define COLI_RELEASE_RUNTIME_ON_FAIL
+#endif
 
     #define RESOLVE(name, type) \
         /* GetProcAddress returns FARPROC (void(*)(void)); casting it to a   \
@@ -1061,7 +1357,9 @@ static int coli_cuda_load(void){
         if(!g_cuda.name){ \
             fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL \
                             " missing symbol coli_cuda_" #name "\n"); \
-            FreeLibrary(g_cuda.dll); g_cuda.dll=NULL; return 0; }
+            FreeLibrary(g_cuda.dll); g_cuda.dll=NULL; \
+            COLI_RELEASE_RUNTIME_ON_FAIL \
+            return 0; }
 
     /* Optional symbol: a DLL predating it leaves the pointer NULL and only that
      * feature degrades (fmt=6 tensors stay CPU-side), instead of taking the whole
@@ -1125,7 +1423,15 @@ static int coli_cuda_load(void){
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
     #undef RESOLVE
+    #undef COLI_RELEASE_RUNTIME_ON_FAIL
 
+#ifdef COLI_HIP_DLL
+    /* Everything above proved: the configured file is the only amdhip64_7.dll
+     * in the process, it is the module we referenced, it survived the backend
+     * load, and every mandatory symbol resolved. Only now does the reference
+     * stop being local, so no earlier failure path can leak or double-free it. */
+    g_cuda.hip_runtime = runtime;
+#endif
     g_cuda.available = 1;
     return 1;
 }
@@ -1142,6 +1448,20 @@ int coli_cuda_init(const int *devices, int count){
 
 void coli_cuda_shutdown(void){
     if(g_cuda.available && g_cuda.shutdown) g_cuda.shutdown();
+#ifdef COLI_HIP_DLL
+    /* Backend first, then the runtime it imports: releasing the runtime while
+     * the backend is still mapped would leave the backend holding the only
+     * reference to a module we no longer track. Safe after a failed
+     * initialisation too, because both handles are NULL then.
+     *
+     * Note for the record, not a defect introduced here: colibri.c only calls
+     * this on the ANS-pack early exit, so in ordinary runs the practical
+     * cleanup path is process teardown. Adding the missing normal-exit call is
+     * a separate lifecycle question. */
+    if(g_cuda.dll){ FreeLibrary(g_cuda.dll); g_cuda.dll = NULL; }
+    if(g_cuda.hip_runtime){ FreeLibrary(g_cuda.hip_runtime); g_cuda.hip_runtime = NULL; }
+    g_cuda.available = 0;
+#endif
 }
 
 int coli_cuda_device_count(void){
