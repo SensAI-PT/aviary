@@ -49,6 +49,14 @@ def _cc_flags():
     cflags = ["-O3", "-Wall", "-Wextra", "-Wno-unused-parameter",
               "-Wno-misleading-indentation", "-Wno-unused-function"]
     ldflags = ["-lm"]
+    if sys.platform not in ("darwin", "win32"):
+        # -fopenmp, like the Makefile. Without it every '#pragma omp' in colibri.c
+        # becomes a -Wunknown-pragmas warning (-Wall enables it), and the assertion
+        # below requires an empty stderr -- so on Linux this test failed for a
+        # reason that had nothing to do with what it is testing. macOS gets the
+        # libomp probe just below; Windows/MinGW is left alone.
+        cflags += ["-fopenmp"]
+        ldflags += ["-fopenmp"]
     if sys.platform == "darwin":
         try:
             prefix = subprocess.run(["brew", "--prefix", "libomp"], capture_output=True,
