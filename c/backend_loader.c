@@ -365,6 +365,40 @@ done:
 }
 #endif /* COLI_HIP_DLL */
 
+/* ---- Truthful reporting of a failed backend load ----
+ *
+ * Both LoadLibraryEx attempts below can fail for reasons that have nothing to
+ * do with the file being absent: a 32-bit DLL on a 64-bit host, a dependency
+ * that cannot be resolved, a denied ACL. Reporting all of those as "not found"
+ * sends the reader looking for a missing file that is sitting right there.
+ *
+ * These helpers are vendor-neutral on purpose — a CUDA host is misled by the
+ * same message — so they live outside the COLI_HIP_DLL block.
+ *
+ * No FormatMessage: its text is localised, which would make any assertion on
+ * it machine-dependent, and it needs an allocation to be used safely. A short
+ * project-owned table is smaller, stable, and always carries the numeric code
+ * so an unrecognised value is still actionable. */
+static const char *coli_win_loader_error_text(DWORD code){
+    switch(code){
+    case ERROR_FILE_NOT_FOUND:  return "the file was not found";
+    case ERROR_PATH_NOT_FOUND:  return "the path was not found";
+    case ERROR_ACCESS_DENIED:   return "access denied";
+    case ERROR_MOD_NOT_FOUND:   return "module or one of its dependencies was not found";
+    case ERROR_PROC_NOT_FOUND:  return "a required procedure was not found";
+    case ERROR_BAD_EXE_FORMAT:  return "invalid executable format or architecture";
+    default:                    return NULL;
+    }
+}
+
+/* Renders one error into *buf*. Recognised codes gain a short explanation;
+ * everything else still reports its number rather than being swallowed. */
+static void coli_win_error_phrase(DWORD code, char *buf, size_t n){
+    const char *text = coli_win_loader_error_text(code);
+    if(text) snprintf(buf, n, "Windows error %lu (%s)", (unsigned long)code, text);
+    else     snprintf(buf, n, "Windows loader error %lu", (unsigned long)code);
+}
+
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
  * that return the cached result. The engine treats a 0 return as "CUDA
@@ -390,12 +424,20 @@ static int coli_cuda_load(void){
      * LOAD_WITH_ALTERED_SEARCH_PATH anchors both the DLL and its dependency
      * search to the trusted install directory instead of the CWD. */
     char dllpath[MAX_PATH];
+    /* Diagnostic-only bookkeeping. Each error is taken immediately after the
+     * call that produced it, with no intervening Windows API — GetLastError is
+     * clobbered by almost anything, and the two attempts fail for genuinely
+     * different reasons often enough that collapsing them loses information. */
+    int   candidate_built = 0;
+    DWORD primary_err = 0, fallback_err = 0;
     DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
     if(mn > 0 && mn < sizeof(dllpath)){
         char *slash = strrchr(dllpath, '\\');
         if(slash && (size_t)(slash + 1 - dllpath) + sizeof(COLI_BACKEND_DLL) <= sizeof(dllpath)){
             strcpy(slash + 1, COLI_BACKEND_DLL);
+            candidate_built = 1;
             g_cuda.dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if(!g_cuda.dll) primary_err = GetLastError();
         }
     }
     if(!g_cuda.dll){
@@ -403,10 +445,47 @@ static int coli_cuda_load(void){
          * nella dir dell'applicazione e in System32, MAI la CWD. */
         g_cuda.dll = LoadLibraryExA(COLI_BACKEND_DLL, NULL,
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!g_cuda.dll) fallback_err = GetLastError();
     }
     if(!g_cuda.dll){
-        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL " not found; GPU tier disabled "
-                        "(CPU path remains active).\n");
+        /* Report what was actually observed, and nothing beyond it. The
+         * candidate is classified here, after both attempts, so this can never
+         * influence whether or in what order they happened. Windows does not
+         * tell us WHICH dependency or WHICH procedure was missing, so neither
+         * does this message. */
+        char primary_msg[160], fallback_msg[160];
+        coli_win_error_phrase(fallback_err, fallback_msg, sizeof(fallback_msg));
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL " could not be loaded; "
+                        "GPU tier disabled (CPU path remains active).\n");
+        if(candidate_built){
+            DWORD attrs = GetFileAttributesA(dllpath);
+            coli_win_error_phrase(primary_err, primary_msg, sizeof(primary_msg));
+            if(attrs == INVALID_FILE_ATTRIBUTES){
+                DWORD why = GetLastError();
+                if(why == ERROR_FILE_NOT_FOUND || why == ERROR_PATH_NOT_FOUND)
+                    fprintf(stderr, COLI_VENDOR_TAG "   candidate %s: does not exist; "
+                                    "load failed with %s\n", dllpath, primary_msg);
+                else
+                    fprintf(stderr, COLI_VENDOR_TAG "   candidate %s: could not be classified "
+                                    "(Windows error %lu); load failed with %s\n",
+                            dllpath, (unsigned long)why, primary_msg);
+            } else if(attrs & FILE_ATTRIBUTE_DIRECTORY){
+                fprintf(stderr, COLI_VENDOR_TAG "   candidate %s: exists but is a directory; "
+                                "load failed with %s\n", dllpath, primary_msg);
+            } else {
+                fprintf(stderr, COLI_VENDOR_TAG "   candidate %s: exists as a file; "
+                                "load failed with %s\n", dllpath, primary_msg);
+            }
+        } else {
+            /* The MAX_PATH-bounded construction above is the only way to get
+             * here; it is a real limitation, so say so instead of implying the
+             * file was looked for and missed. Retiring it is W1-B2d's job. */
+            fprintf(stderr, COLI_VENDOR_TAG "   candidate path could not be constructed "
+                            "(executable directory unavailable or longer than MAX_PATH); "
+                            "no primary load was attempted\n");
+        }
+        fprintf(stderr, COLI_VENDOR_TAG "   fallback by name " COLI_BACKEND_DLL ": %s\n",
+                fallback_msg);
         return 0;
     }
 

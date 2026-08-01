@@ -132,6 +132,15 @@ _RUNTIME_BASENAME = "amdhip64_7.dll"
 _TEST_ACCESSOR = "coli_test_bound_runtime"
 _RUNTIME_DIR_VAR = "COLI_HIP_RUNTIME_DIR"
 
+# A second, uniquely named dependency used only to provoke loader errors 126
+# and 127 deterministically. It is built in two shapes under one basename: the
+# "full" build exports both entry points and provides the import library, the
+# "lean" build omits the extra one. A backend linked against full and run
+# beside lean therefore loads a DLL that is missing a procedure it imports.
+_DEP_BASENAME = "coli_test_dep.dll"
+_DEP_PROBE = "coli_test_dep_probe"
+_DEP_EXTRA = "coli_test_dep_extra"
+
 
 class _StubFixture:
     """Two same-named runtime stubs plus one complete fake backend.
@@ -153,8 +162,11 @@ class _StubFixture:
         self.backend_dir = self.root / "backend"
         self.src_dir = self.root / "src"
         self.harness_dir = self.root / "harness"
+        self.dep_full_dir = self.root / "dep full"
+        self.dep_lean_dir = self.root / "dep-lean"
         for d in (self.runtime_a_dir, self.runtime_b_dir, self.backend_dir,
-                  self.src_dir, self.harness_dir):
+                  self.src_dir, self.harness_dir,
+                  self.dep_full_dir, self.dep_lean_dir):
             d.mkdir(parents=True)
         self.harness_src = self.src_dir / "harness.c"
         self.harness_exe = self.harness_dir / "test_loader_harness.exe"
@@ -171,6 +183,16 @@ class _StubFixture:
         self.runtime_a_src = self.src_dir / "runtime_a.c"
         self.runtime_b_src = self.src_dir / "runtime_b.c"
         self.backend_src = self.src_dir / "backend.c"
+        # Diagnostic-only artifacts (W1-B2c2).
+        self.dep_full = self.dep_full_dir / _DEP_BASENAME
+        self.dep_lean = self.dep_lean_dir / _DEP_BASENAME
+        self.dep_full_src = self.src_dir / "dep_full.c"
+        self.dep_lean_src = self.src_dir / "dep_lean.c"
+        self.backend_dep_src = self.src_dir / "backend_dep.c"
+        # Kept under its own name here; run_harness installs it in a sandbox
+        # under the basename the production loader actually looks for.
+        self.backend_dep = self.backend_dir / "coli_hip_depvariant.dll"
+        self.bad_pe = self.backend_dir / "not_a_pe.bin"
         self._build()
 
     # --- construction -------------------------------------------------
@@ -343,7 +365,23 @@ int main(int argc, char **argv)
                    "-Wl,--out-implib," + str(implib)], "building runtime stub " + name)
         return implib
 
-    def _backend_source(self):
+    def _build_dep(self, source, out_dir, with_extra, name):
+        lines = [
+            "/* generated test dependency: not a GPU component, no DllMain,",
+            " * no vendor runtime. Exists only so a backend can fail to load",
+            " * for a precisely known reason. */",
+            "__declspec(dllexport) int %s(void) { return 1; }" % _DEP_PROBE,
+        ]
+        if with_extra:
+            lines.append("__declspec(dllexport) int %s(void) { return 2; }" % _DEP_EXTRA)
+        source.write_text("\n".join(lines) + "\n", encoding="ascii")
+        implib = out_dir / "libcoli_test_dep.a"
+        self._gcc(["-O0", "-shared", str(source), "-o", str(out_dir / _DEP_BASENAME),
+                   "-Wl,--out-implib," + str(implib)],
+                  "building test dependency " + name)
+        return implib
+
+    def _backend_source(self, with_dep=False):
         real = {"coli_cuda_init", "coli_cuda_e8_set_grid"}
         lines = [
             "/* generated fake backend: no HIP/ROCm/CUDA header, no GPU work,",
@@ -368,6 +406,16 @@ int main(int argc, char **argv)
             " * path under test, so trivial bodies are enough to let symbol",
             " * resolution complete. */",
         ]
+        if with_dep:
+            lines[3:3] = [
+                "",
+                "/* Second import, from a uniquely named test-only DLL. Whether",
+                " * that DLL is absent or merely lacks this entry point decides",
+                " * which Windows loader error the backend fails with. */",
+                "__declspec(dllimport) int %s(void);" % _DEP_EXTRA,
+                "__declspec(dllexport) int coli_test_dep_touch(void)",
+                "{ return %s(); }" % _DEP_EXTRA,
+            ]
         for name in self.exports:
             if name not in real:
                 lines.append("__declspec(dllexport) int %s(void) { return 0; }" % name)
@@ -385,10 +433,34 @@ int main(int argc, char **argv)
                        "-L" + str(implib_a.parent), "-lamdhip64_7"],
                       "building fake coli_hip.dll")
             shutil.copy2(self.backend, self.cuda_backend)
+            self._build_diagnostic_variants(implib_a)
             self._build_harness()
         except Exception:
             self.cleanup()
             raise
+
+    def _build_diagnostic_variants(self, implib_a):
+        """Artifacts that make each backend-load failure class deterministic.
+
+        Nothing here depends on the developer's machine: the invalid-PE file is
+        generated text, and the two dependency builds are ordinary MinGW DLLs
+        with test-only names. No PATH is touched and no real vendor runtime is
+        involved — runtime A is still preloaded in the dependency cases, so
+        amdhip64_7.dll is provably not the cause of the failure.
+        """
+        self.bad_pe.write_text(
+            "not a portable executable: generated by the loader tests\n",
+            encoding="ascii")
+        dep_implib = self._build_dep(self.dep_full_src, self.dep_full_dir,
+                                     True, "full")
+        self._build_dep(self.dep_lean_src, self.dep_lean_dir, False, "lean")
+        self.backend_dep_src.write_text(self._backend_source(with_dep=True),
+                                        encoding="ascii")
+        self._gcc(["-O0", "-shared", str(self.backend_dep_src),
+                   "-o", str(self.backend_dep),
+                   "-L" + str(implib_a.parent), "-lamdhip64_7",
+                   "-L" + str(dep_implib.parent), "-lcoli_test_dep"],
+                  "building the dependency-carrying backend variant")
 
     def _build_harness(self):
         """Compile the harness together with the repository's backend_loader.c.
@@ -453,10 +525,13 @@ int main(int argc, char **argv)
                 self.runtime_a_src, self.runtime_b_src, self.backend_src,
                 self.harness_src, self.harness_exe, self.cuda_harness_exe,
                 self.runtime_a_dir / "libamdhip64_7.a",
-                self.runtime_b_dir / "libamdhip64_7.a"]
+                self.runtime_b_dir / "libamdhip64_7.a",
+                self.dep_full, self.dep_lean, self.dep_full_src,
+                self.dep_lean_src, self.backend_dep_src, self.backend_dep,
+                self.bad_pe, self.dep_full_dir / "libcoli_test_dep.a"]
 
     def run_harness(self, case_dir, preload, env=None, vendor="hip",
-                    with_backend=True):
+                    with_backend=True, backend_override=None, extra_files=()):
         """Run the harness in its own sandbox, in a separate native process.
 
         The harness and the fake backend are co-located because the production
@@ -472,7 +547,11 @@ int main(int argc, char **argv)
         genuinely set-but-empty variable, which Windows reports distinctly.
 
         ``with_backend=False`` leaves the sandbox without a backend DLL, for
-        cases that only need the loader's own miss path.
+        cases that only need the loader's own miss path. ``backend_override``
+        installs some other file — a variant DLL, or something that is not a PE
+        at all — under the basename the loader looks for. ``extra_files`` are
+        copied in beside it, which is how a dependency is made present or
+        absent without touching PATH or System32.
         """
         case_dir.mkdir(parents=True, exist_ok=True)
         source_exe = self.harness_exe if vendor == "hip" else self.cuda_harness_exe
@@ -480,7 +559,9 @@ int main(int argc, char **argv)
         exe = case_dir / source_exe.name
         shutil.copy2(source_exe, exe)
         if with_backend:
-            shutil.copy2(backend, case_dir / backend.name)
+            shutil.copy2(backend_override or backend, case_dir / backend.name)
+        for extra in extra_files:
+            shutil.copy2(extra, case_dir / Path(extra).name)
         child = {k: v for k, v in os.environ.items()
                  if k != _RUNTIME_DIR_VAR}
         child.update(env or {})
@@ -918,7 +999,7 @@ class LoaderRuntimeDirContractTest(unittest.TestCase):
         self.assertIn("loader_init", out, detail)
         # Reaching the backend phase shows up one of exactly two ways.
         reached = (out.get("backend_loaded") == "1"
-                   or "coli_hip.dll not found" in err)
+                   or "coli_hip.dll could not be loaded" in err)
         self.assertTrue(reached, "never reached the backend load" + detail)
         return proc, out
 
@@ -1046,6 +1127,180 @@ class LoaderRuntimeDirContractTest(unittest.TestCase):
             os.path.normcase(os.path.normpath(str(f.runtime_b))), detail)
 
 
+class LoaderFailureDiagnosticTest(unittest.TestCase):
+    """When the backend will not load, does the message say what really happened?
+
+    The loader used to report every ``LoadLibraryEx`` failure as "not found",
+    which is wrong the moment the file is present and fails for some other
+    reason. Each case below engineers one specific Windows loader error with
+    generated artifacts, then reads the diagnostic back out of a real
+    subprocess. No GPU, no ROCm, no HIP SDK, no PATH or System32 change.
+    """
+
+    fixture = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.fixture = _StubFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.fixture is not None:
+            cls.fixture.cleanup()
+            cls.fixture = None
+
+    def setUp(self):
+        self.cases = tempfile.TemporaryDirectory(prefix="coli diag ")
+        self.addCleanup(self.cases.cleanup)
+
+    # --- shared -------------------------------------------------------
+
+    @staticmethod
+    def _errors(err):
+        """Every numeric loader code the diagnostic reported, in order."""
+        return [int(n) for n in
+                re.findall(r"Windows (?:loader )?error (\d+)", err)]
+
+    def _fail(self, name, **kwargs):
+        """Run one failing HIP case and assert everything common to all of them."""
+        f = self.fixture
+        kwargs.setdefault("preload", "NONE")
+        kwargs.setdefault("env", {_RUNTIME_DIR_VAR: str(f.runtime_a_dir)})
+        proc, out = f.run_harness(Path(self.cases.name) / name, **kwargs)
+        err = proc.stderr or ""
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, err)
+
+        self.assertEqual(proc.returncode, 0, "harness crashed" + detail)
+        self.assertEqual(out.get("loader_init"), "0", detail)
+        self.assertNotIn("backend_path", out, detail)
+        # Validation passed, so nothing here is a configuration complaint.
+        self.assertNotIn(_RUNTIME_DIR_VAR, err, detail)
+        # Vendor and container are named, and the CPU fallback is promised.
+        self.assertIn("[HIP] coli_hip.dll could not be loaded", err, detail)
+        self.assertIn("CPU path remains active", err, detail)
+        self.assertIn("[HIP]   fallback by name coli_hip.dll:", err, detail)
+        self.assertNotIn("coli_cuda.dll", err, detail)
+        # Both attempts happened, so both codes must be present.
+        self.assertEqual(len(self._errors(err)), 2,
+                         "expected a primary and a fallback code" + detail)
+        # Claims the loader cannot support.
+        self.assertNotIn("System32", err, detail)
+        self.assertNotIn("coli_cuda_", err, detail)
+        return proc, out, err, detail
+
+    def _assert_only_preloaded_runtime(self, out, detail, preloaded):
+        f = self.fixture
+        for key, path in out.items():
+            if key.startswith("runtime_") and key.rsplit("_", 1)[-1].isdigit():
+                for runtime in (f.runtime_a, f.runtime_b):
+                    if runtime == preloaded:
+                        continue
+                    self.assertNotEqual(
+                        os.path.normcase(os.path.normpath(path)),
+                        os.path.normcase(os.path.normpath(str(runtime))),
+                        "an unexpected controlled runtime was loaded" + detail)
+
+    # --- the four classes ---------------------------------------------
+
+    def test_absent_backend_is_reported_as_absent(self):
+        """Nothing at the candidate path: say so, and give the codes."""
+        proc, out, err, detail = self._fail("absent", with_backend=False)
+        self.assertRegex(err, r"candidate .*coli_hip\.dll: does not exist", detail)
+        self.assertNotIn("exists as a file", err, detail)
+        primary, fallback = self._errors(err)
+        self.assertEqual(primary, 126, detail)     # ERROR_MOD_NOT_FOUND
+        self.assertEqual(fallback, 126, detail)
+        self.assertIn("module or one of its dependencies was not found", err, detail)
+        self._assert_only_preloaded_runtime(out, detail, None)
+
+    def test_invalid_pe_is_not_reported_as_missing(self):
+        """A non-PE file at the exact path: present, and 193 — never 'absent'."""
+        f = self.fixture
+        proc, out, err, detail = self._fail(
+            "badpe", backend_override=f.bad_pe)
+        self.assertRegex(err, r"candidate .*coli_hip\.dll: exists as a file", detail)
+        self.assertNotIn("does not exist", err, detail)
+        primary, _ = self._errors(err)
+        self.assertEqual(primary, 193, detail)     # ERROR_BAD_EXE_FORMAT
+        self.assertIn("invalid executable format or architecture", err, detail)
+
+    def test_missing_dependency_is_not_reported_as_missing_backend(self):
+        """The backend is right there; its dependency is not. That is 126.
+
+        Runtime A is preloaded, so amdhip64_7.dll provably is not the cause —
+        the only unsatisfied import left is the test-only dependency, which is
+        deliberately absent from the sandbox.
+        """
+        f = self.fixture
+        proc, out, err, detail = self._fail(
+            "missing_dep", preload=str(f.runtime_a),
+            backend_override=f.backend_dep)
+        self.assertRegex(err, r"candidate .*coli_hip\.dll: exists as a file", detail)
+        self.assertNotIn("does not exist", err, detail)
+        primary, _ = self._errors(err)
+        self.assertEqual(primary, 126, detail)     # ERROR_MOD_NOT_FOUND
+        self.assertIn("module or one of its dependencies was not found", err, detail)
+        # The message must not name a culprit Windows never identified.
+        self.assertNotIn(_DEP_BASENAME, err, detail)
+        self.assertNotIn(_DEP_EXTRA, err, detail)
+        self.assertEqual(out.get("preload_marker"), str(_RUNTIME_MARKER_A), detail)
+        self._assert_only_preloaded_runtime(out, detail, f.runtime_a)
+
+    def test_missing_procedure_is_reported_as_a_procedure_failure(self):
+        """Dependency present but one entry point short: that is 127, not 126.
+
+        The lean build of the test dependency exports only the probe, while the
+        backend was linked against the full build and imports the extra entry
+        point. Both files exist and are valid PEs, so the failure is precisely
+        a missing procedure — constructed entirely from generated artifacts,
+        with no reliance on whatever amdhip64_7.dll this machine happens to
+        have in System32.
+        """
+        f = self.fixture
+        proc, out, err, detail = self._fail(
+            "missing_proc", preload=str(f.runtime_a),
+            backend_override=f.backend_dep, extra_files=(f.dep_lean,))
+        self.assertRegex(err, r"candidate .*coli_hip\.dll: exists as a file", detail)
+        primary, _ = self._errors(err)
+        self.assertEqual(primary, 127, detail)     # ERROR_PROC_NOT_FOUND
+        self.assertIn("a required procedure was not found", err, detail)
+        self.assertNotIn("module or one of its dependencies was not found",
+                         err, detail)
+        self.assertNotIn(_DEP_EXTRA, err, detail)
+        self.assertEqual(out.get("preload_marker"), str(_RUNTIME_MARKER_A), detail)
+        self._assert_only_preloaded_runtime(out, detail, f.runtime_a)
+
+    def test_the_four_classes_are_distinguishable_from_each_other(self):
+        """The whole point: absent, invalid, dependency and procedure differ."""
+        f = self.fixture
+        seen = {}
+        for name, kwargs in (
+            ("d_absent", {"with_backend": False}),
+            ("d_badpe", {"backend_override": f.bad_pe}),
+            ("d_dep", {"preload": str(f.runtime_a),
+                       "backend_override": f.backend_dep}),
+            ("d_proc", {"preload": str(f.runtime_a),
+                        "backend_override": f.backend_dep,
+                        "extra_files": (f.dep_lean,)}),
+        ):
+            kwargs.setdefault("preload", "NONE")
+            kwargs.setdefault("env", {_RUNTIME_DIR_VAR: str(f.runtime_a_dir)})
+            proc, _ = f.run_harness(Path(self.cases.name) / name, **kwargs)
+            err = proc.stderr or ""
+            exists = "exists as a file" in err
+            seen[name] = (exists, self._errors(err)[0])
+        self.assertEqual(seen["d_absent"], (False, 126), seen)
+        self.assertEqual(seen["d_badpe"], (True, 193), seen)
+        self.assertEqual(seen["d_dep"], (True, 126), seen)
+        self.assertEqual(seen["d_proc"], (True, 127), seen)
+        # Absent and missing-dependency share a code; only the candidate
+        # classification separates them, which is exactly why it is printed.
+        self.assertNotEqual(seen["d_absent"], seen["d_dep"])
+
+
 class LoaderCudaModeIgnoresRuntimeDirTest(unittest.TestCase):
     """A CUDA host must be completely indifferent to COLI_HIP_RUNTIME_DIR.
 
@@ -1116,7 +1371,8 @@ class LoaderCudaModeIgnoresRuntimeDirTest(unittest.TestCase):
         err = proc.stderr or ""
         detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, err)
         self.assertEqual(out.get("loader_init"), "0", detail)
-        self.assertIn("[CUDA] coli_cuda.dll not found", err, detail)
+        self.assertIn("[CUDA] coli_cuda.dll could not be loaded", err, detail)
+        self.assertIn("[CUDA]   fallback by name coli_cuda.dll:", err, detail)
         self.assertNotIn("[HIP]", err, detail)
         self.assertNotIn(_RUNTIME_DIR_VAR, err, detail)
 
@@ -1220,20 +1476,25 @@ class LoaderBackendSelectionTest(unittest.TestCase):
         )
 
     def test_cuda_dll_host_reports_cuda_backend(self):
-        """CUDA_DLL host: '[CUDA] coli_cuda.dll not found', never the HIP name."""
+        """CUDA_DLL host: names coli_cuda.dll everywhere, never the HIP name."""
         err = self._run_isolated("cuda").stderr or ""
-        self.assertIn("[CUDA] coli_cuda.dll not found", err)
+        self.assertIn("[CUDA] coli_cuda.dll could not be loaded", err)
+        self.assertIn("[CUDA]   fallback by name coli_cuda.dll:", err)
+        # The sandbox genuinely has no backend, so that is what it must say.
+        self.assertIn("does not exist", err)
         self.assertNotIn("coli_hip.dll", err)
         self.assertNotIn("[HIP]", err)
 
     def test_hip_dll_host_reports_hip_backend(self):
-        """HIP_DLL host: '[HIP] coli_hip.dll not found', never the CUDA name.
+        """HIP_DLL host: names coli_hip.dll everywhere, never the CUDA name.
 
         Runs with no AMD GPU, no HIP SDK and no nvidia-smi — the loader has not
         reached any vendor runtime at the point this message is printed.
         """
         err = self._run_isolated("hip").stderr or ""
-        self.assertIn("[HIP] coli_hip.dll not found", err)
+        self.assertIn("[HIP] coli_hip.dll could not be loaded", err)
+        self.assertIn("[HIP]   fallback by name coli_hip.dll:", err)
+        self.assertIn("does not exist", err)
         self.assertNotIn("coli_cuda.dll", err)
 
     def test_cuda_dll_host_with_coli_cuda_unset_stays_on_cpu(self):
@@ -1264,7 +1525,7 @@ class LoaderBackendSelectionTest(unittest.TestCase):
             with self.subTest(host=key):
                 result = self._run_isolated(key)
                 err = result.stderr or ""
-                self.assertIn("not found; GPU tier disabled", err)
+                self.assertIn("could not be loaded; GPU tier disabled", err)
                 # colibri.c owns this second line and stays vendor-neutral in
                 # W1-B1: only the loader's own prefix is discriminated here.
                 self.assertIn("[CUDA] requested backend is unavailable", err)
