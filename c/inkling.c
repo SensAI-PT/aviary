@@ -33,6 +33,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "route_trace.h"                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -788,8 +789,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
     /* usage counters; seeded from a previous run's history when present */
-    m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
-    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
+    rt_init("inkling", c->n_layers, E);
+    for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
+    rt_drop_row(c->n_layers);                     /* inkling has no MTP row */
+    m->eusage = rt_counts_all();                  /* alias: the bump sites stay as they are */
     m->dense_load_s = now_s() - t0;
 }
 
@@ -890,14 +893,10 @@ static void pins_load(Model *m, const char *snap) {
     }
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
-    FILE *f = fopen(up, "rb");
-    if (!f) return;
-    uint32_t hdr[3];
-    if (fread(hdr, 4, 3, f) != 3 || hdr[0] != 0x31554B49u ||
-        (int)hdr[1] != c->n_layers || (int)hdr[2] != E) {
-        fprintf(stderr, "[pin] %s: not an inkling usage file, ignoring\n", up);
-        fclose(f); return;
-    }
+    /* Reads both layouts: the IKU1 block every previous inkling wrote, and the shared
+     * text format. Dimension and identity checks moved into the reader, which refuses
+     * by name instead of with a generic 'ignoring'. Counts land straight in eusage. */
+    if (rt_load(up) <= 0) return;
     int cap = m->cache[0].cap;
     /* default: pin half the cap. Measured on the 975B: cap/4 (19/layer) gave
      * 83.6% hit / 0.32 tok/s; 40/layer gave 95.6% / 0.80 tok/s — decode fills
@@ -905,14 +904,12 @@ static void pins_load(Model *m, const char *snap) {
     m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/2;
     if (m->npin > cap - 8) m->npin = cap - 8;
     if (m->npin < 0) m->npin = 0;
-    uint32_t *tmp = malloc((size_t)E * 4);
     Slot **ps = malloc((size_t)c->n_layers * m->npin * sizeof(Slot*));
     int *pl = malloc((size_t)c->n_layers * m->npin * sizeof(int));
     int np = 0;
     for (int i = 0; i < c->n_layers; i++) {
-        if (fread(tmp, 4, E, f) != (size_t)E) break;
-        if (!c->sparse[i] || !m->npin) continue;
-        memcpy(m->eusage[i], tmp, (size_t)E * 4);          /* seed the ranking */
+        const uint32_t *tmp = rt_counts(i);                /* seeded by rt_load above */
+        if (!tmp || !c->sparse[i] || !m->npin) continue;
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
@@ -926,7 +923,6 @@ static void pins_load(Model *m, const char *snap) {
             ps[np] = s; pl[np] = i; np++;
         }
     }
-    fclose(f);
     if (np) {
         double t0 = now_s();
         #pragma omp parallel for schedule(dynamic,1)
@@ -934,7 +930,7 @@ static void pins_load(Model *m, const char *snap) {
         fprintf(stderr, "[pin] %d experts pinned (%d/layer) from %s in %.1fs\n",
                 np, m->npin, up, now_s()-t0);
     }
-    free(tmp); free(ps); free(pl);
+    free(ps); free(pl);
 }
 
 /* usage snapshot: rewritten after every generation run (same contract as
@@ -942,24 +938,18 @@ static void pins_load(Model *m, const char *snap) {
  * USAGE_SAVE=0 skips the rewrite (e.g. benchmark loops that would skew the
  * ranking); PIN=off also implies no save (that run never seeded counts). */
 static int usage_save(Model *m, const char *snap) {
-    Cfg *c = &m->c; int E = c->n_experts;
-    char up[2048], tp[2060];
+    (void)m;                              /* the counters live in route_trace.h now */
+    char up[2048];
     const char *env = getenv("PIN");
     const char *sv = getenv("USAGE_SAVE");
     if (sv && *sv == '0') return 0;
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
-    snprintf(tp, sizeof(tp), "%s.tmp", up);
-    FILE *f = fopen(tp, "wb");
-    if (!f) return 0;
-    uint32_t hdr[3] = { 0x31554B49u, (uint32_t)c->n_layers, (uint32_t)E };
-    fwrite(hdr, 4, 3, f);
-    uint32_t *zero = calloc(E, 4);
-    for (int i = 0; i < c->n_layers; i++)
-        fwrite(m->eusage[i] ? m->eusage[i] : zero, 4, E, f);
-    free(zero); fclose(f);
-    return rename(tp, up) == 0;
+    /* One format for every engine now: sparse text with the dimension and identity
+     * header. The IKU1 block this replaced is still readable on load, so a history
+     * written by an older inkling keeps working and is rewritten in the new form. */
+    return rt_save(up, 1);
 }
 
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
@@ -1393,9 +1383,9 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
 static int stdin_readable(void) {
-    fd_set r; struct timeval tv = {0, 0};
-    FD_ZERO(&r); FD_SET(0, &r);
-    return select(1, &r, NULL, NULL, &tv) > 0;
+    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
+     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
+    return coli_stdin_readable();
 }
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;

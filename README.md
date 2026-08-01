@@ -13,26 +13,31 @@
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
-**Tiny engine, immense model.** Explore **GLM-5.2 (744B-parameter MoE)** across
-consumer and heterogeneous hardware — in pure C, with zero engine dependencies,
-by treating storage, RAM, and VRAM as one inference hierarchy.
+**Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
+parameters** — on consumer and heterogeneous hardware, in pure C with zero
+engine dependencies, by treating storage, RAM, and VRAM as one inference
+hierarchy.
 
-> **Colibrì is an experimental inference engine and research platform.** Its
-> primary goal is to pursue inference-side performance across the entire
-> software/hardware boundary — model formats, memory hierarchy, storage I/O,
-> placement, scheduling, kernels, speculation, and CPU/GPU overlap — so large
-> models depend less on scarce hardware and cost less to run.
+Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
+`coli serve` / `coli web` front end. [Full roster ↓](#other-supported-models)
 
-Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy. It is
-deliberately a place to test aggressive systems ideas, not a production runtime
-with an SLA. Experiments must earn their place through reproducible end-to-end
-measurements, and the default policy **never silently changes model precision
-or router semantics**. Insufficient fast memory may reduce speed; it must not
-quietly redefine the model.
+> **Colibrì is an inference engine you can run today, and an open research
+> platform.** Its primary goal is to pursue inference-side performance across
+> the entire software/hardware boundary — model formats, memory hierarchy,
+> storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
+> overlap — so large models depend less on scarce hardware and cost less to run.
+
+Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
+deliberately a place to test aggressive systems ideas — so there is **no SLA on
+speed, and a hard guarantee on semantics**: experiments must earn their place
+through reproducible end-to-end measurements, and the default policy **never
+silently changes model precision or router semantics**. Insufficient fast memory
+may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.3.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -202,6 +207,26 @@ the hottest ones automatically — colibrì literally gets faster the more you u
 it. On multi-socket hosts, `COLI_NUMA=1` interleaves the resident weights across
 memory controllers ([#82](https://github.com/JustVugg/colibri/issues/82)).
 
+For a second drive that cannot hold the whole model, Colibri can rank a partial
+mirror from the expert history it already learns. Run a few representative
+prompts first so `.coli_usage` reflects the workload, then plan, stage, and
+verify the mirror:
+
+```bash
+./c/coli mirror plan  --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror stage --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror verify --model /fast/glm52_i4 --mirror /second/glm52_i4
+```
+
+The planner reads safetensors headers directly, follows split-model directories
+from `COLI_MODEL_DIRS`, and prioritizes shards that can serve the hottest routed
+experts. Staging never changes the primary model: it copies through temporary
+files, preserves the requested free-space reserve, verifies every shard with
+SHA-256, never deletes an existing mirror shard, and atomically publishes a
+receipt only after the selected mirror is ready.
+
 ### Never wait for the disk twice
 
 Misses are expensive, so the engine spends most of its cleverness avoiding and
@@ -213,7 +238,11 @@ layer's experts — routing is measurably **71.6% predictable one layer ahead**.
 On GPUs, the resident pipeline (`COLI_CUDA_PIPE=2`) keeps the residual stream
 on-device across layers so the CPU expert loop runs uninterrupted; on Apple
 Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
-math on the unified-memory GPU.
+math on the unified-memory GPU; and a [Vulkan backend](docs/vulkan.md) brings
+the expert tier, dense projections, and the MLA attention core to any GPU with
+a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (the only backend for
+cards the vendor stacks no longer support, like the RX 580, and competitive
+with ROCm on RDNA4 — see [the benchmarking notes](docs/vulkan.md)).
 
 > **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
 > often a large win on drives with DRAM cache and bandwidth headroom (+34%
@@ -224,8 +253,9 @@ math on the unified-memory GPU.
 
 ### Faithful model, compressed state
 
-The forward pass is validated **token-exact against a `transformers` oracle**
-(teacher-forcing 32/32). MLA attention stores a compressed KV state — 576
+The forward pass is validated against a `transformers` oracle (teacher-forcing
+typically 30-32/32; two tiny-oracle positions are floating-point near-ties and
+toolchain-dependent). MLA attention stores a compressed KV state — 576
 floats/token instead of 32,768 (**57× smaller**) — and persists it across
 restarts (`.coli_kv`): conversations reopen warm with zero re-prefill,
 byte-identical to an uninterrupted session. DSA sparse attention (GLM-5.2's
@@ -353,6 +383,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli chat     # RAM budget, cache and MTP auto-detec
 COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk placement
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
+COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
 ./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
 ./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
 ```
@@ -404,6 +435,7 @@ Two things that differ per model, both documented in the per-model page:
 | Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
 | CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
+| Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
