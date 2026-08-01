@@ -8076,17 +8076,43 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 #ifdef __linux__
     if(gpu_prefix>0) g_numa_skip_bind=1;   /* prefix slabs = transient upload staging: don't bind (#419) */
 #endif
-    #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-#ifdef __linux__
-    g_numa_skip_bind=0;
+    int pre_n = gpu_prefix?gpu_prefix:npin;   /* quanti esperti nella fase "prefisso" */
+    /* #730: quanti caricarne per volta. Il default e' "tutti", che riproduce esattamente
+     * il comportamento precedente. Sotto CUDA_RELEASE_HOST i slab host del prefisso sono
+     * staging TRANSITORIO -- il commento di budget qui sopra lo dice: "prefix RAM is
+     * returned after upload" -- ma erano transitori in AGGREGATO: si caricava tutto il
+     * prefisso in RAM host e solo dopo si liberava un esperto alla volta. Il picco di RSS
+     * host era quindi l'intero CUDA_EXPERT_GB, e su un host con piu' VRAM che RAM (96 GB
+     * di VRAM contro 64 di RAM, #730) l'OOM arriva prima che il primo release parta.
+     * A round, il picco diventa stage*eb e il carico parallelo mantiene la sua banda. */
+    int stage = pre_n;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && g_cuda_release_host && gpu_prefix>0 && budget>0){
+        /* Tetto di staging: il piu' piccolo tra 4 GB e un ottavo del budget del tier,
+         * mai meno di un esperto (altrimenti il ciclo non avanza) e mai piu' del
+         * prefisso. Un ottavo mantiene i round abbastanza grandi da tenere occupati
+         * i thread del carico parallelo; il tetto assoluto protegge chi ha poca RAM
+         * e un budget enorme, che e' esattamente il caso segnalato. */
+        double cap = 4e9; if(budget/8.0 < cap) cap = budget/8.0;
+        int st = (int)(cap/eb);
+        if(st < 1) st = 1;
+        if(st < stage) stage = st;
+        if(stage < pre_n)
+            fprintf(stderr,"[CUDA] tier staging: %d experts per round (%.1f GB host peak) "
+                           "instead of %d at once (%.1f GB) — CUDA_RELEASE_HOST frees each "
+                           "round before the next (#730)\n",
+                    stage, stage*eb/1e9, pre_n, pre_n*eb/1e9);
+    }
 #endif
-    m->resident_bytes+=(int64_t)(gpu_prefix?gpu_prefix:npin)*eb;
+    for(int base=0; base<pre_n; base+=stage){
+    int hi = base+stage; if(hi>pre_n) hi=pre_n;
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int a=base;a<hi;a++)
+        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+    m->resident_bytes+=(int64_t)(hi-base)*eb;
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
-        int gpu_limit=gpu_prefix?gpu_prefix:npin;
-        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
+        for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
             { ESlot *s=&m->pin[li][slot_of[a]];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
@@ -8133,6 +8159,14 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                 }
             }
         }
+    }
+#endif
+    }   /* fine del ciclo a round (#730) */
+#ifdef __linux__
+    g_numa_skip_bind=0;
+#endif
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && budget>0){
         fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
