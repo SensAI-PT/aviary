@@ -22,7 +22,9 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <windows.h>
 
 #include "backend_cuda.h"
@@ -171,6 +173,198 @@ static struct {
     fn_tensor_update tensor_update;
 } g_cuda;
 
+#ifdef COLI_HIP_DLL
+/* ---- COLI_HIP_RUNTIME_DIR: the HIP runtime-directory contract ----
+ *
+ * A HIP host must be told, explicitly and unambiguously, which ROCm/HIP
+ * runtime it is meant to use. This machine class routinely carries more than
+ * one amdhip64_7.dll (a system-wide ROCm install plus whatever the user
+ * unpacked), and Windows resolves an import by BASE NAME against whatever is
+ * already loaded — so "whichever one the search order happens to find" is not
+ * a contract, it is a coin flip with a native crash on the losing side.
+ *
+ * This slice validates the configuration only. It reads the variable, checks
+ * that it names a real directory holding a file called amdhip64_7.dll, and
+ * then hands over to the existing backend load unchanged. Nothing is loaded,
+ * preloaded or pinned here, and no state survives the call: making the load
+ * itself deterministic is a separate, self-contained change.
+ *
+ * Placement matters. The check lives inside coli_cuda_load(), the one-shot
+ * loader entry, so it fires exactly when the GPU tier is actually requested.
+ * A host that never asks for the GPU never reaches this code and therefore
+ * never needs the variable. Under a CUDA_DLL build the whole block is
+ * compiled out, so COLI_HIP_RUNTIME_DIR cannot influence CUDA behaviour even
+ * when it is set to nonsense.
+ *
+ * Deliberately not done: no %VAR% expansion (the value is taken literally, so
+ * a path containing a percent sign is not silently rewritten), no fallback to
+ * the current directory, no PATH search, no process-environment mutation, and
+ * no inspection of the runtime file beyond "it exists and is a file". */
+
+#define COLI_HIP_RUNTIME_DIR_VAR L"COLI_HIP_RUNTIME_DIR"
+#define COLI_HIP_RUNTIME_FILE    L"amdhip64_7.dll"
+
+static int coli_hip_is_sep(wchar_t c){ return c == L'\\' || c == L'/'; }
+
+/* Absolute in the Windows sense, using only the C runtime — pulling in
+ * Shlwapi for PathIsRelativeW would add a link dependency to the host for one
+ * predicate. Accepts a drive-absolute path (C:\x, C:/x) and anything rooted at
+ * a double separator (\\server\share, \\?\C:\x, //server/share). Everything
+ * else is rejected, including the two forms that LOOK rooted but are not:
+ * "C:runtime" is relative to the drive's own current directory, and "\runtime"
+ * is relative to the current drive. Resolving either against the CWD is
+ * precisely the ambiguity this contract exists to remove. */
+static int coli_hip_path_is_absolute(const wchar_t *p){
+    if(!p || !p[0]) return 0;
+    if(coli_hip_is_sep(p[0]) && coli_hip_is_sep(p[1])) return 1;
+    if(((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) &&
+       p[1] == L':' && coli_hip_is_sep(p[2])) return 1;
+    return 0;
+}
+
+/* stderr is a narrow (byte-oriented) stream here, and mixing wide output into
+ * it is undefined, so paths are converted rather than printed with %ls. */
+static char *coli_hip_utf8(const wchar_t *w){
+    char *s;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if(n <= 0) return NULL;
+    s = (char *)malloc((size_t)n);
+    if(!s) return NULL;
+    if(WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0){
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+/* One shape for every rejection: what was wrong, the offending value when
+ * there is one, and the same "CPU path remains active" reassurance the
+ * backend miss already prints. It never claims a DLL was loaded or tried. */
+static void coli_hip_reject(const char *what, const wchar_t *value){
+    char *utf8 = value ? coli_hip_utf8(value) : NULL;
+    fprintf(stderr, COLI_VENDOR_TAG " %s%s%s; GPU tier disabled "
+                    "(CPU path remains active).\n",
+            what,
+            value ? ": " : "",
+            utf8 ? utf8 : (value ? "<unprintable path>" : ""));
+    free(utf8);
+}
+
+/* Read COLI_HIP_RUNTIME_DIR into a fresh allocation.
+ * Returns 1 with *out owned by the caller (possibly the empty string), 0 when
+ * the variable is not set at all, and -1 on retrieval or allocation failure
+ * with *err carrying the reason. The buffer is sized from the API rather than
+ * assumed, so a value longer than MAX_PATH is read in full instead of being
+ * truncated into a different path. */
+static int coli_hip_env_dup(wchar_t **out, DWORD *err){
+    DWORD cap = MAX_PATH;
+    int attempt;
+
+    *out = NULL;
+    *err = 0;
+    for(attempt = 0; attempt < 8; attempt++){
+        DWORD n;
+        wchar_t *buf = (wchar_t *)malloc((size_t)cap * sizeof(wchar_t));
+        if(!buf){ *err = ERROR_NOT_ENOUGH_MEMORY; return -1; }
+        /* Cleared first: a set-but-empty value returns 0 with the error code
+         * untouched, which is the only way to tell it from "not set". */
+        SetLastError(ERROR_SUCCESS);
+        n = GetEnvironmentVariableW(COLI_HIP_RUNTIME_DIR_VAR, buf, cap);
+        if(n == 0){
+            DWORD e = GetLastError();
+            if(e == ERROR_ENVVAR_NOT_FOUND){ free(buf); return 0; }
+            if(e == ERROR_SUCCESS){ buf[0] = L'\0'; *out = buf; return 1; }
+            free(buf);
+            *err = e;
+            return -1;
+        }
+        if(n < cap){ *out = buf; return 1; }
+        free(buf);
+        cap = n;   /* n is now the required size, terminator included */
+    }
+    /* Only reachable if the value keeps growing between calls. */
+    *err = ERROR_MORE_DATA;
+    return -1;
+}
+
+/* 1 when the configured runtime directory is usable, 0 (with a diagnostic
+ * naming the specific problem) otherwise. Validation only — see the block
+ * comment above. */
+static int coli_hip_runtime_dir_ok(void){
+    wchar_t *dir = NULL, *file = NULL;
+    DWORD err = 0, attrs;
+    size_t len;
+    int rc, ok = 0;
+
+    rc = coli_hip_env_dup(&dir, &err);
+    if(rc == 0){
+        fprintf(stderr, COLI_VENDOR_TAG " COLI_HIP_RUNTIME_DIR is not set; "
+                        "set it to the directory containing amdhip64_7.dll. "
+                        "GPU tier disabled (CPU path remains active).\n");
+        return 0;
+    }
+    if(rc < 0){
+        fprintf(stderr, COLI_VENDOR_TAG " could not read COLI_HIP_RUNTIME_DIR "
+                        "(error %lu); GPU tier disabled "
+                        "(CPU path remains active).\n", (unsigned long)err);
+        return 0;
+    }
+
+    len = wcslen(dir);
+    if(len == 0){
+        coli_hip_reject("COLI_HIP_RUNTIME_DIR is empty", NULL);
+        goto done;
+    }
+    if(!coli_hip_path_is_absolute(dir)){
+        coli_hip_reject("COLI_HIP_RUNTIME_DIR must be an absolute path", dir);
+        goto done;
+    }
+
+    attrs = GetFileAttributesW(dir);
+    if(attrs == INVALID_FILE_ATTRIBUTES){
+        coli_hip_reject("COLI_HIP_RUNTIME_DIR does not exist", dir);
+        goto done;
+    }
+    if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
+        coli_hip_reject("COLI_HIP_RUNTIME_DIR is not a directory", dir);
+        goto done;
+    }
+
+    /* Append the runtime filename under one separator. A value the user ended
+     * with a slash must not become a doubled separator: that reads as a UNC
+     * root after a drive letter and would fail for a reason unrelated to the
+     * real configuration. */
+    file = (wchar_t *)malloc((len + 1 + wcslen(COLI_HIP_RUNTIME_FILE) + 1) *
+                             sizeof(wchar_t));
+    if(!file){
+        fprintf(stderr, COLI_VENDOR_TAG " out of memory validating "
+                        "COLI_HIP_RUNTIME_DIR; GPU tier disabled "
+                        "(CPU path remains active).\n");
+        goto done;
+    }
+    wcscpy(file, dir);
+    if(!coli_hip_is_sep(dir[len - 1])) wcscat(file, L"\\");
+    wcscat(file, COLI_HIP_RUNTIME_FILE);
+
+    attrs = GetFileAttributesW(file);
+    if(attrs == INVALID_FILE_ATTRIBUTES){
+        coli_hip_reject("amdhip64_7.dll not found in COLI_HIP_RUNTIME_DIR", file);
+        goto done;
+    }
+    if(attrs & FILE_ATTRIBUTE_DIRECTORY){
+        coli_hip_reject("amdhip64_7.dll is a directory, not a file", file);
+        goto done;
+    }
+
+    ok = 1;
+
+done:
+    free(file);
+    free(dir);
+    return ok;
+}
+#endif /* COLI_HIP_DLL */
+
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
  * that return the cached result. The engine treats a 0 return as "CUDA
@@ -178,6 +372,13 @@ static struct {
 static int coli_cuda_load(void){
     if(g_cuda.loaded) return g_cuda.available;
     g_cuda.loaded = 1;
+
+#ifdef COLI_HIP_DLL
+    /* Configuration gate: refuse before touching the filesystem search order,
+     * so a misconfigured host fails with a message about its configuration
+     * rather than about a DLL it was never going to find. */
+    if(!coli_hip_runtime_dir_ok()) return 0;
+#endif
 
     /* Load the backend DLL from the engine's OWN directory, by absolute path —
      * never a bare name. LoadLibraryA(COLI_BACKEND_DLL) searches the current

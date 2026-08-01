@@ -130,6 +130,7 @@ _RUNTIME_MARKER_A = 0xA1
 _RUNTIME_MARKER_B = 0xB2
 _RUNTIME_BASENAME = "amdhip64_7.dll"
 _TEST_ACCESSOR = "coli_test_bound_runtime"
+_RUNTIME_DIR_VAR = "COLI_HIP_RUNTIME_DIR"
 
 
 class _StubFixture:
@@ -157,10 +158,16 @@ class _StubFixture:
             d.mkdir(parents=True)
         self.harness_src = self.src_dir / "harness.c"
         self.harness_exe = self.harness_dir / "test_loader_harness.exe"
+        self.cuda_harness_exe = self.harness_dir / "test_loader_harness_cuda.exe"
         self.harness_cmd = []
+        self.cuda_harness_cmd = []
         self.runtime_a = self.runtime_a_dir / _RUNTIME_BASENAME
         self.runtime_b = self.runtime_b_dir / _RUNTIME_BASENAME
         self.backend = self.backend_dir / "coli_hip.dll"
+        # Byte-identical twin under the CUDA name: the two builds differ only
+        # in which container the loader looks for, so reusing the same exports
+        # keeps the CUDA comparison about COLI_HIP_RUNTIME_DIR and nothing else.
+        self.cuda_backend = self.backend_dir / "coli_cuda.dll"
         self.runtime_a_src = self.src_dir / "runtime_a.c"
         self.runtime_b_src = self.src_dir / "runtime_b.c"
         self.backend_src = self.src_dir / "backend.c"
@@ -176,6 +183,10 @@ class _StubFixture:
  * optionally preloads one absolute amdhip64_7.dll, then calls coli_cuda_init
  * and reports which runtime the fake backend actually bound to.
  *
+ * COLI_HIP_RUNTIME_DIR is deliberately NOT read here: the loader compiled in
+ * beside this file is the only thing that may interpret it, so the harness
+ * proves the production contract rather than a copy of it.
+ *
  * usage: test_loader_harness.exe <absolute-preload-path|NONE>
  */
 #include <windows.h>
@@ -184,6 +195,13 @@ class _StubFixture:
 #include <stdio.h>
 #include <string.h>
 #include "backend_cuda.h"
+
+/* Mirrors backend_loader.c's own selection, from the same macro. */
+#ifdef COLI_HIP_DLL
+#define HARNESS_BACKEND_DLL L"coli_hip.dll"
+#else
+#define HARNESS_BACKEND_DLL L"coli_cuda.dll"
+#endif
 
 #define RUNTIME_BASENAME L"amdhip64_7.dll"
 #define WBUF 32768
@@ -273,8 +291,13 @@ int main(int argc, char **argv)
     rc = coli_cuda_init(devices, 1);          /* the real loader runs here */
     printf("loader_init=%d\n", rc);
 
+    /* Reported unconditionally: a configuration rejection must leave the
+     * backend DLL untouched even though it is sitting right next to us. */
+    printf("backend_loaded=%d\n",
+           GetModuleHandleW(HARNESS_BACKEND_DLL) != NULL);
+
     if (rc) {
-        HMODULE backend = GetModuleHandleW(L"coli_hip.dll");
+        HMODULE backend = GetModuleHandleW(HARNESS_BACKEND_DLL);
         if (backend) {
             wchar_t bpath[WBUF];
             int (*bound)(void);
@@ -361,6 +384,7 @@ int main(int argc, char **argv)
                        "-o", str(self.backend),
                        "-L" + str(implib_a.parent), "-lamdhip64_7"],
                       "building fake coli_hip.dll")
+            shutil.copy2(self.backend, self.cuda_backend)
             self._build_harness()
         except Exception:
             self.cleanup()
@@ -371,14 +395,21 @@ int main(int argc, char **argv)
 
         The production source is compiled *in place* from c/, never copied into
         the fixture, so the harness always exercises the loader at HEAD.
+
+        Two variants are built from that one source. They differ by exactly the
+        macro the Makefile's two mutually exclusive builds differ by, which is
+        what lets the CUDA variant serve as the control for "COLI_HIP_RUNTIME_DIR
+        must not reach a CUDA host".
         """
         self.harness_src.write_text(self.HARNESS_SOURCE, encoding="ascii")
-        self.harness_cmd = [
-            "-O0", "-DCOLI_CUDA", "-DCOLI_HIP_DLL", "-I" + str(HERE),
-            str(self.harness_src), str(HERE / "backend_loader.c"),
-            "-o", str(self.harness_exe),
-        ]
+        base = ["-O0", "-DCOLI_CUDA", "-I" + str(HERE),
+                str(self.harness_src), str(HERE / "backend_loader.c")]
+        self.harness_cmd = base[:1] + ["-DCOLI_HIP_DLL"] + base[1:] + \
+            ["-o", str(self.harness_exe)]
+        self.cuda_harness_cmd = base + ["-o", str(self.cuda_harness_exe)]
         self._gcc(self.harness_cmd, "building the native loader harness")
+        self._gcc(self.cuda_harness_cmd,
+                  "building the native loader harness (CUDA mode)")
 
     # --- inspection (objdump only; nothing is ever loaded) -------------
 
@@ -418,27 +449,43 @@ int main(int argc, char **argv)
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
     def generated_paths(self):
-        return [self.runtime_a, self.runtime_b, self.backend,
+        return [self.runtime_a, self.runtime_b, self.backend, self.cuda_backend,
                 self.runtime_a_src, self.runtime_b_src, self.backend_src,
-                self.harness_src, self.harness_exe,
+                self.harness_src, self.harness_exe, self.cuda_harness_exe,
                 self.runtime_a_dir / "libamdhip64_7.a",
                 self.runtime_b_dir / "libamdhip64_7.a"]
 
-    def run_harness(self, case_dir, preload):
+    def run_harness(self, case_dir, preload, env=None, vendor="hip",
+                    with_backend=True):
         """Run the harness in its own sandbox, in a separate native process.
 
         The harness and the fake backend are co-located because the production
-        loader resolves coli_hip.dll beside the executable; the runtimes stay
+        loader resolves its backend DLL beside the executable; the runtimes stay
         outside that directory so only an explicit preload can bind them. The
         process exits before the caller inspects the result, so no module
         handle survives to block TemporaryDirectory cleanup on Windows.
+
+        ``env`` maps variable names to values for this case only. The child
+        always starts from a copy of os.environ with COLI_HIP_RUNTIME_DIR
+        *removed*, so an ambient value on the developer's machine can never
+        turn a "variable missing" case green; passing "" therefore means a
+        genuinely set-but-empty variable, which Windows reports distinctly.
+
+        ``with_backend=False`` leaves the sandbox without a backend DLL, for
+        cases that only need the loader's own miss path.
         """
         case_dir.mkdir(parents=True, exist_ok=True)
-        exe = case_dir / self.harness_exe.name
-        shutil.copy2(self.harness_exe, exe)
-        shutil.copy2(self.backend, case_dir / self.backend.name)
+        source_exe = self.harness_exe if vendor == "hip" else self.cuda_harness_exe
+        backend = self.backend if vendor == "hip" else self.cuda_backend
+        exe = case_dir / source_exe.name
+        shutil.copy2(source_exe, exe)
+        if with_backend:
+            shutil.copy2(backend, case_dir / backend.name)
+        child = {k: v for k, v in os.environ.items()
+                 if k != _RUNTIME_DIR_VAR}
+        child.update(env or {})
         proc = subprocess.run(
-            [str(exe), preload], cwd=str(case_dir), text=True,
+            [str(exe), preload], cwd=str(case_dir), text=True, env=child,
             errors="replace", capture_output=True, timeout=120)
         fields = {}
         for line in (proc.stdout or "").splitlines():
@@ -571,6 +618,13 @@ class LoaderStubFixtureTest(unittest.TestCase):
         self.assertIn(str(HERE / "backend_loader.c"), cmd)
         self.assertIn("-DCOLI_CUDA", cmd)
         self.assertIn("-DCOLI_HIP_DLL", cmd)
+        # The CUDA control is the same source and the same loader, minus the
+        # one macro; otherwise it would not be a control.
+        cuda = " ".join(f.cuda_harness_cmd)
+        self.assertTrue(f.cuda_harness_exe.is_file(), f.cuda_harness_exe)
+        self.assertIn(str(HERE / "backend_loader.c"), cuda)
+        self.assertIn("-DCOLI_CUDA", cuda)
+        self.assertNotIn("-DCOLI_HIP_DLL", cuda)
         # A copied loader would let the test drift from production.
         copies = list(f.root.rglob("backend_loader.c"))
         self.assertEqual(copies, [], "loader source copied into the fixture: %s" % copies)
@@ -650,7 +704,12 @@ class LoaderRuntimeBindingTest(unittest.TestCase):
     def _assert_bound_to(self, name, runtime, marker, other):
         f = self.fixture
         case = Path(self.cases.name) / name
-        proc, out = f.run_harness(case, str(runtime))
+        # W1-B2c1: a HIP host must be configured before the loader will run at
+        # all, so every binding case now names the directory it preloads from.
+        # Validation does not load anything, so what is proven below is
+        # unchanged.
+        proc, out = f.run_harness(case, str(runtime),
+                                  env={_RUNTIME_DIR_VAR: str(runtime.parent)})
         detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
 
         self.assertEqual(proc.returncode, 0, "harness failed" + detail)
@@ -705,7 +764,10 @@ class LoaderRuntimeBindingTest(unittest.TestCase):
         """
         f = self.fixture
         case = Path(self.cases.name) / "case_ambient"
-        proc, out = f.run_harness(case, "NONE")
+        # A valid runtime directory is configured so the loader is actually
+        # entered; nothing is preloaded from it, which is the point.
+        proc, out = f.run_harness(case, "NONE",
+                                  env={_RUNTIME_DIR_VAR: str(f.runtime_a_dir)})
         detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
 
         self.assertEqual(proc.returncode, 0, "harness crashed" + detail)
@@ -744,6 +806,319 @@ class LoaderRuntimeBindingTest(unittest.TestCase):
         self.assertIsInstance(exists, bool)
         if exists:
             self.assertGreater(size, 0)
+
+
+class LoaderRuntimeDirContractTest(unittest.TestCase):
+    """COLI_HIP_RUNTIME_DIR: which values a HIP host accepts, and which it refuses.
+
+    Every case runs the native harness, which links ``c/backend_loader.c``
+    unmodified — so the parsing under test is production's, not a Python
+    re-implementation. No ROCm, no HIP SDK, no GPU and no real runtime are
+    involved: the rejections happen before any DLL is touched, and the
+    acceptances only prove that a directory holding a file of the right name
+    was found.
+    """
+
+    fixture = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.fixture = _StubFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.fixture is not None:
+            cls.fixture.cleanup()
+            cls.fixture = None
+
+    def setUp(self):
+        self.cases = tempfile.TemporaryDirectory(prefix="coli runtime dir ")
+        self.addCleanup(self.cases.cleanup)
+        self.cfg = Path(self.cases.name) / "cfg"
+        self.cfg.mkdir()
+
+        # A real file, offered where a directory is required.
+        self.a_file = self.cfg / "not a directory.txt"
+        self.a_file.write_text("not a runtime", encoding="ascii")
+        # A real directory with no runtime in it.
+        self.empty_dir = self.cfg / "empty dir"
+        self.empty_dir.mkdir()
+        # A directory that *is* named amdhip64_7.dll — the shape a naive
+        # existence check would happily accept.
+        self.dir_child = self.cfg / "child is a dir"
+        (self.dir_child / _RUNTIME_BASENAME).mkdir(parents=True)
+        # Never created.
+        self.missing_dir = self.cfg / "no such directory"
+        # A valid runtime directory whose name is outside ASCII.
+        self.unicode_dir = self.cfg / "körtid π"
+        self.unicode_dir.mkdir()
+        shutil.copy2(self.fixture.runtime_a, self.unicode_dir / _RUNTIME_BASENAME)
+
+    # --- shared assertions ---------------------------------------------
+
+    def _run(self, name, value, preload="NONE"):
+        env = None if value is None else {_RUNTIME_DIR_VAR: value}
+        return self.fixture.run_harness(
+            Path(self.cases.name) / name, preload, env=env)
+
+    def _assert_rejected(self, name, value, expected):
+        """The loader refused, said why, and never went near a DLL."""
+        f = self.fixture
+        proc, out = self._run(name, value)
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+        err = proc.stderr or ""
+
+        self.assertEqual(proc.returncode, 0, "harness crashed" + detail)
+        self.assertEqual(out.get("loader_init"), "0",
+                         "loader ran despite invalid configuration" + detail)
+        self.assertEqual(out.get("backend_loaded"), "0",
+                         "the backend DLL was loaded anyway" + detail)
+        self.assertNotIn("backend_path", out, detail)
+
+        # The specific diagnostic, tagged as HIP, and never a claim that a DLL
+        # was looked for or loaded.
+        self.assertIn("[HIP] ", err, detail)
+        self.assertIn(expected, err, detail)
+        self.assertNotIn("coli_hip.dll", err, "the backend was reached" + detail)
+        self.assertNotIn("missing symbol", err, detail)
+
+        # Module inventory is identical at all three sampling points, and
+        # neither controlled runtime is in it.
+        counts = [out.get("runtime_before_count"),
+                  out.get("runtime_after_preload_count"),
+                  out.get("runtime_after_backend_count")]
+        self.assertEqual(len(set(counts)), 1,
+                         "runtime inventory changed: %s%s" % (counts, detail))
+        for key, loaded in out.items():
+            if key.startswith("runtime_") and key.rsplit("_", 1)[-1].isdigit():
+                for runtime in (f.runtime_a, f.runtime_b):
+                    self.assertFalse(
+                        os.path.normcase(os.path.normpath(loaded)) ==
+                        os.path.normcase(os.path.normpath(str(runtime))),
+                        "a controlled runtime was loaded" + detail)
+        return proc, out
+
+    def _assert_accepted(self, name, value):
+        """Validation passed and execution moved on to the backend-load phase.
+
+        Deliberately makes no claim about whether that load then succeeds:
+        W1-B2c1 does not preload the runtime, so the outcome past this point is
+        the pre-existing, environment-dependent behaviour.
+        """
+        proc, out = self._run(name, value)
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+        err = proc.stderr or ""
+
+        self.assertEqual(proc.returncode, 0, "harness crashed" + detail)
+        self.assertNotIn(_RUNTIME_DIR_VAR, err,
+                         "a valid directory was rejected" + detail)
+        self.assertIn("loader_init", out, detail)
+        # Reaching the backend phase shows up one of exactly two ways.
+        reached = (out.get("backend_loaded") == "1"
+                   or "coli_hip.dll not found" in err)
+        self.assertTrue(reached, "never reached the backend load" + detail)
+        return proc, out
+
+    # --- rejected values ------------------------------------------------
+
+    def test_missing_variable_is_refused(self):
+        self._assert_rejected("miss", None, "COLI_HIP_RUNTIME_DIR is not set")
+
+    def test_empty_variable_is_refused(self):
+        """Set-but-empty is distinct from unset, and says so.
+
+        Windows reports the two differently — GetEnvironmentVariableW returns 0
+        with ERROR_ENVVAR_NOT_FOUND for one and a clear error code for the
+        other — so collapsing them into one message would lose the difference
+        between "you forgot" and "your launcher passed an empty value".
+        """
+        self._assert_rejected("empty", "", "COLI_HIP_RUNTIME_DIR is empty")
+
+    def test_relative_forms_are_refused(self):
+        """Nothing that would be resolved against the current directory."""
+        cases = {
+            "rel_plain": r"relative\directory",
+            "rel_dot": r".\directory",
+            "rel_parent": r"..\directory",
+            "rel_forward": "relative/directory",
+        }
+        for name, value in cases.items():
+            with self.subTest(value=value):
+                self._assert_rejected(
+                    name, value, "COLI_HIP_RUNTIME_DIR must be an absolute path")
+
+    def test_drive_relative_path_is_refused(self):
+        """``C:runtime`` is relative to that drive's own current directory."""
+        self._assert_rejected("drive_rel", "C:runtime",
+                              "COLI_HIP_RUNTIME_DIR must be an absolute path")
+
+    def test_rooted_path_without_drive_is_refused(self):
+        """``\\runtime`` is relative to the current drive, not absolute."""
+        self._assert_rejected("rooted", "\\runtime",
+                              "COLI_HIP_RUNTIME_DIR must be an absolute path")
+
+    def test_nonexistent_absolute_directory_is_refused(self):
+        self._assert_rejected("gone", str(self.missing_dir),
+                              "COLI_HIP_RUNTIME_DIR does not exist")
+
+    def test_file_supplied_as_the_directory_is_refused(self):
+        self._assert_rejected("file_as_dir", str(self.a_file),
+                              "COLI_HIP_RUNTIME_DIR is not a directory")
+
+    def test_directory_without_the_runtime_is_refused(self):
+        self._assert_rejected(
+            "no_runtime", str(self.empty_dir),
+            "amdhip64_7.dll not found in COLI_HIP_RUNTIME_DIR")
+
+    def test_runtime_child_that_is_a_directory_is_refused(self):
+        """Existence alone is not enough: it has to be a file."""
+        self._assert_rejected("child_dir", str(self.dir_child),
+                              "amdhip64_7.dll is a directory, not a file")
+
+    # --- accepted values ------------------------------------------------
+
+    def test_runtime_a_directory_with_a_space_is_accepted(self):
+        f = self.fixture
+        self.assertIn(" ", str(f.runtime_a_dir))
+        self._assert_accepted("ok_a", str(f.runtime_a_dir))
+
+    def test_runtime_b_directory_is_accepted(self):
+        self._assert_accepted("ok_b", str(self.fixture.runtime_b_dir))
+
+    def test_unicode_directory_is_accepted(self):
+        """The value is read with GetEnvironmentVariableW, so it survives."""
+        self.assertFalse(str(self.unicode_dir).isascii())
+        self._assert_accepted("ok_unicode", str(self.unicode_dir))
+
+    def test_trailing_separator_is_accepted(self):
+        """No doubled separator when the user's value already ends in one."""
+        for name, suffix in (("ok_trail_back", "\\"), ("ok_trail_fwd", "/")):
+            with self.subTest(suffix=suffix):
+                self._assert_accepted(
+                    name, str(self.fixture.runtime_a_dir) + suffix)
+
+    # --- configured vs. actually bound ----------------------------------
+
+    def test_configured_and_preloaded_runtime_agree(self):
+        """Configured A, preloaded A: validation passes and A is bound."""
+        f = self.fixture
+        proc, out = f.run_harness(
+            Path(self.cases.name) / "agree", str(f.runtime_a),
+            env={_RUNTIME_DIR_VAR: str(f.runtime_a_dir)})
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+        self.assertNotIn(_RUNTIME_DIR_VAR, proc.stderr or "", detail)
+        self.assertEqual(out.get("loader_init"), "1", detail)
+        self.assertEqual(out.get("bound_marker"), str(_RUNTIME_MARKER_A), detail)
+
+    def test_configured_a_but_preloaded_b_still_binds_b(self):
+        """TEMPORARY REGRESSION WITNESS for W1-B2d — not accepted behaviour.
+
+        COLI_HIP_RUNTIME_DIR names runtime A and the directory validates, yet
+        runtime B was already loaded under the same basename and B is what the
+        backend ends up bound to. Validating the configuration proves the
+        configuration is well-formed; it proves nothing about which runtime the
+        process is actually using.
+
+        This test exists to pin that gap in place so it cannot be mistaken for
+        enforcement. W1-B2d must invert the assertion: once the loader checks
+        the already-loaded module and verifies the bound path, this case has to
+        fail closed with a diagnostic instead of silently binding B.
+        """
+        f = self.fixture
+        proc, out = f.run_harness(
+            Path(self.cases.name) / "mismatch", str(f.runtime_b),
+            env={_RUNTIME_DIR_VAR: str(f.runtime_a_dir)})
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+
+        # Configuration accepted: A really is a valid runtime directory.
+        self.assertNotIn(_RUNTIME_DIR_VAR, proc.stderr or "", detail)
+        self.assertEqual(out.get("preload_marker"), str(_RUNTIME_MARKER_B), detail)
+        # ...and the mismatch goes through unreported.
+        self.assertEqual(out.get("loader_init"), "1", detail)
+        self.assertEqual(out.get("bound_marker"), str(_RUNTIME_MARKER_B),
+                         "pre-B2d behaviour changed" + detail)
+        self.assertEqual(out.get("runtime_after_backend_count"), "1", detail)
+        self.assertTrue(
+            os.path.normcase(os.path.normpath(out["runtime_after_backend_0"])) ==
+            os.path.normcase(os.path.normpath(str(f.runtime_b))), detail)
+
+
+class LoaderCudaModeIgnoresRuntimeDirTest(unittest.TestCase):
+    """A CUDA host must be completely indifferent to COLI_HIP_RUNTIME_DIR.
+
+    The control is the same harness source and the same ``c/backend_loader.c``,
+    built without COLI_HIP_DLL — the one macro the Makefile's two mutually
+    exclusive builds differ by. Needs no NVIDIA GPU and no CUDA SDK: the fake
+    backend is the fixture's, renamed.
+    """
+
+    fixture = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.fixture = _StubFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.fixture is not None:
+            cls.fixture.cleanup()
+            cls.fixture = None
+
+    def setUp(self):
+        self.cases = tempfile.TemporaryDirectory(prefix="coli cuda ignore ")
+        self.addCleanup(self.cases.cleanup)
+
+    def _cuda_run(self, name, env):
+        f = self.fixture
+        return f.run_harness(Path(self.cases.name) / name, str(f.runtime_a),
+                             env=env, vendor="cuda")
+
+    def test_invalid_runtime_dir_does_not_change_cuda_behaviour(self):
+        """Garbage in COLI_HIP_RUNTIME_DIR vs. no variable at all: identical."""
+        f = self.fixture
+        baseline_proc, baseline = self._cuda_run("cuda_clean", None)
+        poisoned_proc, poisoned = self._cuda_run(
+            "cuda_poisoned", {_RUNTIME_DIR_VAR: r"..\definitely not a runtime"})
+        detail = ("\nbaseline:\n%s\n%s\npoisoned:\n%s\n%s"
+                  % (baseline_proc.stdout, baseline_proc.stderr,
+                     poisoned_proc.stdout, poisoned_proc.stderr))
+
+        for proc in (baseline_proc, poisoned_proc):
+            self.assertEqual(proc.returncode, 0, detail)
+            # No HIP validation ran, so none of its vocabulary appears.
+            self.assertNotIn(_RUNTIME_DIR_VAR, proc.stderr or "", detail)
+            self.assertNotIn("[HIP]", proc.stderr or "", detail)
+
+        for key in ("loader_init", "backend_loaded", "bound_marker",
+                    "preload_marker", "runtime_after_backend_count"):
+            self.assertEqual(baseline.get(key), poisoned.get(key),
+                             "%s diverged" % key + detail)
+
+        # And the outcome itself is the ordinary CUDA one.
+        self.assertEqual(poisoned.get("loader_init"), "1", detail)
+        self.assertEqual(poisoned.get("bound_marker"), str(_RUNTIME_MARKER_A), detail)
+        self.assertTrue(poisoned["backend_path"].lower().endswith("coli_cuda.dll"),
+                        detail)
+
+    def test_cuda_host_seeks_the_cuda_backend_only(self):
+        """Even with a poisoned variable, the missing-DLL path stays CUDA's."""
+        f = self.fixture
+        proc, out = f.run_harness(
+            Path(self.cases.name) / "cuda_miss", "NONE",
+            env={_RUNTIME_DIR_VAR: "C:relative-nonsense"},
+            vendor="cuda", with_backend=False)
+        err = proc.stderr or ""
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, err)
+        self.assertEqual(out.get("loader_init"), "0", detail)
+        self.assertIn("[CUDA] coli_cuda.dll not found", err, detail)
+        self.assertNotIn("[HIP]", err, detail)
+        self.assertNotIn(_RUNTIME_DIR_VAR, err, detail)
 
 
 class LoaderBackendSelectionTest(unittest.TestCase):
@@ -814,6 +1189,14 @@ class LoaderBackendSelectionTest(unittest.TestCase):
         the defaults are applied, which is how a caller opts out of the
         ``COLI_CUDA=1`` request set below and tests the not-requested contract
         instead. The default removes nothing, so existing callers are unchanged.
+
+        Since W1-B2c1 a HIP host refuses to reach the backend at all without a
+        valid COLI_HIP_RUNTIME_DIR, so the sandbox gets one: a throwaway
+        directory holding an empty placeholder file of the right name. The
+        loader only asks whether that file exists — it never opens, maps or
+        loads it — so this stays a CPU-only test with no HIP SDK and no GPU.
+        The ambient value is dropped either way, so a developer's real ROCm
+        install cannot influence the result.
         """
         # One sandbox per host, so a test may exercise both in a single method.
         sandbox = Path(self.tmp.name) / ("bin_" + key)
@@ -822,6 +1205,12 @@ class LoaderBackendSelectionTest(unittest.TestCase):
         shutil.copy2(self._hosts[key], exe)
         model = _minimal_model(str(sandbox))
         merged = {**os.environ, "SNAP": str(model), "COLI_CUDA": "1"}
+        merged.pop(_RUNTIME_DIR_VAR, None)
+        if key == "hip":
+            runtime_dir = sandbox / "runtime"
+            runtime_dir.mkdir(exist_ok=True)
+            (runtime_dir / _RUNTIME_BASENAME).write_bytes(b"")
+            merged[_RUNTIME_DIR_VAR] = str(runtime_dir)
         for name in unset:
             merged.pop(name, None)
         return subprocess.run(
