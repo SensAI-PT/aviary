@@ -1,4 +1,4 @@
-/* backend_loader.c — Windows runtime loader for coli_cuda.dll.
+/* backend_loader.c — Windows runtime loader for the GPU backend DLL.
  *
  * Why this exists: the engine is built with MinGW-w64 (gcc), but CUDA kernels
  * must be compiled with MSVC + nvcc. We cannot link a CUDA .o into a gcc binary
@@ -26,6 +26,24 @@
 #include <windows.h>
 
 #include "backend_cuda.h"
+
+/* Which backend DLL this host looks for, and how it labels its own messages.
+ * The Makefile defines COLI_HIP_DLL for a HIP_DLL=1 host and leaves it undefined
+ * for CUDA_DLL=1; the two builds are mutually exclusive there, so exactly one
+ * arm is live. Every filename-coupled site below uses COLI_BACKEND_DLL —
+ * including the path bounds check, which must derive from the same constant so
+ * it can never drift from the name it is guarding.
+ *
+ * The EXPORTED symbol prefix stays coli_cuda_ for both vendors: one shared ABI,
+ * one shared backend_cuda.cu (see GPU_BACKENDS.md). Only the container filename
+ * and the diagnostic label differ. */
+#ifdef COLI_HIP_DLL
+#define COLI_BACKEND_DLL "coli_hip.dll"
+#define COLI_VENDOR_TAG  "[HIP]"
+#else
+#define COLI_BACKEND_DLL "coli_cuda.dll"
+#define COLI_VENDOR_TAG  "[CUDA]"
+#endif
 
 /* Function-pointer typedefs matching each exported symbol. */
 typedef int            (*fn_init)(const int *devices, int count);
@@ -161,10 +179,10 @@ static int coli_cuda_load(void){
     if(g_cuda.loaded) return g_cuda.available;
     g_cuda.loaded = 1;
 
-    /* Load coli_cuda.dll from the engine's OWN directory, by absolute path —
-     * never a bare name. LoadLibraryA("coli_cuda.dll") searches the current
+    /* Load the backend DLL from the engine's OWN directory, by absolute path —
+     * never a bare name. LoadLibraryA(COLI_BACKEND_DLL) searches the current
      * working directory (and, without SafeDllSearchMode, other writable dirs):
-     * an attacker who drops a coli_cuda.dll where the user launches glm.exe (or
+     * an attacker who drops a same-named DLL where the user launches glm.exe (or
      * inside a downloaded model directory the user cd's into) would get their
      * DllMain run at load — classic DLL hijacking -> arbitrary code execution.
      * Resolving the path next to glm.exe and loading THAT specific file with
@@ -174,19 +192,19 @@ static int coli_cuda_load(void){
     DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
     if(mn > 0 && mn < sizeof(dllpath)){
         char *slash = strrchr(dllpath, '\\');
-        if(slash && (size_t)(slash + 1 - dllpath) + sizeof("coli_cuda.dll") <= sizeof(dllpath)){
-            strcpy(slash + 1, "coli_cuda.dll");
+        if(slash && (size_t)(slash + 1 - dllpath) + sizeof(COLI_BACKEND_DLL) <= sizeof(dllpath)){
+            strcpy(slash + 1, COLI_BACKEND_DLL);
             g_cuda.dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
     }
     if(!g_cuda.dll){
         /* fallback (GetModuleFileNameA praticamente non fallisce): cerca solo
          * nella dir dell'applicazione e in System32, MAI la CWD. */
-        g_cuda.dll = LoadLibraryExA("coli_cuda.dll", NULL,
+        g_cuda.dll = LoadLibraryExA(COLI_BACKEND_DLL, NULL,
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if(!g_cuda.dll){
-        fprintf(stderr, "[CUDA] coli_cuda.dll not found; GPU tier disabled "
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL " not found; GPU tier disabled "
                         "(CPU path remains active).\n");
         return 0;
     }
@@ -201,7 +219,8 @@ static int coli_cuda_load(void){
         g_cuda.name = (type)GetProcAddress(g_cuda.dll, "coli_cuda_" #name); \
         _Pragma("GCC diagnostic pop") \
         if(!g_cuda.name){ \
-            fprintf(stderr, "[CUDA] coli_cuda.dll missing symbol coli_cuda_" #name "\n"); \
+            fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL \
+                            " missing symbol coli_cuda_" #name "\n"); \
             FreeLibrary(g_cuda.dll); g_cuda.dll=NULL; return 0; }
 
     /* Optional symbol: a DLL predating it leaves the pointer NULL and only that
