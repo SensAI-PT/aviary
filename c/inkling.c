@@ -1204,7 +1204,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *mxg = NULL, *mrw = NULL; const void **mgp = NULL, **mup = NULL, **mdp = NULL;
     const float **mgs = NULL, **mus = NULL, **mds = NULL; Slot **mslot = NULL;
     int *mxoff = NULL, *mnr = NULL, *mrows = NULL, *mgi = NULL, *mfp = NULL;
-    if (g_metal && m->xq) {
+    /* GPU only when the block is batched: at decode (S==1) a round is topk
+     * pairs of 6-row kernels and the ~135ms dispatch+sync latency swamps the
+     * math — measured 0.14 tok/s on GPU vs 0.63 on CPU for Inkling-Small.
+     * Prefill rounds carry up to `cap` pairs and amortize the launch.
+     * INK_METAL_MIN_S overrides the gate (1 = GPU always, for A/Bs). */
+    int metal_min_s = getenv("INK_METAL_MIN_S") ? atoi(getenv("INK_METAL_MIN_S")) : 2;
+    if (g_metal && m->xq && S >= metal_min_s) {
         mxg = falloc((int64_t)cap*D); mrw = falloc(cap);
         mgp = malloc(cap*sizeof(void*)); mup = malloc(cap*sizeof(void*)); mdp = malloc(cap*sizeof(void*));
         mgs = malloc(cap*sizeof(float*)); mus = malloc(cap*sizeof(float*)); mds = malloc(cap*sizeof(float*));
