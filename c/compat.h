@@ -10,6 +10,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#ifndef _WIN32
+#include <sys/select.h>   /* select(), fd_set, struct timeval per coli_stdin_readable */
+#endif
 
 /* --- posix_fadvise: assente su macOS ---
  * WILLNEED -> F_RDADVISE (readahead esplicito: stessa semantica).
@@ -369,6 +372,43 @@ static inline char *compat_mkdtemp(char *tmpl){
 /* --- COMPAT_O_RDONLY: O_RDONLY con O_BINARY su Windows, O_RDONLY puro altrove --- */
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
+#endif
+
+/* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
+ *
+ * I serve loop di inkling.c e kimi_k3.c usavano select() su fd_set direttamente.
+ * Su Windows quei simboli non esistono in quella forma e le due build FALLIVANO
+ * (misurato: Linux ok, macOS ok, Windows/UCRT64 no) -- ed e' il motivo per cui
+ * le release binarie hanno sempre contenuto il solo motore GLM.
+ *
+ * La logica Windows non e' una traduzione meccanica: ha assorbito due bug.
+ *   #139  select() su un handle di pipe finisce in winsock e ritorna sempre
+ *         SOCKET_ERROR, quindi il loop non accettava mai una richiesta.
+ *   #195  le pipe anonime NON sono oggetti attendibili: WaitForSingleObject su
+ *         di esse e' undefined, e PeekNamedPipe fallisce su handle di file o
+ *         console. Su stdin non-pipe si riporta "niente da leggere" invece di
+ *         bloccare il loop.
+ * Duplicarla una terza volta avrebbe rifatto entrare quei due bug in due motori
+ * dove nessuno li avrebbe cercati: sta qui una volta sola.
+ *
+ * static inline: e' un header condiviso, e un TU che non la usa non deve pagarla. */
+#ifdef _WIN32
+static inline int coli_stdin_readable(void)
+{
+    HANDLE ih = (HANDLE)_get_osfhandle(_fileno(stdin));
+    DWORD avail = 0;
+    if (ih == INVALID_HANDLE_VALUE) return 0;
+    if (PeekNamedPipe(ih, NULL, 0, NULL, &avail, NULL)) return avail > 0;
+    return 0;   /* console/file: nessun poll non bloccante, meglio "niente" che bloccare */
+}
+#else
+static inline int coli_stdin_readable(void)
+{
+    fd_set r; struct timeval tv = {0, 0};
+    FD_ZERO(&r); FD_SET(STDIN_FILENO, &r);
+    return select(STDIN_FILENO + 1, &r, NULL, NULL, &tv) > 0
+           && FD_ISSET(STDIN_FILENO, &r);
+}
 #endif
 
 #endif /* COMPAT_H */

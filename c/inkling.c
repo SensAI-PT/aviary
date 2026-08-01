@@ -1393,9 +1393,9 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
 static int stdin_readable(void) {
-    fd_set r; struct timeval tv = {0, 0};
-    FD_ZERO(&r); FD_SET(0, &r);
-    return select(1, &r, NULL, NULL, &tv) > 0;
+    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
+     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
+    return coli_stdin_readable();
 }
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
