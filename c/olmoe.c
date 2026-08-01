@@ -3,7 +3,9 @@
  * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
  *
  * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
- * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
+ * Expert letti dal disco on-demand via pread, cache LRU per-layer; le pagine
+ * restano nel page cache cosi' i miss LRU non tornano su disco (EXPERT_DROP=1
+ * ripristina fadvise(DONTNEED) per macchine con poca RAM).
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
@@ -13,6 +15,9 @@
  *   WIDE=N        : prefetch top-K*N candidates (default 1, try 2 or 3)
  *   SMOOTH=F      : EMA coefficient for routing momentum (default 0.3, range 0.0-0.95)
  *   CONF_LIMIT=F  : cumulative gate probability threshold for prefetch cutoff (default 0.92)
+ *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
+ *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
+ *                    for RAM-tight boxes); 0=keep pages cached (default)
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -27,6 +32,10 @@
 #include <unistd.h>
 #endif
 #include "st.h"
+#ifdef _OPENMP
+#include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
+#endif
+#include "omp_tune.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -42,6 +51,9 @@ typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim;
     int n_experts, topk, inter, vocab;
     float theta, eps; int norm_topk;
+    int stop_ids[8], n_stop;   /* unused (no model-specific hardcoded stops) — chat mode's
+                                 * stop set comes entirely from the tokenizer's own special-
+                                 * token flags via sample.h's stops_arm_tok */
 } Cfg;
 
 /* ---------- pesi densi per-layer ---------- */
@@ -82,6 +94,7 @@ typedef struct {
     uint8_t *is_pinned;     /* [n_layers * n_experts], 1 if expert is globally pinned */
     uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
     float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
+    uint64_t *last_access;  /* [n_layers * n_experts], clock time when expert was last accessed */
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +103,14 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
+static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
+
+static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
+    uint64_t age = (clock > last) ? (clock - last) : 0;
+    uint64_t recent = (age < 255) ? (255 - age) : 0;
+    return ((uint64_t)heat << 8) | recent;
+}
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -117,6 +138,14 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
+/* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
+ * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
+ * Declared before #include "sample.h" — it references these by name, and
+ * Cfg/falloc above, without its own extern declarations. */
+static float g_temp = 0.7f;   /* TEMP env overrides */
+static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
+#include "sample.h"
+
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
     #pragma omp parallel for schedule(static)
@@ -125,6 +154,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
             float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
             for (int i = 0; i < I; i++) acc += xs[i] * w[i];
             y[(int64_t)s * O + o] = acc;
         }
@@ -149,9 +179,30 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 #endif
     return vaddvq_s32(acc);
 }
+#define HAVE_FAST_DOT_I8 1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+/* x86 counterpart of the NEON path above (was scalar-only here before —
+ * the only fast path was ARM, so x86 boxes silently used the scalar
+ * fallback even when AVX2 was available).
+ * Sign-extend both int8 vectors to int16 (exact, no precision loss) then
+ * madd+horizontal-sum in int32: pure integer arithmetic, so this is
+ * bit-for-bit identical to the scalar dot product, just vectorized. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
+    __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m256i prod = _mm256_madd_epi16(va16, vb16);           /* 8 x int32, adjacent pairs summed */
+    __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(prod), _mm256_extracti128_si256(prod, 1));
+    __m128i hi64   = _mm_unpackhi_epi64(sum128, sum128);
+    __m128i sum64  = _mm_add_epi32(sum128, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128i sum32  = _mm_add_epi32(sum64, hi32);
+    return _mm_cvtsi128_si32(sum32);
+}
+#define HAVE_FAST_DOT_I8 1
 #endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__ARM_NEON)
+#if defined(HAVE_FAST_DOT_I8)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
     if (idot && I % 16 == 0 && I <= 4096) {
@@ -177,30 +228,12 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
         float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
     }
 }
 
-/* quantizza un weight f32 [O,I] -> int8 q[O,I] + scala[O], simmetrica per riga.
- * Replica quant_dequant() del Python: scale = amax(|w|, riga)/qmax, q = round(w/scale). */
-static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
-    int qmax = (1 << (bits - 1)) - 1;     /* 8->127, 4->7, 2->1 */
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *wr = w + (int64_t)o * I;
-        float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
-        float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
-        scale[o] = s;
-        int8_t *qr = q + (int64_t)o * I;
-        for (int i = 0; i < I; i++) {
-            int v = (int)lrintf(wr[i] / s);
-            if (v >  qmax) v =  qmax;
-            if (v < -qmax-1) v = -qmax-1;
-            qr[i] = (int8_t)v;
-        }
-    }
-}
 
 /* rmsnorm su una riga di lunghezza D, in-place su out (out puo' essere == x) */
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
@@ -302,6 +335,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->pilot_smooth = sv;
     m->is_pinned = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
     m->is_queued = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint8_t));
+    m->last_access = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint64_t));
     float cl = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
@@ -392,7 +426,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
-    st_read_raw(&m->S, nm, s->g, 1);
+    st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
 
@@ -402,6 +436,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
         m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+        if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
@@ -440,6 +475,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -456,11 +492,11 @@ static void pin_hot_experts(Model *m) {
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
         uint32_t *freq_l = m->freq + (int64_t)l * c->n_experts;
-        
+
         uint64_t layer_total = 0;
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
-        
+
         int max_pin = m->cache[l].cap - 8;
         if (max_pin < 4) max_pin = 4;
         
@@ -719,6 +755,19 @@ static void pilot_realload(Model *m, int layer, int eid) {
             pthread_mutex_unlock(&g_pilot_mx);
             return; /* all pinned/in-flight, skip */
         }
+
+        /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
+        if (g_pilot_evict_guard && m->freq && m->last_access && lc->slots[lru].eid >= 0) {
+            int vid = lc->slots[lru].eid;
+            uint64_t vs = lfru_score(m->freq[layer * c->n_experts + vid], m->last_access[layer * c->n_experts + vid], m->clock);
+            uint64_t cs = lfru_score(m->freq[layer * c->n_experts + eid], m->last_access[layer * c->n_experts + eid], m->clock);
+            if (cs <= vs + (vs >> 2) + (4u << 8)) {
+                m->is_queued[layer * c->n_experts + eid] = 0;
+                pthread_mutex_unlock(&g_pilot_mx);
+                return; /* drop speculation */
+            }
+        }
+
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;
@@ -730,6 +779,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = eid;
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
+    if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -926,6 +976,110 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     return scored;
 }
 
+/* ---------- interactive chat mode (CHAT=1) ---------- */
+/* OLMoE-Instruct's real template (tokenizer_config.json's chat_template):
+ *   {{bos_token}}<|user|>\n{msg}\n<|assistant|>\n{reply}{eos_token}\n<|user|>\n...
+ * bos_token == eos_token == "|||IP_ADDRESS|||" (a genuine OLMoE tokenizer quirk,
+ * a PII-scrubbing artifact repurposed as the BOS/EOS marker — not a bug here).
+ * It's an added special token, so tok_encode() tokenizes the literal string as
+ * one atomic id, same as any other added token. <|user|>/<|assistant|> are NOT
+ * special tokens in this tokenizer — just plain text the model was trained to
+ * treat as turn markers.
+ * Turn 1 gets bos_token with no separator before "<|user|>"; every later turn
+ * gets eos_token+"\n" first (closing the previous assistant turn we never
+ * explicitly appended to history, matching the is_stop-skips-append design
+ * below) before its own "<|user|>...". */
+static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
+    int n = first_turn
+        ? snprintf(out, cap, "|||IP_ADDRESS|||<|user|>\n%s\n<|assistant|>\n", msg)
+        : snprintf(out, cap, "|||IP_ADDRESS|||\n<|user|>\n%s\n<|assistant|>\n", msg);
+    return (n < 0 || n >= cap) ? -1 : n;
+}
+
+/* KV cache allocated ONCE for ctx_cap and never reallocated — hist_len only
+ * grows (or resets to 0 on /reset), so every turn after the first reuses the
+ * previous turns' cached keys/values: real multi-turn context, not a fresh
+ * generate() call per message. ctx_cap capped at 4096: attention()'s per-head
+ * score buffer (sc[4096]) is fixed-size, any position >= 4096 would overflow it. */
+static void run_chat(Model *m, Tok *T, int ctx_cap) {
+    Cfg *c = &m->c;
+    m->max_t = ctx_cap;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+
+    int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
+    stops_arm_tok(c, tok_eos, T);
+
+    int max_new = getenv("MAX_NEW") ? atoi(getenv("MAX_NEW")) : 512;
+    if (max_new < 1) max_new = 1;
+
+    int *hist = malloc((size_t)ctx_cap * sizeof(int));
+    int hist_len = 0;
+    int first_turn = 1;
+
+    char *line = malloc(8192);
+    char *turn = malloc(8192 + 64);
+    int  *newids = malloc(8192 * sizeof(int));
+    int  *gen = malloc((size_t)max_new * sizeof(int));
+    char *outbuf = malloc(65536);
+
+    fprintf(stderr, "olmoe chat — SNAP=%s, ctx=%d, TEMP=%.2f, NUCLEUS=%.2f\n"
+                     "  type a message and press enter; /reset clears context; Ctrl-D exits\n",
+            getenv("SNAP"), ctx_cap, g_temp, g_nuc);
+
+    for (;;) {
+        printf("\n> "); fflush(stdout);
+        if (!fgets(line, 8192, stdin)) break;
+        size_t L = strlen(line);
+        while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
+        if (L == 0) continue;
+        if (!strcmp(line, "/reset")) { hist_len = 0; first_turn = 1; fprintf(stderr, "[chat] context reset\n"); continue; }
+
+        int tn = fmt_user_turn(turn, 8192 + 64, line, first_turn);
+        if (tn < 0) { fprintf(stderr, "[chat] message too long, skipped\n"); continue; }
+        first_turn = 0;
+        int nn = tok_encode(T, turn, tn, newids, 8192);
+
+        if (hist_len + nn + max_new > ctx_cap) {
+            fprintf(stderr, "[chat] context window full (%d/%d tokens) — /reset to start over\n",
+                    hist_len + nn, ctx_cap);
+            continue;
+        }
+
+        float *logit = step(m, newids, nn, hist_len);
+        hist_len += nn;
+
+        /* Every token counted in hist_len must have gone through step() exactly
+         * once (that's what writes its KV-cache slot) — otherwise a later turn's
+         * attention would read an uninitialized slot. So even on the turn's LAST
+         * token we still call step() once to populate its KV before breaking;
+         * only its returned logit (which nothing will consume) is discarded. */
+        int ngen = 0;
+        for (int s = 0; s < max_new; s++) {
+            int nt = pick_tok(logit, c->vocab, -1);
+            free(logit); logit = NULL;
+            if (is_stop(nt)) break;
+            hist[hist_len] = nt; gen[ngen++] = nt; hist_len++;
+            int room_left = (s < max_new - 1) && (hist_len < ctx_cap);
+            logit = step(m, &nt, 1, hist_len - 1);
+            if (!room_left) {
+                if (hist_len >= ctx_cap) fprintf(stderr, "\n[chat] context window full mid-reply — /reset to start over\n");
+                free(logit); logit = NULL;
+                break;
+            }
+        }
+
+        int outn = tok_decode(T, gen, ngen, outbuf, 65535);
+        outbuf[outn] = 0;
+        printf("%s\n", outbuf);
+        fflush(stdout);
+    }
+    free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -935,10 +1089,13 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 int main(int argc, char **argv) {
+    coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -948,13 +1105,31 @@ int main(int argc, char **argv) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits);
         return 1;
     }
+
+    if (getenv("CHAT")) {   /* interactive mode: bypasses the ref.json harness entirely */
+        g_temp = getenv("TEMP")    ? (float)atof(getenv("TEMP"))    : g_temp;
+        g_nuc  = getenv("NUCLEUS") ? (float)atof(getenv("NUCLEUS")) : g_nuc;
+        int ctx_cap = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (ctx_cap < 1 || ctx_cap > 4096) {   /* attention()'s sc[4096] score buffer hard-caps this */
+            fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
+            return 1;
+        }
+        Model m; model_init(&m, snap, cap, bits);
+        printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+        Tok T;
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+        run_chat(&m, &T, ctx_cap);
+        return 0;
+    }
+
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
