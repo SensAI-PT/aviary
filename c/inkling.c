@@ -743,6 +743,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 #ifdef COLI_METAL
     {   const char *me = getenv("COLI_METAL");
         if (me && *me == '1' && !getenv("NOGPU")) {
+            /* Residency set ON by default for inkling: without it every MoE
+             * block pays per-buffer useResource churn — measured 0.17 vs 1.76
+             * tok/s decode on Inkling-Small. COLI_METAL_RESSET=0 opts out. */
+            setenv("COLI_METAL_RESSET", "1", 0);
             if (coli_metal_init()) {
                 g_metal = 1;
                 fprintf(stderr, "[metal] ready — batched expert MoE on the Apple GPU\n");
@@ -1204,12 +1208,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *mxg = NULL, *mrw = NULL; const void **mgp = NULL, **mup = NULL, **mdp = NULL;
     const float **mgs = NULL, **mus = NULL, **mds = NULL; Slot **mslot = NULL;
     int *mxoff = NULL, *mnr = NULL, *mrows = NULL, *mgi = NULL, *mfp = NULL;
-    /* GPU only when the block is batched: at decode (S==1) a round is topk
-     * pairs of 6-row kernels and the ~135ms dispatch+sync latency swamps the
-     * math — measured 0.14 tok/s on GPU vs 0.63 on CPU for Inkling-Small.
-     * Prefill rounds carry up to `cap` pairs and amortize the launch.
-     * INK_METAL_MIN_S overrides the gate (1 = GPU always, for A/Bs). */
-    int metal_min_s = getenv("INK_METAL_MIN_S") ? atoi(getenv("INK_METAL_MIN_S")) : 2;
+    /* GPU for decode too, now that the residency set is on by default: with
+     * it a decode block runs in ~3ms and measures 1.76 tok/s vs 0.84 on CPU
+     * (Inkling-Small, M-series 128 GB). Without the set the same block paid
+     * ~135ms of useResource churn and CPU won — INK_METAL_MIN_S=2 restores
+     * the prefill-only gate if that regime ever returns. */
+    int metal_min_s = getenv("INK_METAL_MIN_S") ? atoi(getenv("INK_METAL_MIN_S")) : 1;
     if (g_metal && m->xq && S >= metal_min_s) {
         mxg = falloc((int64_t)cap*D); mrw = falloc(cap);
         mgp = malloc(cap*sizeof(void*)); mup = malloc(cap*sizeof(void*)); mdp = malloc(cap*sizeof(void*));
@@ -1786,7 +1790,11 @@ int main(int argc, char **argv) {
      * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables).
      * NOT under CUDA — same exception glm.c makes: a spinning 24-thread team
      * starves the CUDA driver during every stream sync. */
-#ifndef COLI_CUDA
+#if !defined(COLI_CUDA) && !defined(__APPLE__)
+    /* NOT on Apple Silicon: the active-spin team steals the shared SoC power
+     * budget (same mechanism as the M5 Max Metal report) and measured strictly
+     * worse on Inkling-Small even for pure-CPU decode — 0.50 vs 0.84 tok/s,
+     * and 2x the prefill. Opt back in with COLI_OMP_TUNED=0 unset + Linux. */
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
@@ -1798,7 +1806,7 @@ int main(int argc, char **argv) {
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
-#endif  /* !COLI_CUDA */
+#endif  /* !COLI_CUDA && !__APPLE__ */
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
