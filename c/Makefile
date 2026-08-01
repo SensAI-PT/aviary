@@ -97,6 +97,40 @@ ARCH   ?= native
 CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
+else ifneq (,$(AARCH64))
+# --- Linux / *BSD aarch64 (#631) ---
+# NEON e' baseline, ma i kernel SDOT/SMMLA int8-int4 vivono dietro
+# __ARM_FEATURE_DOTPROD / __ARM_FEATURE_MATMUL_INT8. A gcc that does not know
+# this core (gcc 13 vs Cortex-X925 on GB10: #631) degrades native to plain
+# armv8-a SILENTLY: the kernels compile out, no warning, the banner says
+# "idot: neon" and int4 S=1 decode falls back to f32. So for the default
+# ARCH=native, probe the macro; if it is missing, re-add the features the
+# silicon itself reports in /proc/cpuinfo -- but keep them only if this
+# compiler accepts the modifiers (gcc < 10 has no +i8mm: composing blindly
+# would turn a slow build into a broken one).
+CC      = gcc
+ARCH   ?= native
+ifeq ($(ARCH),native)
+ARCHFLAG := -mcpu=native
+ifeq ($(shell $(CC) -mcpu=native -dM -E - </dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8),0)
+CPUFEAT  := $(shell grep -m1 '^Features' /proc/cpuinfo 2>/dev/null)
+ARCH_EXT := $(if $(filter asimddp,$(CPUFEAT)),+dotprod)$(if $(filter i8mm,$(CPUFEAT)),+i8mm)
+ifneq ($(ARCH_EXT),)
+ifneq ($(shell $(CC) -march=armv8-a$(ARCH_EXT) -dM -E - </dev/null 2>/dev/null | grep -cE '__ARM_FEATURE_DOTPROD|__ARM_FEATURE_MATMUL_INT8'),0)
+ARCHFLAG := -march=armv8-a$(ARCH_EXT)
+else
+$(warning $(CC) does not accept$(subst +, +,$(ARCH_EXT)): int8/int4 idot kernels compile out (#631))
+endif
+endif
+endif
+else ifneq (,$(filter armv%,$(ARCH)))
+ARCHFLAG := -march=$(ARCH)
+else
+ARCHFLAG := -mcpu=$(ARCH)
+endif
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -pthread
+EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
 CC      = gcc
