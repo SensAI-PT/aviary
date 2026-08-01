@@ -151,9 +151,13 @@ class _StubFixture:
         self.runtime_b_dir = self.root / "runtime-b"
         self.backend_dir = self.root / "backend"
         self.src_dir = self.root / "src"
-        for d in (self.runtime_a_dir, self.runtime_b_dir,
-                  self.backend_dir, self.src_dir):
+        self.harness_dir = self.root / "harness"
+        for d in (self.runtime_a_dir, self.runtime_b_dir, self.backend_dir,
+                  self.src_dir, self.harness_dir):
             d.mkdir(parents=True)
+        self.harness_src = self.src_dir / "harness.c"
+        self.harness_exe = self.harness_dir / "test_loader_harness.exe"
+        self.harness_cmd = []
         self.runtime_a = self.runtime_a_dir / _RUNTIME_BASENAME
         self.runtime_b = self.runtime_b_dir / _RUNTIME_BASENAME
         self.backend = self.backend_dir / "coli_hip.dll"
@@ -163,6 +167,133 @@ class _StubFixture:
         self._build()
 
     # --- construction -------------------------------------------------
+
+    HARNESS_SOURCE = r'''
+/* Native same-process loader harness (generated).
+ *
+ * Compiled together with the repository's real c/backend_loader.c, unmodified,
+ * so this exercises the production loader rather than a reimplementation. It
+ * optionally preloads one absolute amdhip64_7.dll, then calls coli_cuda_init
+ * and reports which runtime the fake backend actually bound to.
+ *
+ * usage: test_loader_harness.exe <absolute-preload-path|NONE>
+ */
+#include <windows.h>
+#include <tlhelp32.h>
+#include <wchar.h>
+#include <stdio.h>
+#include <string.h>
+#include "backend_cuda.h"
+
+#define RUNTIME_BASENAME L"amdhip64_7.dll"
+#define WBUF 32768
+
+static void emit_path(const char *key, const wchar_t *wide)
+{
+    char utf8[WBUF * 2];
+    int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, (int)sizeof(utf8),
+                                NULL, NULL);
+    printf("%s=%s\n", key, n > 0 ? utf8 : "<unconvertible>");
+}
+
+/* Every loaded module whose basename matches the runtime, by full path.
+ * Toolhelp32 can transiently fail with ERROR_BAD_LENGTH while the module list
+ * changes, so the snapshot is retried a bounded number of times. */
+static int runtime_inventory(const char *prefix)
+{
+    int attempt;
+    for (attempt = 0; attempt < 8; attempt++) {
+        HANDLE snap = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+        MODULEENTRY32W entry;
+        int count = 0;
+        if (snap == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_BAD_LENGTH) continue;
+            printf("%s_count=-1\n", prefix);
+            printf("%s_error=%lu\n", prefix, GetLastError());
+            return -1;
+        }
+        entry.dwSize = sizeof(entry);
+        if (Module32FirstW(snap, &entry)) {
+            do {
+                if (_wcsicmp(entry.szModule, RUNTIME_BASENAME) == 0) {
+                    wchar_t full[WBUF];
+                    char key[128];
+                    DWORD got = GetModuleFileNameW(entry.hModule, full, WBUF);
+                    sprintf(key, "%s_%d", prefix, count);
+                    /* GetModuleFileNameW is preferred; szExePath is MAX_PATH. */
+                    emit_path(key, got ? full : entry.szExePath);
+                    count++;
+                }
+            } while (Module32NextW(snap, &entry));
+        }
+        CloseHandle(snap);
+        printf("%s_count=%d\n", prefix, count);
+        return count;
+    }
+    printf("%s_count=-1\n", prefix);
+    printf("%s_error=retry_exhausted\n", prefix);
+    return -1;
+}
+
+int main(int argc, char **argv)
+{
+    const char *preload = (argc > 1) ? argv[1] : "NONE";
+    int requested = (strcmp(preload, "NONE") != 0);
+    int devices[1];
+    int rc;
+
+    printf("preload_requested=%d\n", requested);
+    runtime_inventory("runtime_before");
+
+    if (requested) {
+        wchar_t wide[WBUF], got[WBUF];
+        HMODULE runtime;
+        int (*marker)(void);
+        MultiByteToWideChar(CP_UTF8, 0, preload, -1, wide, WBUF);
+        /* Absolute path, Unicode API. No PATH edit, no SetDllDirectory, and
+         * the runtime is never copied beside the harness. The handle is held
+         * until the process exits so the module stays resident. */
+        runtime = LoadLibraryExW(wide, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!runtime) {
+            printf("preload_ok=0\n");
+            printf("preload_error=%lu\n", GetLastError());
+            return 4;
+        }
+        printf("preload_ok=1\n");
+        if (GetModuleFileNameW(runtime, got, WBUF)) emit_path("preload_path", got);
+        marker = (int (*)(void))(void *)GetProcAddress(runtime,
+                                                       "coli_test_runtime_marker");
+        if (!marker) { printf("preload_marker_missing=1\n"); return 5; }
+        printf("preload_marker=%d\n", marker());
+    }
+    runtime_inventory("runtime_after_preload");
+
+    devices[0] = 0;
+    rc = coli_cuda_init(devices, 1);          /* the real loader runs here */
+    printf("loader_init=%d\n", rc);
+
+    if (rc) {
+        HMODULE backend = GetModuleHandleW(L"coli_hip.dll");
+        if (backend) {
+            wchar_t bpath[WBUF];
+            int (*bound)(void);
+            if (GetModuleFileNameW(backend, bpath, WBUF))
+                emit_path("backend_path", bpath);
+            /* Test-only accessor, read straight from the loaded fake backend;
+             * production code is not modified to expose it. */
+            bound = (int (*)(void))(void *)GetProcAddress(backend,
+                                                          "coli_test_bound_runtime");
+            if (bound) printf("bound_marker=%d\n", bound());
+            else printf("bound_marker_missing=1\n");
+        } else {
+            printf("backend_handle_missing=1\n");
+        }
+    }
+    runtime_inventory("runtime_after_backend");
+    return 0;
+}
+'''
 
     def _gcc(self, args, what):
         cmd = ["gcc"] + args
@@ -230,9 +361,24 @@ class _StubFixture:
                        "-o", str(self.backend),
                        "-L" + str(implib_a.parent), "-lamdhip64_7"],
                       "building fake coli_hip.dll")
+            self._build_harness()
         except Exception:
             self.cleanup()
             raise
+
+    def _build_harness(self):
+        """Compile the harness together with the repository's backend_loader.c.
+
+        The production source is compiled *in place* from c/, never copied into
+        the fixture, so the harness always exercises the loader at HEAD.
+        """
+        self.harness_src.write_text(self.HARNESS_SOURCE, encoding="ascii")
+        self.harness_cmd = [
+            "-O0", "-DCOLI_CUDA", "-DCOLI_HIP_DLL", "-I" + str(HERE),
+            str(self.harness_src), str(HERE / "backend_loader.c"),
+            "-o", str(self.harness_exe),
+        ]
+        self._gcc(self.harness_cmd, "building the native loader harness")
 
     # --- inspection (objdump only; nothing is ever loaded) -------------
 
@@ -274,8 +420,32 @@ class _StubFixture:
     def generated_paths(self):
         return [self.runtime_a, self.runtime_b, self.backend,
                 self.runtime_a_src, self.runtime_b_src, self.backend_src,
+                self.harness_src, self.harness_exe,
                 self.runtime_a_dir / "libamdhip64_7.a",
                 self.runtime_b_dir / "libamdhip64_7.a"]
+
+    def run_harness(self, case_dir, preload):
+        """Run the harness in its own sandbox, in a separate native process.
+
+        The harness and the fake backend are co-located because the production
+        loader resolves coli_hip.dll beside the executable; the runtimes stay
+        outside that directory so only an explicit preload can bind them. The
+        process exits before the caller inspects the result, so no module
+        handle survives to block TemporaryDirectory cleanup on Windows.
+        """
+        case_dir.mkdir(parents=True, exist_ok=True)
+        exe = case_dir / self.harness_exe.name
+        shutil.copy2(self.harness_exe, exe)
+        shutil.copy2(self.backend, case_dir / self.backend.name)
+        proc = subprocess.run(
+            [str(exe), preload], cwd=str(case_dir), text=True,
+            errors="replace", capture_output=True, timeout=120)
+        fields = {}
+        for line in (proc.stdout or "").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                fields[key.strip()] = value.strip()
+        return proc, fields
 
     def cleanup(self):
         self._tmp.cleanup()
@@ -392,6 +562,26 @@ class LoaderStubFixtureTest(unittest.TestCase):
                     dll.startswith(_ALLOWED_IMPORT_PREFIXES),
                     "%s has an unexpected import: %s" % (path.name, dll))
 
+    def test_harness_is_built_from_the_repository_loader_source(self):
+        """The harness links c/backend_loader.c in place, never a copy."""
+        f = self.fixture
+        self.assertTrue(f.harness_exe.is_file(), f.harness_exe)
+        self.assertEqual(f.architecture(f.harness_exe), "i386:x86-64")
+        cmd = " ".join(f.harness_cmd)
+        self.assertIn(str(HERE / "backend_loader.c"), cmd)
+        self.assertIn("-DCOLI_CUDA", cmd)
+        self.assertIn("-DCOLI_HIP_DLL", cmd)
+        # A copied loader would let the test drift from production.
+        copies = list(f.root.rglob("backend_loader.c"))
+        self.assertEqual(copies, [], "loader source copied into the fixture: %s" % copies)
+
+    def test_harness_imports_no_gpu_runtime(self):
+        """The harness itself binds nothing vendor-specific."""
+        f = self.fixture
+        for dll in f.imported_dlls(f.harness_exe):
+            self.assertFalse(any(bad in dll for bad in _FORBIDDEN_IMPORT_MARKERS),
+                             "harness imports a real GPU component: %s" % dll)
+
     def test_fixture_root_contains_a_space_and_avoids_the_repo(self):
         """Quoting bugs must surface here, not on a user's Program Files install."""
         f = self.fixture
@@ -422,6 +612,138 @@ class LoaderStubFixtureCleanupTest(unittest.TestCase):
         # The repository must be untouched by a fixture that never targets it.
         self.assertFalse((HERE / "coli_hip.dll").exists())
         self.assertFalse((HERE / _RUNTIME_BASENAME).exists())
+
+
+class LoaderRuntimeBindingTest(unittest.TestCase):
+    """Which amdhip64_7.dll does the real loader end up bound to?
+
+    Every case runs the native harness — which links c/backend_loader.c
+    unmodified — in its own process and its own executable-directory sandbox.
+    The stub DLLs are never loaded into this Python process, and each
+    subprocess has exited before cleanup runs.
+    """
+
+    fixture = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.fixture = _StubFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.fixture is not None:
+            cls.fixture.cleanup()
+            cls.fixture = None
+
+    def setUp(self):
+        self.cases = tempfile.TemporaryDirectory(prefix="coli loader case ")
+        self.addCleanup(self.cases.cleanup)
+
+    @staticmethod
+    def _same_path(a, b):
+        return os.path.normcase(os.path.normpath(a)) == \
+               os.path.normcase(os.path.normpath(b))
+
+    def _assert_bound_to(self, name, runtime, marker, other):
+        f = self.fixture
+        case = Path(self.cases.name) / name
+        proc, out = f.run_harness(case, str(runtime))
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+
+        self.assertEqual(proc.returncode, 0, "harness failed" + detail)
+        self.assertEqual(out.get("preload_requested"), "1", detail)
+        self.assertEqual(out.get("preload_ok"), "1", detail)
+        self.assertEqual(out.get("preload_marker"), str(marker), detail)
+        self.assertTrue(self._same_path(out["preload_path"], str(runtime)), detail)
+
+        self.assertEqual(out.get("loader_init"), "1", "loader init failed" + detail)
+        self.assertTrue(self._same_path(out["backend_path"],
+                                        str(case / f.backend.name)), detail)
+        self.assertEqual(out.get("bound_marker"), str(marker),
+                         "bound the wrong runtime" + detail)
+
+        self.assertEqual(out.get("runtime_after_preload_count"), "1", detail)
+        self.assertEqual(out.get("runtime_after_backend_count"), "1", detail)
+        loaded = out["runtime_after_backend_0"]
+        self.assertTrue(self._same_path(loaded, str(runtime)), detail)
+        self.assertFalse(self._same_path(loaded, str(other)),
+                         "the other runtime was bound" + detail)
+        return out
+
+    def test_preloaded_runtime_a_is_the_one_bound(self):
+        """Preload A -> the backend's import resolves to A (0xA1)."""
+        f = self.fixture
+        out = self._assert_bound_to("case_a", f.runtime_a,
+                                    _RUNTIME_MARKER_A, f.runtime_b)
+        self.assertEqual(out.get("runtime_before_count"), "0")
+
+    def test_preloaded_runtime_b_wins_over_the_linked_runtime(self):
+        """Preload B -> B is bound, although the backend was linked against A.
+
+        The fake backend imports amdhip64_7.dll by basename and was linked
+        against runtime A's import library, yet the already-loaded same-basename
+        runtime B satisfies that import. Same-process preload therefore decides
+        the binding, which is exactly why a wrong preloaded runtime has to be
+        detected before production loading proceeds.
+        """
+        f = self.fixture
+        out = self._assert_bound_to("case_b", f.runtime_b,
+                                    _RUNTIME_MARKER_B, f.runtime_a)
+        self.assertEqual(out.get("runtime_before_count"), "0")
+
+    def test_ambient_no_preload_is_classified_not_assumed(self):
+        """With no preload the outcome is environment-dependent; classify it.
+
+        This deliberately asserts no particular ambient winner: whether a
+        machine-wide amdhip64_7.dll exists, and whether the loader reaches it,
+        varies by host. The contract here is that the harness stays honest —
+        it runs, its inventory parses, and neither controlled runtime was
+        preloaded.
+        """
+        f = self.fixture
+        case = Path(self.cases.name) / "case_ambient"
+        proc, out = f.run_harness(case, "NONE")
+        detail = "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+
+        self.assertEqual(proc.returncode, 0, "harness crashed" + detail)
+        self.assertEqual(out.get("preload_requested"), "0", detail)
+        self.assertNotIn("preload_marker", out, detail)
+        for key in ("runtime_before_count", "runtime_after_preload_count",
+                    "loader_init", "runtime_after_backend_count"):
+            self.assertIn(key, out, "unparseable harness output" + detail)
+            if key.endswith("_count"):
+                self.assertGreaterEqual(int(out[key]), 0, detail)
+
+        init = out["loader_init"]
+        self.assertIn(init, ("0", "1"), detail)
+        if init == "1":
+            # Succeeded: something satisfied the import, and it must not be a
+            # controlled runtime, because none was preloaded.
+            self.assertIn("bound_marker", out, detail)
+            for key in out:
+                if key.startswith("runtime_after_backend_") and key[-1].isdigit():
+                    self.assertFalse(self._same_path(out[key], str(f.runtime_a)), detail)
+                    self.assertFalse(self._same_path(out[key], str(f.runtime_b)), detail)
+        else:
+            # Failed: backend_loader.c's own diagnostic is preserved, and no
+            # claim is made about which transient module was rejected — it is
+            # no longer loaded, so its path cannot be proven.
+            self.assertIn("coli_hip.dll", proc.stderr or "", detail)
+            self.assertNotIn("backend_path", out, detail)
+
+    def test_ambient_environment_is_recorded_without_inference(self):
+        """Record whether a machine-wide runtime exists; prove nothing from it."""
+        system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        candidate = system32 / _RUNTIME_BASENAME
+        exists = candidate.is_file()
+        size = candidate.stat().st_size if exists else 0
+        # Existence is an environmental fact, never evidence of binding.
+        self.assertIsInstance(exists, bool)
+        if exists:
+            self.assertGreater(size, 0)
 
 
 class LoaderBackendSelectionTest(unittest.TestCase):
