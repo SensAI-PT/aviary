@@ -1529,6 +1529,11 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T) {
+    /* Before the sentinel: on Windows a TEXT-mode stdout rewrites the trailing \n
+     * as \r\n, the gateway never matches it and waits forever (#748). Lives in
+     * compat.h because colibri.c has had it since #195 and this engine was
+     * written without it. */
+    coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
