@@ -400,8 +400,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk pl
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
-./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
-./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
+./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
+./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
@@ -424,9 +424,9 @@ COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
 COLI_MODEL=/nvme/inkling_i4    ./coli chat
 COLI_MODEL=/nvme/kimi_k3       ./coli chat
 
-./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/inkling_i4               # API + dashboard, opens a browser
 ./coli web --model /nvme/kimi_k3
-./coli serve --model /nvme/inkling_i4             # API only
+./coli serve --model /nvme/inkling_i4             # API + dashboard, no browser
 ```
 
 For the non-GLM engines `coli chat` starts the gateway locally and attaches the
