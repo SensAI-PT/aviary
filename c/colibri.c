@@ -8729,6 +8729,16 @@ static int coli_resolve_cap(int cli_given, int cli, int env, int platform_fast, 
     return cli_given ? 8 : 64;   /* sentinel 0 -> coli's historic 8; bare ./glm -> historic 64 */
 }
 
+/* Una variabile di STATO e' attiva se e' impostata E non vale 0/false/off/no.
+ * Volutamente diverso dai kill-switch, che restano presence-based. */
+static int coli_env_on(const char *name)
+{
+    const char *v = getenv(name);
+    if(!v || !*v) return 0;
+    return !(strcmp(v,"0")==0 || strcmp(v,"false")==0 ||
+             strcmp(v,"off")==0 || strcmp(v,"no")==0);
+}
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -8749,8 +8759,18 @@ int main(int argc, char **argv){
      * re-exec + tuning path (distinct from the internal COLI_OMP_TUNED sentinel).
      *
      * Must remain the FIRST statement in main(): argv is passed verbatim to execv(). */
+    /* COLI_OMP_TUNED e COLI_NO_OMP_TUNE sono KILL-SWITCH: presence-based e' voluto
+     * (c/coli lo documenta: "impostarla a qualsiasi valore, anche 0, disattiva").
+     * COLI_CUDA e COLI_METAL invece sono STATO, e uno 0 significa "niente GPU":
+     * testarne la presenza faceva saltare il tuning proprio a chi la GPU non ce
+     * l'ha. Ed e' raggiungibile, non teorico -- `coli` stesso scrive
+     * e["COLI_CUDA"]="0" (c/coli:281 e :360) quando il piano non usa CUDA, quindi
+     * su un host Linux CPU-only un `coli run --auto-tier --gpu none` documentato
+     * perdeva silenziosamente il tuning che un `./colibri` nudo riceve. Grazie a
+     * @fredchu per averlo letto nel sorgente e detto chiaramente di non averlo
+     * misurato (#707). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
-       !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
+       !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
         /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
