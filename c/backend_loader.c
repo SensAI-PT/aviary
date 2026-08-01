@@ -26,6 +26,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include "backend_cuda.h"
 
@@ -398,6 +399,565 @@ static void coli_win_error_phrase(DWORD code, char *buf, size_t n){
     if(text) snprintf(buf, n, "Windows error %lu (%s)", (unsigned long)code, text);
     else     snprintf(buf, n, "Windows loader error %lu", (unsigned long)code);
 }
+
+/* ===================== Windows runtime identity and inventory =============
+ *
+ * Foundation for deterministic HIP runtime binding. NOTHING HERE IS CALLED BY
+ * THE LOADER YET: this slice adds the machinery and proves it, and a later one
+ * wires it in. Keeping the two apart means the change that alters what the
+ * process loads can be reviewed — and reverted — on its own.
+ *
+ * Three measured Windows facts shape all of it:
+ *
+ *   1. Two modules with the same base name, loaded from different absolute
+ *      paths, really do coexist in one process, with distinct HMODULEs.
+ *   2. GetModuleHandleExW asked for a BASE NAME returns only the first of them
+ *      and silently hides the rest, so it cannot answer "what is loaded".
+ *   3. Two different path strings can name one physical file (hard links, dot
+ *      segments, case), and one path string can be re-pointed at a different
+ *      file by a rename even while the old one is mapped.
+ *
+ * So: enumerate every match rather than ask for one, and decide equality on
+ * physical file identity rather than on path text. Paths are kept only to tell
+ * a human which file we meant.
+ *
+ * These functions have external linkage but appear in no header, are never
+ * exported, and live in backend_loader.o, which links into the host executable
+ * only — coli_hip.dll and coli_cuda.dll are built from backend_cuda.cu and
+ * never see this file. External linkage rather than `static` is deliberate:
+ * unused static functions would warn, and the warning would be noise rather
+ * than a finding while the wiring is still a slice away. */
+
+#define COLI_W32_RUNTIME_BASENAME L"amdhip64_7.dll"
+#define COLI_W32_PATH_START  512u   /* wchar_t; grows, never a correctness bound */
+#define COLI_W32_PATH_ROUNDS 8      /* 512 -> 65536 wchar_t before giving up */
+
+int coli_win32_loader_is_sep(wchar_t c){ return c == L'\\' || c == L'/'; }
+
+/* --- physical file identity ------------------------------------------
+ *
+ * Two representations, because the newer one is not always obtainable.
+ * FILE_ID_INFO carries a 128-bit ID that stays unique on ReFS;
+ * BY_HANDLE_FILE_INFORMATION carries the classic 64-bit index. Both are
+ * captured when available so a later comparison can pick a format the two
+ * sides genuinely share — see coli_win32_loader_identity_equal. */
+typedef struct {
+    int         have_id_info;
+    int         have_by_handle;
+    DWORD       error;            /* why nothing could be captured */
+    ULONGLONG   idi_volume;
+    FILE_ID_128 idi_id;
+    DWORD       bh_volume;
+    DWORD       bh_index_high;
+    DWORD       bh_index_low;
+} ColiW32FileId;
+
+int coli_win32_loader_identity_valid(const ColiW32FileId *id){
+    return id && (id->have_id_info || id->have_by_handle);
+}
+
+/* 1 = the same physical file, 0 = different files, -1 = cannot be determined.
+ *
+ * The fallback is SYMMETRIC: if either side is missing FILE_ID_INFO, BOTH
+ * sides drop to the by-handle index. A 128-bit ID is never compared against a
+ * 64-bit index, because they are different namespaces and a coincidental match
+ * would be indistinguishable from a real one. When no shared format exists the
+ * answer is "unknown" — never a text comparison, which would reject hard links
+ * to the very file that was configured. */
+int coli_win32_loader_identity_equal(const ColiW32FileId *a, const ColiW32FileId *b){
+    if(!a || !b) return -1;
+    if(a->have_id_info && b->have_id_info)
+        return (a->idi_volume == b->idi_volume &&
+                memcmp(&a->idi_id, &b->idi_id, sizeof a->idi_id) == 0) ? 1 : 0;
+    if(a->have_by_handle && b->have_by_handle)
+        return (a->bh_volume     == b->bh_volume &&
+                a->bh_index_high == b->bh_index_high &&
+                a->bh_index_low  == b->bh_index_low) ? 1 : 0;
+    return -1;
+}
+
+/* --- growing-buffer Unicode paths ------------------------------------
+ *
+ * Every one of these returns a malloc'd, NUL-terminated wide string the caller
+ * frees, or NULL with *err set. None of them treats MAX_PATH as a limit. */
+
+static int coli_w32_grow_ok(size_t cap){
+    return cap <= ((size_t)-1) / sizeof(wchar_t) / 2;
+}
+
+/* Path of a loaded module, or of the running executable when mod is NULL.
+ * GetModuleFileNameW signals truncation by returning the buffer size AND
+ * setting ERROR_INSUFFICIENT_BUFFER; the length alone cannot be trusted,
+ * which is why the error code is cleared first and then consulted. */
+wchar_t *coli_win32_loader_module_path(HMODULE mod, DWORD *err){
+    size_t cap = COLI_W32_PATH_START;
+    int round;
+    if(err) *err = 0;
+    for(round = 0; round < COLI_W32_PATH_ROUNDS; round++){
+        wchar_t *buf;
+        DWORD n;
+        if(!coli_w32_grow_ok(cap)){ if(err) *err = ERROR_ARITHMETIC_OVERFLOW; return NULL; }
+        buf = (wchar_t *)malloc(cap * sizeof(wchar_t));
+        if(!buf){ if(err) *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+        SetLastError(ERROR_SUCCESS);
+        n = GetModuleFileNameW(mod, buf, (DWORD)cap);
+        if(n == 0){
+            DWORD e = GetLastError();
+            free(buf);
+            if(err) *err = e;
+            return NULL;
+        }
+        if((size_t)n < cap && GetLastError() != ERROR_INSUFFICIENT_BUFFER){
+            buf[n] = L'\0';
+            return buf;
+        }
+        free(buf);
+        cap *= 2;
+    }
+    if(err) *err = ERROR_INSUFFICIENT_BUFFER;
+    return NULL;
+}
+
+wchar_t *coli_win32_loader_exe_path(DWORD *err){
+    return coli_win32_loader_module_path(NULL, err);
+}
+
+/* Canonical path behind an open handle, for DIAGNOSTICS ONLY. It resolves
+ * case, dot segments, symlinks and junctions — but NOT hard links, which keep
+ * their own names. That is exactly why equality is decided on file identity
+ * and this string is only ever shown to a human. The VOLUME_NAME_DOS form is
+ * returned as Windows gives it, including any \\?\ prefix: stripping that
+ * prefix can change how a path is interpreted, so it is left intact. */
+wchar_t *coli_win32_loader_final_path(HANDLE handle, DWORD *err){
+    size_t cap = COLI_W32_PATH_START;
+    int round;
+    if(err) *err = 0;
+    for(round = 0; round < COLI_W32_PATH_ROUNDS; round++){
+        wchar_t *buf;
+        DWORD n;
+        if(!coli_w32_grow_ok(cap)){ if(err) *err = ERROR_ARITHMETIC_OVERFLOW; return NULL; }
+        buf = (wchar_t *)malloc(cap * sizeof(wchar_t));
+        if(!buf){ if(err) *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+        SetLastError(ERROR_SUCCESS);
+        n = GetFinalPathNameByHandleW(handle, buf, (DWORD)cap,
+                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if(n == 0){
+            DWORD e = GetLastError();
+            free(buf);
+            if(err) *err = e;
+            return NULL;
+        }
+        if((size_t)n < cap){ buf[n] = L'\0'; return buf; }
+        free(buf);
+        /* n is the required size INCLUDING the terminator when it did not fit. */
+        cap = (size_t)n + 1;
+    }
+    if(err) *err = ERROR_INSUFFICIENT_BUFFER;
+    return NULL;
+}
+
+/* <dir> + one separator + <child>. Purely textual: nothing is resolved,
+ * expanded or searched for. A value already ending in a separator does not
+ * gain a second one, because "C:\x\\y" reads as a UNC root. */
+wchar_t *coli_win32_loader_join(const wchar_t *dir, const wchar_t *child, DWORD *err){
+    size_t dl, cl, need;
+    int sep;
+    wchar_t *out;
+    if(err) *err = 0;
+    if(!dir || !child || !dir[0]){ if(err) *err = ERROR_INVALID_PARAMETER; return NULL; }
+    dl = wcslen(dir);
+    cl = wcslen(child);
+    sep = !coli_win32_loader_is_sep(dir[dl - 1]);
+    if(cl > ((size_t)-1) - dl - 2){ if(err) *err = ERROR_ARITHMETIC_OVERFLOW; return NULL; }
+    need = dl + (size_t)(sep ? 1 : 0) + cl + 1;
+    if(need > ((size_t)-1) / sizeof(wchar_t)){ if(err) *err = ERROR_ARITHMETIC_OVERFLOW; return NULL; }
+    out = (wchar_t *)malloc(need * sizeof(wchar_t));
+    if(!out){ if(err) *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+    wcscpy(out, dir);
+    if(sep) wcscat(out, L"\\");
+    wcscat(out, child);
+    return out;
+}
+
+/* One open, both answers. Zero requested access means "query metadata": it
+ * needs no read permission and cannot disturb a mapped module. Full sharing
+ * means the probe never blocks anyone else, and FILE_FLAG_BACKUP_SEMANTICS
+ * lets the same call work if the target turns out to be a directory. */
+int coli_win32_loader_probe(const wchar_t *path, ColiW32FileId *id,
+                            wchar_t **final_path, DWORD *err){
+    HANDLE h;
+    FILE_ID_INFO fii;
+    BY_HANDLE_FILE_INFORMATION bhi;
+    if(final_path) *final_path = NULL;
+    if(err) *err = 0;
+    if(!id) return 0;
+    memset(id, 0, sizeof *id);
+    if(!path){ id->error = ERROR_INVALID_PARAMETER; if(err) *err = id->error; return 0; }
+
+    h = CreateFileW(path, 0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if(h == INVALID_HANDLE_VALUE){
+        id->error = GetLastError();
+        if(err) *err = id->error;
+        return 0;
+    }
+    if(GetFileInformationByHandleEx(h, FileIdInfo, &fii, (DWORD)sizeof fii)){
+        id->have_id_info = 1;
+        id->idi_volume   = fii.VolumeSerialNumber;
+        id->idi_id       = fii.FileId;
+    }
+    if(GetFileInformationByHandle(h, &bhi)){
+        id->have_by_handle  = 1;
+        id->bh_volume       = bhi.dwVolumeSerialNumber;
+        id->bh_index_high   = bhi.nFileIndexHigh;
+        id->bh_index_low    = bhi.nFileIndexLow;
+    }
+    if(!coli_win32_loader_identity_valid(id)){
+        id->error = GetLastError();
+        if(err) *err = id->error;
+        CloseHandle(h);
+        return 0;
+    }
+    if(final_path) *final_path = coli_win32_loader_final_path(h, NULL);
+    CloseHandle(h);
+    return 1;
+}
+
+/* --- inventory of every loaded module with a given base name ---------- */
+
+enum {
+    COLI_W32_INV_OK = 0,
+    COLI_W32_INV_SNAPSHOT_FAILED,
+    COLI_W32_INV_ENUM_FAILED,
+    COLI_W32_INV_ALLOC_FAILED,
+    COLI_W32_INV_PATH_FAILED,
+    COLI_W32_INV_IDENTITY_FAILED
+};
+
+typedef struct {
+    HMODULE       module;
+    wchar_t      *path;        /* authoritative, from GetModuleFileNameW */
+    wchar_t      *final_path;  /* canonical, diagnostics only, may be NULL */
+    wchar_t      *entry_path;  /* MODULEENTRY32W.szExePath, MAX_PATH, fallback */
+    ColiW32FileId id;
+} ColiW32Module;
+
+typedef struct {
+    int            status;
+    DWORD          error;
+    size_t         count;
+    ColiW32Module *items;
+} ColiW32Inventory;
+
+void coli_win32_loader_inventory_free(ColiW32Inventory *inv){
+    size_t i;
+    if(!inv) return;
+    for(i = 0; i < inv->count; i++){
+        free(inv->items[i].path);
+        free(inv->items[i].final_path);
+        free(inv->items[i].entry_path);
+    }
+    free(inv->items);
+    inv->items = NULL;
+    inv->count = 0;
+}
+
+static wchar_t *coli_w32_wdup(const wchar_t *s){
+    size_t n;
+    wchar_t *o;
+    if(!s) return NULL;
+    n = wcslen(s) + 1;
+    o = (wchar_t *)malloc(n * sizeof(wchar_t));
+    if(o) memcpy(o, s, n * sizeof(wchar_t));
+    return o;
+}
+
+/* Enumerate, do not ask. A failed or partial enumeration is reported as such:
+ * it must never be mistaken for "nothing is loaded", because the two lead to
+ * opposite decisions. Reference counts are untouched — the HMODULEs recorded
+ * here are observations, not owned references. */
+int coli_win32_loader_inventory(const wchar_t *basename, ColiW32Inventory *out){
+    int attempt;
+    if(!out) return COLI_W32_INV_ALLOC_FAILED;
+    memset(out, 0, sizeof *out);
+    if(!basename){ out->status = COLI_W32_INV_ENUM_FAILED; out->error = ERROR_INVALID_PARAMETER; return out->status; }
+
+    for(attempt = 0; attempt < 8; attempt++){
+        HANDLE snap;
+        MODULEENTRY32W entry;
+        BOOL more;
+
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                        GetCurrentProcessId());
+        if(snap == INVALID_HANDLE_VALUE){
+            DWORD e = GetLastError();
+            /* The module list changed underneath the snapshot; that is normal
+             * and transient, so retry rather than report a failure. */
+            if(e == ERROR_BAD_LENGTH) continue;
+            out->status = COLI_W32_INV_SNAPSHOT_FAILED;
+            out->error  = e;
+            return out->status;
+        }
+
+        memset(&entry, 0, sizeof entry);
+        entry.dwSize = sizeof entry;
+        more = Module32FirstW(snap, &entry);
+        if(!more){
+            DWORD e = GetLastError();
+            CloseHandle(snap);
+            if(e == ERROR_BAD_LENGTH) continue;
+            out->status = COLI_W32_INV_ENUM_FAILED;
+            out->error  = e;
+            return out->status;
+        }
+        do {
+            ColiW32Module *grown, item;
+            DWORD err = 0;
+            if(_wcsicmp(entry.szModule, basename) != 0) continue;
+
+            memset(&item, 0, sizeof item);
+            item.module     = entry.hModule;
+            item.entry_path = coli_w32_wdup(entry.szExePath);
+            item.path       = coli_win32_loader_module_path(entry.hModule, &err);
+            if(!item.path){
+                free(item.entry_path);
+                CloseHandle(snap);
+                coli_win32_loader_inventory_free(out);
+                out->status = COLI_W32_INV_PATH_FAILED;
+                out->error  = err;
+                return out->status;
+            }
+            if(!coli_win32_loader_probe(item.path, &item.id, &item.final_path, &err)){
+                free(item.entry_path);
+                free(item.path);
+                CloseHandle(snap);
+                coli_win32_loader_inventory_free(out);
+                out->status = COLI_W32_INV_IDENTITY_FAILED;
+                out->error  = err;
+                return out->status;
+            }
+            grown = (ColiW32Module *)realloc(out->items,
+                                             (out->count + 1) * sizeof *out->items);
+            if(!grown){
+                free(item.entry_path);
+                free(item.path);
+                free(item.final_path);
+                CloseHandle(snap);
+                coli_win32_loader_inventory_free(out);
+                out->status = COLI_W32_INV_ALLOC_FAILED;
+                out->error  = ERROR_NOT_ENOUGH_MEMORY;
+                return out->status;
+            }
+            out->items = grown;
+            out->items[out->count++] = item;
+        } while(Module32NextW(snap, &entry));
+
+        CloseHandle(snap);
+        out->status = COLI_W32_INV_OK;
+        out->error  = 0;
+        return out->status;
+    }
+    out->status = COLI_W32_INV_SNAPSHOT_FAILED;
+    out->error  = ERROR_BAD_LENGTH;
+    return out->status;
+}
+
+/* --- the decision ----------------------------------------------------
+ *
+ * Deliberately pure: no Windows call, no allocation, no global state, nothing
+ * loaded. It takes the comparison results rather than the identities so that
+ * every branch — including the ones the filesystem will not produce on demand
+ * — can be driven directly from a test. */
+enum {
+    COLI_BIND_NEED_EXACT_LOAD = 0,
+    COLI_BIND_REUSE_EXACT_MATCH,
+    COLI_BIND_REJECT_WRONG_RUNTIME,
+    COLI_BIND_REJECT_MULTIPLE_RUNTIMES,
+    COLI_BIND_REJECT_UNVERIFIABLE
+};
+
+int coli_win32_loader_decide(int configured_valid, int inventory_status,
+                             size_t count, const int *match_equality){
+    if(!configured_valid)                    return COLI_BIND_REJECT_UNVERIFIABLE;
+    if(inventory_status != COLI_W32_INV_OK)  return COLI_BIND_REJECT_UNVERIFIABLE;
+    if(count == 0)                           return COLI_BIND_NEED_EXACT_LOAD;
+    /* More than one same-basename runtime is refused even when one of them is
+     * the configured file: which one an import binds to is decided by load
+     * order, not by us, so the situation is not something to pick a winner in. */
+    if(count > 1)                            return COLI_BIND_REJECT_MULTIPLE_RUNTIMES;
+    if(!match_equality)                      return COLI_BIND_REJECT_UNVERIFIABLE;
+    if(match_equality[0] == 1)               return COLI_BIND_REUSE_EXACT_MATCH;
+    if(match_equality[0] == 0)               return COLI_BIND_REJECT_WRONG_RUNTIME;
+    return COLI_BIND_REJECT_UNVERIFIABLE;    /* identity unknown -> refuse */
+}
+
+/* --- the configured runtime, as a short-lived fact -------------------
+ *
+ * Only what this slice can honestly establish: where the runtime is, what file
+ * that is, and how to name it in a message. No module handle, no ownership
+ * flag, no verification state — those become real when something is actually
+ * loaded, and inventing them now would mean carrying fields that no code can
+ * yet set correctly. */
+typedef struct {
+    wchar_t      *path;
+    wchar_t      *final_path;
+    ColiW32FileId id;
+    int           valid;
+    DWORD         error;
+} ColiW32ConfiguredRuntime;
+
+/* Idempotent, and safe on a zero-initialised object. */
+void coli_win32_loader_configured_free(ColiW32ConfiguredRuntime *cr){
+    if(!cr) return;
+    free(cr->path);
+    free(cr->final_path);
+    cr->path = NULL;
+    cr->final_path = NULL;
+    cr->valid = 0;
+}
+
+int coli_win32_loader_configured(const wchar_t *dir, ColiW32ConfiguredRuntime *out){
+    DWORD err = 0;
+    if(!out) return 0;
+    memset(out, 0, sizeof *out);
+    out->path = coli_win32_loader_join(dir, COLI_W32_RUNTIME_BASENAME, &err);
+    if(!out->path){ out->error = err; return 0; }
+    if(!coli_win32_loader_probe(out->path, &out->id, &out->final_path, &err)){
+        out->error = err;
+        return 0;   /* path retained for diagnostics; free() is the caller's */
+    }
+    out->valid = 1;
+    return 1;
+}
+
+#ifdef COLI_LOADER_TEST_API
+/* ---- Test-only surface (never compiled into the shipped host) --------
+ *
+ * The loader tests run the REAL functions above by compiling this file into a
+ * native harness with COLI_LOADER_TEST_API defined. Only that build has these
+ * symbols; the normal host build contains none of them.
+ *
+ * Everything is passed by value or through caller-owned buffers on purpose:
+ * no internal pointer, no struct layout and no mutable global escapes, so the
+ * test surface cannot become a back door into loader state. */
+
+static int coli_w32_test_utf8(const wchar_t *w, char *out, size_t cap){
+    if(!out || cap == 0) return 0;
+    out[0] = '\0';
+    if(!w) return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) > 0;
+}
+
+/* 1 same file, 0 different, -1 undeterminable — the production contract. */
+int coli_loader_test_same_file(const wchar_t *a, const wchar_t *b){
+    ColiW32FileId ia, ib;
+    coli_win32_loader_probe(a, &ia, NULL, NULL);
+    coli_win32_loader_probe(b, &ib, NULL, NULL);
+    return coli_win32_loader_identity_equal(&ia, &ib);
+}
+
+/* Drives the symmetric fallback directly: the caller says which
+ * representations each side has, so the mixed case can be exercised without
+ * needing a filesystem on which one API fails. */
+int coli_loader_test_identity_equal_synthetic(int a_idi, int a_bh, int b_idi, int b_bh,
+                                              int same_idi, int same_bh){
+    ColiW32FileId a, b;
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    a.have_id_info = a_idi; a.have_by_handle = a_bh;
+    b.have_id_info = b_idi; b.have_by_handle = b_bh;
+    a.idi_volume = 1; b.idi_volume = same_idi ? 1 : 2;
+    a.bh_volume  = 1; b.bh_volume  = same_bh  ? 1 : 2;
+    return coli_win32_loader_identity_equal(&a, &b);
+}
+
+int coli_loader_test_final_path(const wchar_t *path, char *out, size_t cap){
+    ColiW32FileId id;
+    wchar_t *final_path = NULL;
+    int ok;
+    if(!coli_win32_loader_probe(path, &id, &final_path, NULL)) return 0;
+    ok = coli_w32_test_utf8(final_path, out, cap);
+    free(final_path);
+    return ok;
+}
+
+int coli_loader_test_join(const wchar_t *dir, const wchar_t *child, char *out, size_t cap){
+    DWORD err = 0;
+    wchar_t *joined = coli_win32_loader_join(dir, child, &err);
+    int ok;
+    if(!joined) return 0;
+    ok = coli_w32_test_utf8(joined, out, cap);
+    free(joined);
+    return ok;
+}
+
+int coli_loader_test_exe_path(char *out, size_t cap){
+    DWORD err = 0;
+    wchar_t *p = coli_win32_loader_exe_path(&err);
+    int ok;
+    if(!p) return 0;
+    ok = coli_w32_test_utf8(p, out, cap);
+    free(p);
+    return ok;
+}
+
+int coli_loader_test_decide(int configured_valid, int inventory_status,
+                            int count, const int *match_equality){
+    return coli_win32_loader_decide(configured_valid, inventory_status,
+                                    (size_t)count, match_equality);
+}
+
+int coli_loader_test_configured(const wchar_t *dir, char *path_out, size_t path_cap,
+                                char *final_out, size_t final_cap, unsigned long *error){
+    ColiW32ConfiguredRuntime cr;
+    int valid;
+    int ok = coli_win32_loader_configured(dir, &cr);
+    coli_w32_test_utf8(cr.path, path_out, path_cap);
+    coli_w32_test_utf8(cr.final_path, final_out, final_cap);
+    if(error) *error = cr.error;
+    valid = cr.valid;
+    coli_win32_loader_configured_free(&cr);
+    coli_win32_loader_configured_free(&cr);   /* proves the free is idempotent */
+    (void)ok;
+    return valid;
+}
+
+/* One inventory pass, flattened into caller-owned slots. *count is the true
+ * match count even when it exceeds max_items, so a test can never mistake a
+ * truncated report for a smaller inventory. */
+int coli_loader_test_inventory(const wchar_t *configured_path,
+                               int *status, unsigned long *error, int *count,
+                               int max_items, int slot,
+                               char *paths, char *finals,
+                               unsigned long long *modules, int *equal_to_configured){
+    ColiW32Inventory inv;
+    ColiW32FileId configured;
+    int have_configured = 0;
+    size_t i;
+
+    memset(&configured, 0, sizeof configured);
+    if(configured_path)
+        have_configured = coli_win32_loader_probe(configured_path, &configured, NULL, NULL);
+
+    coli_win32_loader_inventory(COLI_W32_RUNTIME_BASENAME, &inv);
+    if(status) *status = inv.status;
+    if(error)  *error  = inv.error;
+    if(count)  *count  = (int)inv.count;
+
+    for(i = 0; i < inv.count && (int)i < max_items; i++){
+        if(paths)  coli_w32_test_utf8(inv.items[i].path,       paths  + (size_t)slot * i, (size_t)slot);
+        if(finals) coli_w32_test_utf8(inv.items[i].final_path, finals + (size_t)slot * i, (size_t)slot);
+        if(modules) modules[i] = (unsigned long long)(uintptr_t)inv.items[i].module;
+        if(equal_to_configured)
+            equal_to_configured[i] = have_configured
+                ? coli_win32_loader_identity_equal(&configured, &inv.items[i].id)
+                : -1;
+    }
+    coli_win32_loader_inventory_free(&inv);
+    return inv.status;
+}
+#endif /* COLI_LOADER_TEST_API */
 
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
