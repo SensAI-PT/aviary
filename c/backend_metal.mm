@@ -200,13 +200,23 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
         acc += (dot(m0*sA,xs[l*2]) + dot(m1*sB,xs[l*2+1])) * (0.5f*db);
       }
     }
+  } else if (fmt == 5) {                            // bf16 raw rows: no scales, upper half of f32
+    device const ushort* w=(device const ushort*)(waddr[e])+(long)o*K;
+    device const ushort4* w4=(device const ushort4*)w;
+    for(int c=slane;c<K8;c+=32){ ushort4 a=w4[2*c], b=w4[2*c+1];
+      float4 w0=float4(as_type<float>(uint(a.x)<<16), as_type<float>(uint(a.y)<<16),
+                       as_type<float>(uint(a.z)<<16), as_type<float>(uint(a.w)<<16));
+      float4 w1=float4(as_type<float>(uint(b.x)<<16), as_type<float>(uint(b.y)<<16),
+                       as_type<float>(uint(b.z)<<16), as_type<float>(uint(b.w)<<16));
+      acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
+    for(int i=K8*8+slane;i<K;i+=32) acc += as_type<float>(uint(w[i])<<16)*xr[i];
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==6) ? acc : acc*sc[o];   // fmt=6: scales live in-block
+  if(slane==0) yout[row] = (fmt==6||fmt==5) ? acc : acc*sc[o];   // fmt 6: in-block scales; fmt 5: none
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -1143,7 +1153,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 6)) return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;

@@ -795,6 +795,28 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             LDW(sh_g, "mlp.shared_experts.gate_proj");
             LDW(sh_u, "mlp.shared_experts.up_proj");
             LDW(sh_d, "mlp.shared_experts.down_proj");
+#ifdef COLI_METAL
+            /* Move the bf16 shared-expert weights into one page-aligned slab
+             * (gates, then ups, then downs) and repoint the Wt handles into
+             * it: the CPU path reads the same bytes it always did, and the
+             * slab registers once so the GPU fmt=5 path can resolve it. */
+            if (g_metal && l->sh_g.h && l->sh_u.h && l->sh_d.h) {
+                int64_t I = c->moe_inter, ns = c->n_shared;
+                size_t one = (size_t)ns*I*D*2, pg = 16384;
+                size_t len = (3*one + pg - 1) / pg * pg;
+                void *sl = NULL;
+                if (!posix_memalign(&sl, pg, len)) {
+                    memcpy((char*)sl,           l->sh_g.h, one);
+                    memcpy((char*)sl + one,     l->sh_u.h, one);
+                    memcpy((char*)sl + 2*one,   l->sh_d.h, one);
+                    free(l->sh_g.h); free(l->sh_u.h); free(l->sh_d.h);
+                    l->sh_g.h = (uint16_t*)sl;
+                    l->sh_u.h = (uint16_t*)((char*)sl + one);
+                    l->sh_d.h = (uint16_t*)((char*)sl + 2*one);
+                    coli_metal_register(sl, len);
+                }
+            }
+#endif
         }
         #undef LD
         #undef LDW
@@ -1245,6 +1267,39 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         mxoff = malloc((cap+1)*sizeof(int)); mnr = malloc(cap*sizeof(int));
         mrows = malloc(cap*sizeof(int)); mgi = malloc(cap*sizeof(int)); mfp = malloc(cap*sizeof(int));
     }
+    /* Shared experts as ONE bf16 (fmt=5) block, submitted BEFORE the routed
+     * rounds so it rides the GPU while the CPU routes, fills, and packs.
+     * Every token uses every shared expert, so group j is simply all S rows
+     * with weight w[K+j]. Falls back to the CPU loop if begin refuses. */
+    ColiMetalMoeHandle *sh_h = NULL;
+    float *sxg = NULL, *srw = NULL;
+    if (mxg && ns > 0 && ns <= 8 && l->sh_g.h && l->sh_u.h && l->sh_d.h &&
+        !(getenv("INK_METAL_SHARED") && *getenv("INK_METAL_SHARED") == '0')) {
+        double ts = now_s();
+        sxg = falloc((int64_t)ns*S*D); srw = falloc((int64_t)ns*S);
+        const void *sgp[8], *sup[8], *sdp[8];
+        const float *sscale[8];
+        int sxoff[9], snr[8];
+        int *srows = malloc((size_t)ns*S*sizeof(int));
+        for (int j = 0; j < ns; j++) {
+            sgp[j] = l->sh_g.h + (int64_t)j*I*D;
+            sup[j] = l->sh_u.h + (int64_t)j*I*D;
+            sdp[j] = l->sh_d.h + (int64_t)j*D*I;
+            sscale[j] = (const float*)sgp[j];        /* fmt=5 never reads scales */
+            sxoff[j] = j*S; snr[j] = S;
+            for (int s = 0; s < S; s++) {
+                memcpy(sxg + ((int64_t)j*S + s)*D, x + (int64_t)s*D, (size_t)D*sizeof(float));
+                srows[j*S + s] = s;
+                srw[j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
+            }
+        }
+        sxoff[ns] = ns*S;
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+                                          sscale, sscale, sscale,
+                                          sxg, sxoff, snr, srows, srw);
+        free(srows);
+        m->t_shared += now_s() - ts;
+    }
 #endif
     for (int64_t base = 0; base < npair; base += cap) {
         int64_t end = base + cap < npair ? base + cap : npair;
@@ -1308,7 +1363,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * GPU only touches out in _end's scatter-add, after the wait).
                  * On a GPU fault _end returns 0 and the CPU loop below redoes
                  * the round; shared_done stays set either way. */
-                if (base + cap >= npair) {
+                if (base + cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
                         nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
@@ -1362,9 +1417,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_expert += now_s() - te;
     }
+#ifdef COLI_METAL
+    /* GPU shared block: wait + scatter-add. A fault falls through to CPU. */
+    if (sh_h) {
+        double ts = now_s();
+        if (coli_metal_moe_block_end(sh_h, out)) shared_done = 1;
+        m->t_shared += now_s() - ts;
+    }
+#endif
     /* shared experts: una volta per token, fuori dai giri (non usano la cache).
-     * Under Metal the last routed round overlaps this on the CPU (see the
-     * begin/end path above) and sets shared_done. */
+     * Under Metal these run on the GPU as an fmt=5 block overlapped with the
+     * routed rounds (or on the CPU during the last GPU round); either path
+     * sets shared_done. */
     if (!shared_done) {
         double ts = now_s();
         shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
@@ -1378,6 +1442,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         free(mgs); free(mus); free(mds); free(mslot);
         free(mxoff); free(mnr); free(mrows); free(mgi); free(mfp);
     }
+    free(sxg); free(srw);
 #endif
 }
 
