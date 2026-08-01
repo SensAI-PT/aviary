@@ -1,8 +1,13 @@
 /* compat.h — shim di portabilita' per piattaforme non-Linux (oggi: macOS / Apple Silicon,
  * Windows 11 x86-64 via MinGW-w64).
- * Su Linux questo header e' un NO-OP totale: nessun simbolo definito o ridefinito,
- * zero impatto sul percorso x86 esistente.
- * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti. */
+ * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti.
+ *
+ * Storicamente su Linux questo header era un NO-OP totale (solo shim per le altre
+ * piattaforme). Non lo e' piu': coli_stdin_readable() definisce anche il ramo POSIX,
+ * perche' un helper *portabile* deve esistere su tutte le piattaforme -- altrimenti i
+ * .c dovrebbero avere il proprio #ifdef, che e' esattamente cio' che la regola vieta.
+ * Resta vero che il percorso Linux non e' alterato: nulla viene ridefinito, e la
+ * funzione e' static inline, quindi un TU che non la chiama non paga nulla. */
 #ifndef COMPAT_H
 #define COMPAT_H
 
@@ -10,9 +15,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#ifndef _WIN32
-#include <sys/select.h>   /* select(), fd_set, struct timeval per coli_stdin_readable */
-#endif
 
 /* --- posix_fadvise: assente su macOS ---
  * WILLNEED -> F_RDADVISE (readahead esplicito: stessa semantica).
@@ -392,6 +394,10 @@ static inline char *compat_mkdtemp(char *tmpl){
  * dove nessuno li avrebbe cercati: sta qui una volta sola.
  *
  * static inline: e' un header condiviso, e un TU che non la usa non deve pagarla. */
+#ifndef _WIN32
+#include <sys/select.h>   /* select(), fd_set, struct timeval */
+#endif
+
 #ifdef _WIN32
 static inline int coli_stdin_readable(void)
 {
@@ -404,10 +410,11 @@ static inline int coli_stdin_readable(void)
 #else
 static inline int coli_stdin_readable(void)
 {
+    /* fd 0 letterale, non STDIN_FILENO: quella macro vive in <unistd.h>, che questo
+     * header non include su tutte le piattaforme, e stdin e' 0 ovunque per POSIX. */
     fd_set r; struct timeval tv = {0, 0};
-    FD_ZERO(&r); FD_SET(STDIN_FILENO, &r);
-    return select(STDIN_FILENO + 1, &r, NULL, NULL, &tv) > 0
-           && FD_ISSET(STDIN_FILENO, &r);
+    FD_ZERO(&r); FD_SET(0, &r);
+    return select(1, &r, NULL, NULL, &tv) > 0 && FD_ISSET(0, &r);
 }
 #endif
 
