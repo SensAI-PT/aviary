@@ -1128,6 +1128,28 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
  * (2) fill ALL missing experts in one parallel burst (the NVMe wants queue
  * depth — during prefill this batches the whole sequence's misses), then
  * (3) compute. */
+/* shared experts for all S positions: gamma inside (before down_proj is
+ * linear, so applied at the end). Factored out so the Metal path can run it
+ * on the CPU while the last routed-expert round is in flight on the GPU. */
+static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
+                               float *out, const float *wgt,
+                               float *g, float *u, float *hh) {
+    Cfg *c = &m->c;
+    int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s*D;
+        float *os = out + (int64_t)s*D;
+        const float *w = wgt + (int64_t)s*(K+ns);
+        for (int j = 0; j < ns; j++) {
+            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
+            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
+            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
+            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+        }
+    }
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
@@ -1201,6 +1223,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    int shared_done = 0;                /* set when overlapped with the last GPU round */
     int64_t npair = (int64_t)S*K;
 #ifdef COLI_METAL
     /* per-round scratch for the batched GPU submit: pairs grouped by expert,
@@ -1279,6 +1302,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     mgp[j] = e->p13; mup[j] = e->p13 + (int64_t)I*m->rb13; mdp[j] = e->p2;
                     mgs[j] = e->s13; mus[j] = e->s13 + I; mds[j] = e->s2;
                 }
+                /* Last round: submit async and run the shared experts on the
+                 * CPU while the GPU computes the routed ones — they are
+                 * independent (both read x, both accumulate into out, and the
+                 * GPU only touches out in _end's scatter-add, after the wait).
+                 * On a GPU fault _end returns 0 and the CPU loop below redoes
+                 * the round; shared_done stays set either way. */
+                if (base + cap >= npair) {
+                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
+                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        mxg, mxoff, mnr, mrows, mrw);
+                    if (h) {
+                        double ts = now_s();
+                        shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
+                        double sh = now_s() - ts;
+                        m->t_shared += sh;
+                        shared_done = 1;
+                        int ok = coli_metal_moe_block_end(h, out);
+                        m->t_expert += (now_s() - te) - sh;
+                        if (ok) continue;                  /* round done on the GPU */
+                        te = now_s();                      /* fault: CPU redo below */
+                    }
+                }
                 if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
                     m->t_expert += now_s() - te;
@@ -1317,20 +1362,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_expert += now_s() - te;
     }
-    /* shared experts: una volta per token, fuori dai giri (non usano la cache) */
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        float *w = wgt + (int64_t)s*(K+ns);
+    /* shared experts: una volta per token, fuori dai giri (non usano la cache).
+     * Under Metal the last routed round overlaps this on the CPU (see the
+     * begin/end path above) and sets shared_done. */
+    if (!shared_done) {
         double ts = now_s();
-        /* gamma inside (before down_proj is linear, so applied at the end) */
-        for (int j = 0; j < ns; j++) {
-            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
-            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
-            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
-        }
+        shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
         m->t_shared += now_s() - ts;
     }
     free(logits); free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
