@@ -498,8 +498,24 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
+# ENGINES WITHOUT A CUDA BACKEND (#783).
+# kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
+# CUDA=1 appends -DCOLI_CUDA to the global CFLAGS and the cudart libs to
+# LDFLAGS, so `make kimi_k3 CUDA=1` used to compile a define that matches
+# nothing, link a runtime it never calls, and emit no warning: every
+# observable signal said "CUDA build" and the GPUs stayed idle. Strip the
+# flags for these targets and say so once, loudly.
+comma := ,
+NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+                   -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+ifeq ($(CUDA),1)
+	@echo "*** kimi_k3 has no CUDA backend (#783): building without it."
+	@echo "*** On NVIDIA, Kimi K3 runs on the Vulkan path — build VULKAN=1 and set COLI_VULKAN=1."
+endif
+	$(CC) $(NOCUDA_CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(NOCUDA_LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
