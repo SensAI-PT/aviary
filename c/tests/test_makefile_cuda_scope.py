@@ -31,7 +31,16 @@ def recipe(target, *variables):
     return result.stdout + result.stderr
 
 
+def cuda_flag_is_accepted():
+    """CUDA=1 is a hard error outside Linux ("supported only on Linux"), so on
+    macOS and Windows there is no recipe to inspect at all — the assertions
+    below would fail on an absence rather than a regression."""
+    return "only on Linux" not in recipe("colibri", "CUDA=1")
+
+
 @unittest.skipUnless(shutil.which("make"), "make is not installed")
+@unittest.skipUnless(shutil.which("make") and cuda_flag_is_accepted(),
+                     "this toolchain rejects CUDA=1 before any recipe is emitted")
 class MakefileCudaScopeTest(unittest.TestCase):
     def test_kimi_k3_is_not_built_with_cuda_flags(self):
         out = recipe("kimi_k3", "CUDA=1")
