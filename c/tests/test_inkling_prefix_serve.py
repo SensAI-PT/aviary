@@ -12,6 +12,7 @@ real 469 GB model cannot serve this test on a developer machine: measured here,
 a single token pulled 79 GB off disk in 9 minutes and had not finished. That is
 why this gate lives in CI on a fixture rather than in a benchmark on hardware.
 """
+import json
 import os
 import subprocess
 import sys
@@ -24,6 +25,40 @@ ENGINE = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
 FIXTURE = Path(os.environ.get("INKLING_TINY", HERE / "tiny_inkling"))
 MAXTOK = 4
 READY = b"\x01\x01READY\x01\x01\n"
+
+
+def byte_level_vocab(size):
+    """The GPT-2 byte->unicode map that tok.h's tk_build_bytemap builds.
+
+    Bytes 33..126, 161..172 and 174..255 keep their own codepoint; the rest are
+    renumbered from 256 upward in byte order. Reproduced here rather than
+    imported so a drift between the two shows up as a failing test.
+    """
+    direct = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
+    vocab, spare = {}, 0
+    for b in range(size):
+        if b in direct:
+            cp = b
+        else:
+            cp, spare = 256 + spare, spare + 1
+        vocab[chr(cp)] = b
+    return vocab
+
+
+def ensure_tokenizer(fixture):
+    """tools/make_tiny_inkling.py emits weights and a teacher-forcing oracle but
+    no tokenizer: the oracle path feeds token ids directly. Serve mode goes
+    through text, so it needs one. The fixture model is vocab_size=256 /
+    unpadded 250, so one token per byte is not a simplification — it is the
+    whole vocabulary."""
+    path = fixture / "tokenizer.json"
+    if path.exists():
+        return
+    path.write_text(json.dumps({
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {"type": "BPE", "vocab": byte_level_vocab(250), "merges": []},
+    }), encoding="utf-8")
 
 
 class Engine:
@@ -80,6 +115,21 @@ class Engine:
 @unittest.skipUnless((FIXTURE / "config.json").exists(),
                      "tiny inkling fixture is absent (tools/make_tiny_inkling.py)")
 class InklingPrefixServeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        ensure_tokenizer(FIXTURE)
+
+    def test_byte_level_vocab_matches_the_engines_map(self):
+        """Guard the assumption the two tests below rest on: if this map ever
+        disagrees with tok.h, they would fail for a reason that has nothing to
+        do with prefix reuse, and the failure would be very hard to read."""
+        vocab = byte_level_vocab(250)
+        self.assertEqual(len(vocab), 250, "the map must be injective")
+        self.assertEqual(vocab["A"], 65, "printable ASCII keeps its own byte")
+        self.assertEqual(vocab["~"], 126, "top of the direct range")
+        self.assertEqual(vocab[chr(256)], 0, "byte 0 is the first renumbered one")
+        self.assertEqual(vocab[chr(256 + 32)], 32, "space is renumbered, not literal")
+
     def test_reused_prefix_yields_identical_tokens(self):
         warm = Engine()
         first = warm.ask("1", "The capital of France is")
