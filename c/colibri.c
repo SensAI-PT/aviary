@@ -69,6 +69,7 @@
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
 #endif
+#include "omp_tune.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -8859,6 +8860,13 @@ int main(int argc, char **argv){
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+    /* #718: the hot-team block above tunes wake latency but historically left
+     * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
+     * collapse when SMT siblings share each core, measured 2.3x on a 5950X.
+     * The shared helper already protects kimi_k3/olmoe: apply its independent
+     * physical-core sizing here too.  This must stay after the possible re-exec;
+     * omp_set_num_threads() is a runtime API and needs no second exec. */
+    coli_omp_tune_threads("colibri");
 #ifdef _WIN32
     _setmode(fileno(stdout), O_BINARY);
 #endif
