@@ -75,6 +75,28 @@ static inline void kv_prefix_free(kv_prefix *p) {
     p->tainted = 0;
 }
 
+/* Grow the record to `cap`, keeping the first `keep` positions.
+ *
+ * For engines whose KV buffers are re-allocated when a longer prompt arrives.
+ * If those buffers are grown by COPYING their contents, the positions survive
+ * and so must the record — otherwise reuse can never fire in the one case it
+ * exists for: a conversation whose prompt gets longer every turn. Returns 0 if
+ * the record could not be preserved, and leaves it empty rather than stale:
+ * the caller must then treat the state as unreusable. */
+static inline int kv_prefix_grow(kv_prefix *p, int cap, int keep) {
+    if (!p || cap <= 0) return 0;
+    int *grown = (int *)calloc((size_t)cap, sizeof(int));
+    if (!grown) { kv_prefix_free(p); return 0; }
+    if (keep > p->len) keep = p->len;
+    if (keep > cap)    keep = cap;
+    if (keep > 0 && p->fed) memcpy(grown, p->fed, (size_t)keep * sizeof(int));
+    free(p->fed);
+    p->fed = grown;
+    p->cap = cap;
+    p->len = keep > 0 ? keep : 0;
+    return 1;
+}
+
 /* Record n tokens fed at absolute positions pos0..pos0+n-1. Out-of-range
  * writes drop the record rather than truncating it: a partial record would
  * claim coverage the state does not have. */

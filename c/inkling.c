@@ -1451,19 +1451,44 @@ static void state_reset(Model *m) {
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
     if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
-    if (m->K) for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
-    free(m->K); free(m->V);
-    /* The record is sized with the KV it describes: growing these buffers
-     * discards the positions it refers to, so it is dropped at the same
-     * moment. A failed allocation just disables reuse. */
-    kv_prefix_alloc(&m->kvp, max_t);
-    m->kv_len = 0;
+
+    /* GROW, DO NOT RESTART.
+     *
+     * This used to free the buffers and allocate fresh ones, which discarded
+     * every position already computed. That was invisible while each turn
+     * re-prefilled anyway — but it defeats KV prefix reuse in exactly the case
+     * reuse exists for: a conversation whose prompt is longer every turn asks
+     * for a larger max_t every turn, so the state was thrown away just before
+     * the point of using it.
+     *
+     * K/V are laid out [kv_head][max_t][hd], so a larger max_t changes the
+     * stride: the old contents cannot be realloc'd, they have to be re-laid-out
+     * head by head. That copy costs a memcpy of what is already computed, which
+     * is nothing beside re-running the prefill that produced it. */
+    float **oldK = m->K, **oldV = m->V;
+    int old_max = m->max_t;
+    int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
+
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
-        m->V[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
+        int kv = L_KV(c,i), hd = L_HD(c,i);
+        m->K[i] = falloc((int64_t)kv * max_t * hd);
+        m->V[i] = falloc((int64_t)kv * max_t * hd);
+        for (int h = 0; h < kv && keep; h++) {
+            memcpy(m->K[i] + (int64_t)h * max_t * hd,
+                   oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+            memcpy(m->V[i] + (int64_t)h * max_t * hd,
+                   oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+        }
     }
+    if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
+    free(oldK); free(oldV);
+
+    /* the record describes those same positions, so it survives with them --
+     * unless its own allocation fails, in which case reuse simply stops. */
+    if (kv_prefix_grow(&m->kvp, max_t, keep)) m->kv_len = keep;
+    else                                      m->kv_len = 0;
 }
 
 /* greedy generation, olmoe.c-style */

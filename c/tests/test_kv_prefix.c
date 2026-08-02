@@ -72,9 +72,37 @@ int main(void) {
     CHECK(p.len == 0, "overflowing write must drop the record, len=%d", p.len);
     CHECK(kv_prefix_reuse(&p, turn2, 5) == 0, "dropped record must not be reused");
 
-    /* Growing the buffers invalidates everything: the KV they describe is gone. */
-    CHECK(kv_prefix_alloc(&p, 32), "grow failed");
+    /* kv_prefix_alloc RESTARTS: for callers that discard the KV outright. */
+    CHECK(kv_prefix_alloc(&p, 32), "alloc failed");
     CHECK(p.len == 0 && p.tainted == 0, "alloc must reset the record");
+
+    /* kv_prefix_grow PRESERVES: for callers that grow the KV by copying it.
+     * This is the case CI caught — inkling's kv_alloc re-allocated on every
+     * longer prompt, so reuse could never fire in a growing conversation, the
+     * one situation it exists for. */
+    kv_prefix_record(&p, turn1, 0, 3);
+    kv_prefix_record(&p, gen, 3, 2);                       /* 5 positions held */
+    CHECK(kv_prefix_grow(&p, 64, 5), "grow failed");
+    CHECK(p.cap == 64, "cap=%d after grow, want 64", p.cap);
+    CHECK(p.len == 5, "len=%d after grow, want 5 preserved", p.len);
+    CHECK(kv_prefix_reuse(&p, turn3, 6) == 5,
+          "a preserved record must still be reusable after growing");
+
+    /* keep is clamped by what is actually held: a caller that copied FEWER
+     * positions than it claims must not end up describing uninitialised ones. */
+    CHECK(kv_prefix_grow(&p, 128, 999), "grow failed");
+    CHECK(p.len == 5, "keep must clamp to len, got %d", p.len);
+
+    /* keep=0 grows without preserving: the caller discarded the KV contents. */
+    CHECK(kv_prefix_grow(&p, 256, 0), "grow failed");
+    CHECK(p.len == 0, "keep=0 must leave the record empty, got %d", p.len);
+    CHECK(kv_prefix_reuse(&p, turn3, 6) == 0, "an emptied record reuses nothing");
+
+    /* Shrinking below what is held keeps only what fits, never past the end. */
+    kv_prefix_record(&p, turn1, 0, 3);
+    CHECK(kv_prefix_grow(&p, 2, 3), "grow failed");
+    CHECK(p.len <= 2 && p.cap == 2, "len=%d cap=%d must stay within cap",
+          p.len, p.cap);
 
     /* Defensive: a NULL record is inert, not a crash. Engines disable reuse by
      * leaving fed==NULL when the allocation fails. */
