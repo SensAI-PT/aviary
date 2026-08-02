@@ -17,7 +17,7 @@ only — never `#ifdef __HIP__` (or CUDA-specific code) in `backend_cuda.cu`.
 |---|---|---|---|
 | CUDA (`CUDA=1`) | Linux x86-64 | CUDA toolkit (nvcc), `CUDA_HOME=/usr/local/cuda` default | `make -C c glm CUDA=1 [CUDA_ARCH=native\|sm_XX]` |
 | HIP (`HIP=1`) | Linux x86-64 | ROCm (hipcc), `ROCM_HOME=/opt/rocm` default; tested on ROCm 7.2 | `make -C c glm HIP=1 [HIP_ARCH=native\|gfxXXXX]` |
-| HIP DLL (`HIP_DLL=1`) — **experimental, build only** | Windows x86-64 | HIP SDK (hipcc) + a compatible MSVC x64 host toolchain; `HIP_SDK_ROOT` from `HIP_PATH` | `make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN` → `c/coli_hip.dll` |
+| HIP DLL (`HIP_DLL=1`) — build **and** runtime; validated on one configuration | Windows x86-64 | HIP SDK (hipcc) + a compatible MSVC x64 host toolchain; `HIP_SDK_ROOT` from `HIP_PATH` | `make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN` → `c/coli_hip.dll` |
 
 `CUDA=1` and `HIP=1` are mutually exclusive and both opt-in: the default build
 remains pure, dependency-free CPU. Both are **directly linked** paths and remain
@@ -29,7 +29,7 @@ with an unsupported iGPU visible to the runtime (and mask iGPUs at runtime with
 `HIP_VISIBLE_DEVICES=<ordinal>` on ROCm). On Windows `HIP_ARCH` **must** be an
 explicit `gfxNNNN` — see below.
 
-### Windows HIP DLL (experimental)
+### Windows HIP DLL
 
 Mirrors the Windows CUDA split: MinGW gcc cannot compile `.cu`, and Windows
 hipcc targets the MSVC ABI, so the backend is built into a standalone
@@ -37,8 +37,15 @@ hipcc targets the MSVC ABI, so the backend is built into a standalone
 `c/backend_cuda.cu` and the same `coli_cuda_*` ABI the Linux HIP path already
 reuses are used unchanged.
 
-**Build support only.** The host does not yet load `coli_hip.dll` at runtime —
-see [Limitations](#windows-hip-limitations).
+The host loads `coli_hip.dll` at runtime through the same loader seam the
+Windows CUDA split uses, and binds the HIP runtime **explicitly**: the directory
+holding `amdhip64_7.dll` is named by `COLI_HIP_RUNTIME_DIR`, and the loader
+fails closed if the mapped module is not that exact file or if a second module
+of the same basename is already present. It never silently accepts a copy from
+`System32`, from `PATH`, or from an unrelated ROCm install.
+
+Read [what this was tested on](#windows-hip-limitations) before relying on it;
+`docs/windows.md` has the full setup walkthrough.
 
 The two halves are built separately.
 
@@ -90,17 +97,34 @@ library and device bitcode from the other.
 available there, so there is nothing to resolve `native` against.
 
 <a id="windows-hip-limitations"></a>
-#### Limitations
+#### What this was tested on, and what it does not claim
 
-- **Build support only.** This documents compilation, not completed runtime
-  integration. The host cannot yet load `coli_hip.dll`; runtime DLL-name
-  selection is deferred.
-- Deterministic `amdhip64_7.dll` runtime selection is **not** part of this
-  build slice.
-- There is **no hosted CI coverage** for the Windows HIP build — no hosted
-  runner provides a Windows HIP toolchain. `engine-hip-syntax` covers the Linux
-  HIP compile only.
-- Validation therefore requires a suitable local Windows AMD/HIP environment.
+Validated on **one** configuration: AMD Radeon(TM) 8060S Graphics reporting
+`gfx1151`, TheRock HIP 7.14.60850, VS2022 MSVC 14.44.35207, Windows SDK
+10.0.26100.0. Nothing here is a statement about other GPUs, drivers or SDKs.
+
+- **Hybrid placement.** In the validated workload `CUDA_DENSE=1` put the
+  eligible dense tensors on HIP while **routed experts stayed on CPU**. Routed
+  experts reach the GPU only through the existing expert-placement controls
+  (`CUDA_EXPERT_GB` plus a pin/usage source), which is untested here. This is
+  **not** full-GPU MoE inference.
+- **Device discovery is not proof of GPU work.** A run can print
+  `[CUDA] device 0: ...` and still execute every tensor on CPU. The number that
+  settles it is `[CUDA] resident set: N tensors` — `N = 0` means no model tensor
+  was resident on the GPU. Check that, not the device line.
+- **CPU fallback keeps the command successful.** A per-tensor upload failure
+  falls back to CPU and the process still exits 0. Read the first fallback
+  diagnostics and the final fallback count together with the resident set.
+- **Lifecycle.** Normal one-shot model exits rely on Windows process teardown
+  rather than an explicit `coli_cuda_shutdown` call. This matches the existing
+  host path and is not presented as explicit backend shutdown.
+- There is **no hosted CI coverage** for the Windows HIP build or runtime — no
+  hosted runner provides a Windows HIP toolchain or an AMD GPU.
+  `engine-hip-syntax` covers the Linux HIP compile only; the Windows job added
+  alongside this work runs the loader contract tests with **synthetic DLL
+  fixtures and no GPU**.
+- Physical validation therefore comes from a local Windows AMD/HIP environment
+  and is reported as external evidence, not as CI coverage.
 
 ## Runtime configuration (identical for both vendors)
 
