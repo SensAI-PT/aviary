@@ -81,7 +81,8 @@
 #include "tok.h"
 #include "quant.h"
 #include "omp_tune.h"
-#include "route_trace.h"                 /* shared routing telemetry (#700) */
+#include "route_trace.h"
+#include "kv_prefix.h"                    /* KV prefix reuse (shared) */
 
 /* ---------- config ---------- */
 typedef struct {
@@ -154,6 +155,11 @@ typedef struct {
     float **cwq, **cwk, **cwv;            /* conv windows [proj*conv_k], oldest first */
     /* MLA cache */
     float **Lc, **Rc; int max_t;
+    /* KV prefix reuse: what the current state was built from (kv_prefix.h).
+     * K3 has no single KV to inspect — 69 KDA layers carry a RECURRENT state
+     * and only the 24 MLA layers keep Lc/Rc — so an explicit record of the
+     * tokens fed is the only description of it that cannot drift. */
+    kv_prefix kvp;
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
@@ -1250,18 +1256,51 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         }
         m->t_head+=now_s()-t0;
     }
+    /* record what was just fed, at the positions it went to (kv_prefix.h) */
+    kv_prefix_record(&m->kvp, ids, pos0, C);
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
 }
 
 static void kv_alloc(Model *m, int max_t){
-    Cfg *c=&m->c; m->max_t=max_t;
+    Cfg *c=&m->c;
+    /* Serve calls this once per request, and it used to calloc Lc/Rc over the
+     * old pointers without freeing them: n_layers x max_t x (kv_lora +
+     * qk_rope) floats leaked every turn, hundreds of MB over a conversation on
+     * the 24 MLA layers at 4k context.
+     *
+     * GROW, DO NOT RESTART. Freeing and re-allocating also discards every
+     * position already computed, which defeats KV prefix reuse in the one case
+     * it exists for: a conversation whose prompt is longer every turn asks for
+     * a larger max_t every turn, so the state would be thrown away immediately
+     * before the point of using it. (Caught by CI on the Inkling side, where
+     * the same shape of bug sat in the same place.)
+     *
+     * Lc/Rc are laid out [position][kv_lora] and [position][qk_rope], so unlike
+     * inkling's head-major K/V a grow is a straight prefix copy — no re-layout.
+     * The 69 KDA layers are untouched here: their recurrent state does not
+     * scale with max_t and survives on its own. */
+    if(m->Lc && max_t<=m->max_t) return;
+
+    float **oldL=m->Lc, **oldR=m->Rc;
+    int keep=(m->Lc && m->kvp.len>0 && m->kvp.len<=max_t) ? m->kvp.len : 0;
+
+    m->max_t=max_t;
     m->Lc=calloc(c->n_layers,sizeof(float*));
     m->Rc=calloc(c->n_layers,sizeof(float*));
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
         m->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         m->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
+        if(keep){
+            memcpy(m->Lc[i], oldL[i], (size_t)keep*c->kv_lora*sizeof(float));
+            memcpy(m->Rc[i], oldR[i], (size_t)keep*c->qk_rope*sizeof(float));
+        }
     }
+    if(oldL) for(int i=0;i<c->n_layers;i++){ free(oldL[i]); free(oldR[i]); }
+    free(oldL); free(oldR);
+
+    /* the record describes those same positions, so it survives with them */
+    if(!kv_prefix_grow(&m->kvp,max_t,keep)) kv_prefix_clear(&m->kvp);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -1416,6 +1455,7 @@ typedef struct {
 
 static void model_state_reset(Model *m){
     Cfg *c=&m->c;
+    kv_prefix_clear(&m->kvp);   /* the record describes the state we are dropping */
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -1483,14 +1523,41 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         fflush(stdout); free(ids); return;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
-    model_state_reset(m);
+    /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
+     * A chat client resends the whole transcript each turn, so turn N used to
+     * re-process turns 1..N-1 from scratch — the cost of a message grew with
+     * the conversation, and every replayed position pulled its experts off
+     * disk again. When this prompt begins with the sequence the state already
+     * holds, that state IS the state at that position: keep it and prefill
+     * only the tail. This is why kv_alloc above must run FIRST and must keep
+     * its buffers: growing them discards the positions fed[] describes.
+     * At least one new token is required, since the state cannot be rewound.
+     * Either the reused positions are token-identical or nothing is reused;
+     * the emitted tokens are unchanged in both cases. */
     kv_alloc(m,np+q->max_tok+8);
+    int reuse=kv_prefix_reuse(&m->kvp, ids, np);
+    if(getenv("K3_PREFIX_LOG")){
+        /* Report the decision either way, with the state behind a "no".
+         * "It did not get faster" is otherwise the same observation as
+         * "reuse is not wired up" — for a user as much as for a test. */
+        if(reuse)
+            fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse,np,100.0*reuse/np);
+        else
+            fprintf(stderr,"[PREFIX] no reuse: held=%d cap=%d prompt=%d%s\n",
+                    m->kvp.len,m->kvp.cap,np,
+                    (m->kvp.len>0 && m->kvp.len<np) ? " (diverged)" : "");
+        fflush(stderr);
+    }
+    if(!reuse) model_state_reset(m);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
     uint64_t hit0=m->hits, miss0=m->miss;
     float *lo=NULL;
-    for(int i=0;i<np;i+=chunk){
+    /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
+     * position-indexed, so the loop starts at `reuse`, not at 0. */
+    for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
         free(lo); lo=step_chunk(m,ids+i,i,C);
     }
