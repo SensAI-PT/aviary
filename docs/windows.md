@@ -291,6 +291,96 @@ not been validated on hardware here.
 **CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
 entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
 
+### Generating the synthetic GLM oracle model
+
+To exercise the engine end to end you need *a* model, and the smallest one is
+generated locally rather than downloaded. `c/tools/make_glm_oracle.py` builds
+**`glm_tiny`** — a ~0.6 MB GLM-5.2 (`glm_moe_dsa`) with the real architecture
+(MLA + DSA indexer + sigmoid router + shared expert, 5 layers, 8 routed experts,
+top-2) but random weights, plus `ref_glm.json`, a teacher-forcing oracle of
+expected token IDs.
+
+> **It is test tooling, not a language model.** Random weights produce
+> meaningless text. Its only purpose is that the C engine must reproduce the
+> reference token IDs exactly.
+
+The packages below are **development tooling only** — the engine itself is a C
+binary and needs no Python once the model files exist.
+
+**1. Create an isolated environment.** Nothing is installed system-wide:
+
+```powershell
+$tooling = "C:\Development\colibri-validation\glm-oracle-tooling"
+uv venv --python "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" "$tooling\venv"
+
+# CPU-only Torch from the official PyTorch CPU index; the rest from PyPI
+uv pip install --python "$tooling\venv\Scripts\python.exe" `
+    --index-url https://download.pytorch.org/whl/cpu `
+    --extra-index-url https://pypi.org/simple `
+    --index-strategy unsafe-best-match `
+    torch "transformers==5.11.0" "safetensors>=0.4"
+```
+
+Validated on **CPython 3.14.6 (Windows x64)** with **torch 2.13.0+cpu**,
+**transformers 5.11.0** and **safetensors 0.8.0**. `transformers>=5.11` is a
+hard floor — the generator exits below it, because older releases apply
+split-half Llama RoPE and silently emit an oracle the engine cannot match
+(issue #281). Pin 5.11.0 exactly to avoid oracle drift.
+
+**2. Verify the environment** (imports only — builds nothing, downloads nothing):
+
+```powershell
+& "$tooling\venv\Scripts\python.exe" -c "import torch, transformers; from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM; print(torch.__version__, torch.version.cuda, transformers.__version__)"
+```
+
+Expect a `+cpu` Torch build and `None` for the CUDA version.
+
+**3. Generate the model — from an external working directory.** The generator
+takes no `--outdir`: it writes `glm_tiny/` **and** `ref_glm.json` relative to the
+current directory. `c/ref_glm.json` is a tracked file, so generating inside `c/`
+would overwrite it. Run it from outside the repository instead:
+
+```powershell
+$out = "$tooling\model"
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+Push-Location $out
+& "$tooling\venv\Scripts\python.exe" C:\Development\colibri\c\tools\make_glm_oracle.py
+Pop-Location
+# -> $out\glm_tiny\{config.json,model.safetensors} and $out\ref_glm.json
+```
+
+Generation is fully offline once the packages are installed: the model is built
+from a literal config with a fixed seed, and nothing is fetched from the network.
+
+**4. Run the engine against it.** `SNAP` and `REF` both accept external paths,
+so the generated files never need to enter the repository:
+
+```powershell
+$env:SNAP = "$out\glm_tiny"
+$env:REF  = "$out\ref_glm.json"
+$env:TF   = "1"
+.\colibri.exe 64 16 16
+```
+
+`TF=1` is the teacher-forcing self-test: it prints
+`PREFILL (teacher-forcing) C vs oracle: N/32 positions` and one
+`[ORACLE] mismatch pos=… expected=… got=…` line per disagreement. Add
+`DEBUG_LOGITS=1` to dump the top-5 logits at a mismatch. Floating-point
+near-ties are toolchain-dependent, so a small shortfall is expected; compare a
+GPU run against the CPU run on the same machine rather than against a fixed
+number.
+
+To exercise the HIP backend instead, add the runtime settings from
+[Runtime setup](#runtime-setup-experimental-developer-facing) to the same
+command.
+
+**Cleanup** removes the tooling and the generated model in one step; the
+repository is untouched:
+
+```powershell
+Remove-Item -Recurse -Force $tooling
+```
+
 ### AMD failure index
 
 | Symptom | Cause | Fix |
