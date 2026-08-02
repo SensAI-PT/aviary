@@ -1250,6 +1250,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
             m->t_fill += now_s() - tf;
         }
+        /* Validate before the CPU/Metal split: either backend must refuse a
+         * cache slot whose weights belong to a different routed expert. */
+        for (int64_t t = base; t < end; t++) {
+            Slot *e = use[t - base];
+            if (!e) continue;                              /* scartato da TOPP */
+            int s = (int)(t / K), kk = (int)(t % K);
+            if (e->eid != idx[(int64_t)s*K + kk]) {
+                fprintf(stderr, "layer %d: cache served expert %d for requested expert %d\n",
+                        layer, e->eid, idx[(int64_t)s*K + kk]);
+                exit(1);
+            }
+        }
         double te = now_s();
 #ifdef COLI_METAL
         if (mxg) {
