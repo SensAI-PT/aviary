@@ -45,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: matrix.os == 'windows-latest'
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -53,6 +54,7 @@ jobs:
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
       - name: Build every engine
@@ -65,6 +67,57 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+      # The Windows backend-DLL loader contract (c/tests/test_backend_loader.py)
+      # had no CI anywhere: the `python` job below is Linux-only, where these
+      # tests do not apply. They need no GPU and no HIP SDK — the fixtures are
+      # stub DLLs this job's MinGW gcc/objdump build on the fly.
+      #
+      # shell: pwsh overrides the job default on purpose. Under the MSYS2 shell
+      # the UCRT64 interpreter reports os.sep == '/', so the loader's
+      # backslash-joined paths compare unequal and the path tests fail; the same
+      # interpreter reports '\' when launched from PowerShell. Run the tests from
+      # pwsh with the runner's native CPython, and put MSYS2's UCRT64 bin on PATH
+      # only so gcc/objdump are reachable for fixture compilation.
+      - name: Windows backend-loader contract tests (no GPU)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          # Nothing here may reach a real GPU, runtime or backend.
+          COLI_CUDA: ''
+          COLI_GPU: ''
+          CUDA_DENSE: ''
+          COLI_HIP_RUNTIME_DIR: ''
+          HIP_PATH: ''
+        run: |
+          # ucrt64\bin for gcc/objdump AND usr\bin for make: without make, the
+          # host-matrix class skips at setUpClass and the run silently loses
+          # tests instead of failing.
+          $msys = "${{ steps.msys2.outputs.msys2-location }}"
+          $env:PATH = "$msys\ucrt64\bin;$msys\usr\bin;$env:PATH"
+          foreach ($v in 'COLI_CUDA','COLI_GPU','COLI_GPUS','CUDA_DENSE','CUDA_EXPERT_GB',
+                         'COLI_HIP_RUNTIME_DIR','HIP_PATH','ROCM_PATH','ROCM_HOME',
+                         'HIP_DEVICE_LIB_PATH','HSA_OVERRIDE_GFX_VERSION',
+                         'HIP_VISIBLE_DEVICES','CUDA_VISIBLE_DEVICES') {
+            Remove-Item "env:$v" -ErrorAction SilentlyContinue
+          }
+          python -c "import sys, os; print('python', sys.executable); print('os.sep', repr(os.sep))"
+          gcc --version | Select-Object -First 1
+          make --version | Select-Object -First 1
+          if ((python -c "import os; print(os.sep)") -ne '\') {
+            throw "expected a native Windows CPython (os.sep '\'); the loader path tests need it"
+          }
+          cd c
+          $out = python -m unittest tests.test_backend_loader -v 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0) { throw "loader contract tests failed" }
+          # A missing toolchain shows up as setUpClass skips, not failures, so a
+          # green run with a shrunken test count would hide the real problem.
+          if ($out -notmatch '(?m)^Ran (\d+) tests') { throw "could not parse the test count" }
+          $ran = [int]$Matches[1]
+          $skipped = ([regex]::Matches($out, '\.\.\. skipped')).Count
+          "ran=$ran skipped=$skipped"
+          if ($skipped -gt 0) { throw "$skipped loader test(s) skipped: the Windows toolchain is incomplete" }
 
   engine-cuda-syntax:
     name: CUDA syntax check
