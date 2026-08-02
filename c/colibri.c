@@ -8314,10 +8314,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
     if(floored){
         double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
+        /* eb is printed because it is the one term nobody can check from outside:
+         * every projection here divides by it, so a wrong width is indistinguishable
+         * from a wrong budget in this message (#766). */
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB).%s\n",
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,
+            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
