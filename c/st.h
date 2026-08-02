@@ -776,12 +776,37 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
 }
 
 /* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
- * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
+ * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED.
+ *
+ * CALLER CONTRACT: this reads `t->nbytes` -- a length declared by the file header --
+ * into `out`, and has no bound of its own. st_init cannot supply one: it deliberately
+ * skips its numel*esz==nbytes cross-check for dtype 3, because packed quant bytes
+ * legitimately have numel != nbytes. So the caller MUST establish that its destination
+ * is at least t->nbytes before calling. Today all callers do, by three routes:
+ *   - colibri.c sizes the buffer from st_nbytes() itself, and qt_resolve_fmt validates
+ *     both byte counts against [O,I];
+ *   - kimi_k3.c makes the byte count the branch predicate (`if(t->nbytes==O*I ...)`),
+ *     so identifying the format and validating it are the same act;
+ *   - olmoe.c compares against a config-derived want_w and refuses by name.
+ * A new caller with none of those wants st_read_raw_cap below. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+}
+
+/* st_read_raw with the bound made explicit: `cap` is the byte capacity of `out`, in the
+ * same position and spirit as st_read_f32_cap's element cap. Refuses rather than writing
+ * past the destination, so a caller that has an expected size need not invent its own
+ * check -- and one that has none cannot silently do the wrong thing. */
+static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->nbytes < 0 || t->nbytes > cap) {
+        fprintf(stderr, "%s: tensor declares %lld bytes, destination holds %lld — refusing "
+                "(untrusted container)\n", name, (long long)t->nbytes, (long long)cap); exit(1); }
+    st_read_raw(S, name, out, drop);
 }
 
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
