@@ -1401,10 +1401,13 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
-        /* generic path decodes fmt 0/1/2/3 only — a fmt=4 group that slipped the
-         * gates above (odd gs) must NOT be silently decoded as int2 (#334). */
+        /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
+         * than whitelist known offenders: a fmt=4 group that slipped the gates
+         * above (odd gs) must NOT be silently decoded as int2 (#334), and any
+         * group/block-scaled format that gains CUDA tensors later (fmt=5, fmt=8)
+         * would be mis-decoded by weight_at the same way. */
         for(int c=0;c<count;c++)
-            if(host[c].gf==4||host[c].uf==4||host[c].df==4) return 0;
+            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
@@ -1516,7 +1519,15 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
          * ctx->up buffer. */
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-    } else for(int c=0;c<count;c++){
+    } else {
+        /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
+         * That is only correct for fmt 0/1/2/3: refuse group/block-scaled
+         * members (fmt=4 with odd gs today; fmt=5/8 if they ever gain CUDA
+         * tensors) instead of silently mis-scaling them, mirroring the sync
+         * path's refusal (#334). fmt=6 cannot reach here (any_e8 gates above). */
+        for(int c=0;c<count;c++)
+            if(host[c].gf>3||host[c].uf>3||host[c].df>3) return 0;
+        for(int c=0;c<count;c++){
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
@@ -1527,7 +1538,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
             host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
-    }
+    }}
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
