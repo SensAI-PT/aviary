@@ -31,7 +31,6 @@ ARCH ?= x86-64-v3
 CFLAGS = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
-	-DCOLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 LDFLAGS = -lm -fopenmp -static -pthread
@@ -42,7 +41,6 @@ ARCH ?= native
 CFLAGS = -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
-	-DCOLI_V4_EXPERIMENTAL_PARALLEL_PREFIX_VERIFY \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24
 LDFLAGS = -lm -fopenmp -pthread
@@ -52,15 +50,14 @@ endif
 include Makefile.deepseek-v4.units
 
 # native_quant.c / native_quant_batch.c are pulled in by the parallel/avx512 TUs.
-SHARED_SOURCES = safetensors_index.c native_quant_parallel.c \
+SHARED_SOURCES = native_quant_parallel.c \
 	native_quant_dual.c native_quant_batch_avx512.c \
-	native_quant_fp4_rows16.c tensor_io.c
+	native_quant_fp4_rows16.c
 
 SHARED_OBJS = $(SHARED_SOURCES:.c=.o)
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
-DSPARK_OBJS = $(addsuffix .o,$(V4_DSPARK_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_OBJS = $(SHARED_OBJS) $(TARGET_OBJS) $(DSPARK_OBJS)
+V4_OBJS = $(SHARED_OBJS) $(TARGET_OBJS)
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
@@ -73,15 +70,11 @@ $(SHARED_OBJS): %.o: %.c
 
 # These translation units include native_quant.c directly.
 native_quant_parallel.o native_quant_dual.o native_quant_batch_avx512.o: \
-	native_quant.c native_quant.h
+	native_quant.c native_quant_batch.c native_quant.h quant.h
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_dspark.h deepseek_v4_internal.h
+	deepseek_v4_internal.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
-
-$(DSPARK_OBJS): %.o: deepseek_v4_dspark.c deepseek_v4.h \
-	deepseek_v4_dspark.h deepseek_v4_internal.h
-	$(CC) $(CFLAGS) -D$* -c deepseek_v4_dspark.c -o $@
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 

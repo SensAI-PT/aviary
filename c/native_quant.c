@@ -1,4 +1,12 @@
 #include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <float.h>
 #include <math.h>
@@ -215,24 +223,17 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
         free(activation_scales);
         return -1;
     }
-    const uint8_t *packed = weight->data;
-    const uint8_t *scales = weight->scales;
-    for (size_t row = 0; row < rows; row++) {
-        float sum = 0.0f;
-        for (size_t column = 0; column < columns; column++) {
-            uint8_t byte = packed[row * packed_stride + column / 2];
-            uint8_t code = column & 1 ? byte >> 4 : byte & 15;
-            float scale = coli_e8m0_decode(
-                scales[row * scale_stride + column / 32]);
-            sum += activation[column] * coli_e2m1_decode(code) * scale;
-        }
-        output[row] = sum;
-    }
+    matmul_mxfp4(output, activation, weight->data, weight->scales,
+                 1, (int)columns, (int)rows);
     free(activation_scales);
     free(activation);
     return 0;
 }
 
+/* TODO(upstream-fmt8-ue8m0): This is a temporary DeepSeek-V4-private
+ * compatibility path. Replace it with quant.h's shared fmt=8 E4M3 + UE8M0
+ * 128x128 block-scale implementation once upstream provides that decoder.
+ * Do not extend this private path with new backends or container behavior. */
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||

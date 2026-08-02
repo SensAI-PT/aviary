@@ -1,5 +1,10 @@
 #include "native_quant_fp4_rows16.h"
 
+/* TODO(upstream-fmt7-rows16): quant.h now owns the canonical fmt=7 MXFP4
+ * decoder. This private rows16 repack/fused kernel remains only because the
+ * shared layer has no resident-cache rows16 layout yet. Migrate and delete it
+ * when that performance API lands upstream. */
+
 #ifdef __AVX512F__
 #include <immintrin.h>
 #elif defined(__aarch64__)

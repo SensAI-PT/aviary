@@ -77,13 +77,11 @@ typedef struct ColiV4Engine ColiV4Engine;
 typedef struct {
     /* Copied by coli_v4_engine_open; caller strings need not outlive the engine. */
     const char *target_model_dir;   /* required */
-    const char *dspark_model_dir;   /* NULL => same as target */
     uint64_t memory_limit_bytes;    /* 0 => use OS available memory */
     int context_tokens;             /* 0 => 4096 */
-    int verify_drafts;              /* 0 => runner default */
     int pin_slots_per_layer;        /* -1 => auto */
     uint64_t repin_interval;        /* 0 => auto */
-    int no_dspark;                  /* skip all DSpark loading and capture */
+    int no_dspark;                  /* compatibility no-op in target-only engine */
 } ColiV4EngineOpenOptions;
 
 typedef struct {
@@ -91,7 +89,6 @@ typedef struct {
     uint64_t expert_cache_bytes;
     int slots_per_layer;
     int dense_resident;
-    int dspark_resident;
     int head_resident;
 } ColiV4EngineMemorySummary;
 
@@ -107,7 +104,6 @@ void coli_v4_engine_memory_summary(const ColiV4Engine *engine,
                                    ColiV4EngineMemorySummary *summary);
 
 const char *coli_v4_engine_target_model_dir(const ColiV4Engine *engine);
-const char *coli_v4_engine_dspark_model_dir(const ColiV4Engine *engine);
 
 /* ---- experimental public session API ----
  * Session borrows the engine; destroy all sessions before coli_v4_engine_destroy.
@@ -123,17 +119,13 @@ typedef struct {
 typedef struct {
     int max_new_tokens;      /* required; clamped by session cap */
     int stop_at_sentence;
-    int no_dspark;
+    int no_dspark;           /* compatibility no-op in target-only engine */
 } ColiV4SessionGenerateOptions;
 
 typedef struct {
     int prompt_tokens;
     int generated_tokens;
     int eos_stopped;
-    uint64_t dspark_rounds;
-    uint64_t dspark_proposed;
-    uint64_t dspark_accepted;
-    float dspark_acceptance;
     double time_to_first_token_sec;
     double decode_sec;
 } ColiV4SessionGenerateStats;

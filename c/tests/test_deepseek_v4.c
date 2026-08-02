@@ -1,6 +1,5 @@
 /* Merged DeepSeek V4 unit tests (GLM-style single harness). */
 #include "../deepseek_v4_internal.h"
-#include "../deepseek_v4_dspark.h"
 #include "../compat.h"
 #include "../native_quant.h"
 
@@ -43,38 +42,6 @@ static int test_attention_cache(void) {
     return 0;
 }
 /* ==== end test_deepseek_v4_attention_cache.c ==== */
-
-static int test_dspark_position_window(void) {
-    enum { WINDOW = 8 };
-    int positions[WINDOW];
-    int valid = 0;
-    for (int slot = 0; slot < WINDOW; slot++) positions[slot] = -1;
-    const int sequence[] = {0, 1, 2, 3, 8, 11, 17, 17};
-    for (size_t item = 0; item < sizeof(sequence) / sizeof(sequence[0]); item++) {
-        int position = sequence[item];
-        int slot = coli_v4_dspark_position_window_put(
-            positions, WINDOW, &valid, position);
-        if (slot != position % WINDOW) return 1;
-        int occupied = 0;
-        int64_t minimum = (int64_t)position - WINDOW + 1;
-        for (int index = 0; index < WINDOW; index++) {
-            if (positions[index] < 0) continue;
-            if ((int64_t)positions[index] < minimum ||
-                positions[index] > position)
-                return 1;
-            occupied++;
-        }
-        if (valid != occupied) return 1;
-    }
-    if (valid != 2 || positions[1] != 17 || positions[3] != 11)
-        return 1;
-    if (coli_v4_dspark_position_window_put(NULL, WINDOW, &valid, 18) >= 0 ||
-        coli_v4_dspark_position_window_put(positions, 0, &valid, 18) >= 0 ||
-        coli_v4_dspark_position_window_put(positions, WINDOW, &valid, -1) >= 0)
-        return 1;
-    puts("DeepSeek-V4 DSpark position window tests: ok");
-    return 0;
-}
 
 /* ==== begin test_deepseek_v4_config.c ==== */
 /* umbrella headers */
@@ -136,6 +103,19 @@ static int test_config(int argc, char **argv) {
         config.compress_ratio_count != 4 || config.compress_ratios[1] != 4 ||
         config.compress_ratios[2] != 128 || config.rope_factor != 4.0f)
         return 1;
+    {
+        static const char needle[] = "\"compress_ratios\":[0,4,128,0]";
+        static const char replacement[] =
+            "\"compress_ratios\":[0,4,128,0,0,0]";
+        const char *at = strstr(config_json, needle);
+        char extended[sizeof(config_json) + 8];
+        if (!at || snprintf(extended, sizeof(extended), "%.*s%s%s",
+                            (int)(at - config_json), config_json, replacement,
+                            at + strlen(needle)) < 0 ||
+            coli_v4_config_parse(&config, extended, error, sizeof(error)) != 0 ||
+            config.compress_ratio_count != 6)
+            return 1;
+    }
     static const struct {
         const char *label;
         const char *needle;
@@ -171,12 +151,12 @@ static int test_config(int argc, char **argv) {
         int flash = config.hidden_size == 4096 &&
             config.num_hidden_layers == 43 &&
             config.n_routed_experts == 256 &&
-            config.compress_ratio_count == 44 &&
+            config.compress_ratio_count >= config.num_hidden_layers &&
             config.compress_ratios[0] == 0;
         int pro = config.hidden_size == 7168 &&
             config.num_hidden_layers == 61 &&
             config.n_routed_experts == 384 &&
-            config.compress_ratio_count == 62 &&
+            config.compress_ratio_count >= config.num_hidden_layers &&
             config.compress_ratios[0] == 128;
         if ((!flash && !pro) || config.num_experts_per_tok != 6 ||
             config.compress_ratios[2] != 4 ||
@@ -670,45 +650,16 @@ static int test_resource_plan(void) {
 
     ColiDeepSeekV4ResidentTierPlan tiers;
     ColiDeepSeekV4ResidentTierInputs target_only = {
-        40 * GIB, 4 * GIB, 24 * GIB, 0, 0, 12 * GIB, 0,
+        40 * GIB, 4 * GIB, 24 * GIB, 12 * GIB,
     };
     if (coli_v4_resident_tier_plan(
             &tiers, &target_only, error, sizeof(error)) ||
-        !tiers.dense_resident || tiers.dspark_resident ||
-        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes)
+        !tiers.dense_resident || tiers.dense_bytes != 24 * GIB)
         return 1;
     target_only.available_bytes = 39 * GIB;
     if (coli_v4_resident_tier_plan(
             &tiers, &target_only, error, sizeof(error)) ||
-        tiers.dense_resident || tiers.dspark_resident || tiers.dense_bytes ||
-        tiers.dspark_bytes)
-        return 1;
-
-    ColiDeepSeekV4ResidentTierInputs with_dspark = {
-        60 * GIB, 4 * GIB, 24 * GIB, 2 * GIB, 20 * GIB, 12 * GIB, 1,
-    };
-    if (coli_v4_resident_tier_plan(
-            &tiers, &with_dspark, error, sizeof(error)) ||
-        !tiers.dense_resident || !tiers.dspark_resident ||
-        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes != 20 * GIB)
-        return 1;
-    with_dspark.available_bytes = 48 * GIB;
-    if (coli_v4_resident_tier_plan(
-            &tiers, &with_dspark, error, sizeof(error)) ||
-        !tiers.dense_resident || tiers.dspark_resident ||
-        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes != 2 * GIB)
-        return 1;
-    with_dspark.available_bytes = 40 * GIB;
-    if (coli_v4_resident_tier_plan(
-            &tiers, &with_dspark, error, sizeof(error)) ||
-        tiers.dense_resident || !tiers.dspark_resident || tiers.dense_bytes ||
-        tiers.dspark_bytes != 20 * GIB)
-        return 1;
-    with_dspark.available_bytes = 32 * GIB;
-    if (coli_v4_resident_tier_plan(
-            &tiers, &with_dspark, error, sizeof(error)) ||
-        tiers.dense_resident || tiers.dspark_resident || tiers.dense_bytes ||
-        tiers.dspark_bytes != 2 * GIB)
+        tiers.dense_resident || tiers.dense_bytes)
         return 1;
     puts("DeepSeek V4 resource plan tests: ok");
     return 0;
@@ -749,10 +700,6 @@ static int test_sparse_attention(void) {
 int main(int argc, char **argv) {
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
-        return 1;
-    }
-    if (test_dspark_position_window() != 0) {
-        fprintf(stderr, "FAIL: test_dspark_position_window\n");
         return 1;
     }
     if (test_config(argc, argv) != 0) {

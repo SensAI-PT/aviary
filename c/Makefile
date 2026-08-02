@@ -281,14 +281,13 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_config_dspark_compat
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
-	tests/test_v4_config_dspark_compat$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -391,7 +390,8 @@ endif
 
 all: colibri$(EXE)
 
-.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-check deepseek-v4-clean
+.PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
+	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 deepseek-v4:
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
@@ -399,7 +399,11 @@ deepseek-v4:
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 
-deepseek-v4-tiny-check:
+deepseek-v4-tiny-generate:
+	$(PYTHON) tools/make_deepseek_v4_tiny.py \
+		--output ./deepseek_v4_tiny --force
+
+deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(if $(strip $(ARCH)),$(ARCH),$(PORTABLE_ARCH)) deepseek-v4
 	$(PYTHON) tests/test_deepseek_v4_tiny.py \
@@ -415,8 +419,7 @@ deepseek-v4-oracle: deepseek-v4
 		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
 		--validate \
 		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
-		--greedy $(or $(ORACLE_GREEDY),20) \
-		--check-dspark
+		--greedy $(or $(ORACLE_GREEDY),20)
 else
 deepseek-v4 deepseek-v4-oracle:
 	@echo "$@ is supported only on x86-64/aarch64 Linux and Windows/MSYS2" >&2; exit 1
@@ -424,6 +427,8 @@ deepseek-v4-clean:
 	@:
 deepseek-v4-tiny-check:
 	@echo "SKIP deepseek-v4-tiny-check: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
+deepseek-v4-tiny-generate:
+	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
 
 # phony targets — 'glm' kept for backward compatibility
@@ -691,32 +696,26 @@ tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h tensor.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_safetensors_index$(EXE): tests/test_safetensors_index.c safetensors_index.c safetensors_index.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c $< -o $@ $(LDFLAGS)
-
-tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h
+tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_tensor_io$(EXE): tests/test_tensor_io.c tensor_io.c tensor_io.h native_quant.c native_quant.h safetensors_index.c safetensors_index.h tensor.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c native_quant.c tensor_io.c $< \
-		-o $@ $(LDFLAGS)
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
 V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_ST.o \
+	COLI_V4_UNIT_CONFIG.o \
 	COLI_V4_UNIT_MATH.o \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	safetensors_index.o native_quant.o
+	native_quant.o
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
-		deepseek_v4_dspark.h Makefile.deepseek-v4.units
+		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
-		COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o \
-		safetensors_index.o
+		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o
 	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
@@ -725,7 +724,8 @@ V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
-	$(V4_OWN_DIR)/safetensors_index.o
+	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
+	native_quant.o
 
 $(V4_OWN_DIR):
 	mkdir -p $(V4_OWN_DIR)
@@ -736,21 +736,12 @@ $(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c deepseek_v4.h deepseek_v4_in
 $(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
 
-$(V4_OWN_DIR)/safetensors_index.o: safetensors_index.c safetensors_index.h | $(V4_OWN_DIR)
-	$(CC) $(CFLAGS) -c safetensors_index.c -o $@
+$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 
-COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o: deepseek_v4_dspark.c deepseek_v4.h \
-		deepseek_v4_dspark.h deepseek_v4_internal.h Makefile.deepseek-v4
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
-
-tests/test_v4_config_dspark_compat$(EXE): \
-		tests/test_v4_config_dspark_compat.c \
-		COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o
-	$(CC) $(CFLAGS) $< COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o \
-		-o $@ $(LDFLAGS)
 endif
 
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
@@ -804,7 +795,6 @@ test-python: $(RANSLIB)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python
-	$(MAKE) deepseek-v4-tiny-check
 
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
 # The tiny-model assertions live in test_inefficiency.py and run as part of
@@ -835,13 +825,16 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) olmoe$(EXE)
+install: colibri$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	@if [ -f deepseek_v4$(EXE) ]; then \
+	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
+	fi
 	$(INSTALL) -m 644 resource_plan.py doctor.py autotune.py openai_server.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
@@ -863,6 +856,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle deepseek-v4-tiny-check \
+.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable \
 	test-c test-python test check clean install uninstall bench

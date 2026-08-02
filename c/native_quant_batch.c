@@ -4,6 +4,14 @@
 #include <stdlib.h>
 
 #include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 static void batch_tables(float fp4[16], float fp8[256], float e8[256]) {
     for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
@@ -86,27 +94,7 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             free(activation_scales); free(activations); return -1;
         }
-    float fp4[16], fp8_unused[256], e8[256];
-    batch_tables(fp4, fp8_unused, e8);
-    const uint8_t *packed = weight->data, *scales = weight->scales;
-    #pragma omp parallel for schedule(static)
-    for (int64_t row = 0; row < weight->rows; row++) {
-        float sums[64] = {0};
-        size_t row_data = (size_t)row * packed_stride;
-        size_t row_scale = (size_t)row * scale_stride;
-        for (size_t base = 0; base < columns; base += 32) {
-            float scale = e8[scales[row_scale + base / 32]];
-            for (size_t offset = 0; offset < 32; offset++) {
-                size_t column = base + offset;
-                uint8_t byte = packed[row_data + column / 2];
-                float value = fp4[column & 1 ? byte >> 4 : byte & 15];
-                for (int item = 0; item < batch; item++)
-                    sums[item] += activations[(size_t)item * columns + column] *
-                                  value * scale;
-            }
-        }
-        for (int item = 0; item < batch; item++)
-            outputs[(size_t)item * rows + (size_t)row] = sums[item];
-    }
+    matmul_mxfp4(outputs, activations, weight->data, weight->scales,
+                 batch, (int)columns, (int)rows);
     free(activation_scales); free(activations); return 0;
 }

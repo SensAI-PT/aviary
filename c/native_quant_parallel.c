@@ -19,58 +19,7 @@ static void build_decode_tables_v4(float fp4[16], float fp8[256],
 
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
-    if (!output || !weight || !input ||
-        weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
-        weight->scale_format != COLI_SCALE_UE8M0 ||
-        !weight->data || !weight->scales || weight->rows < 1 ||
-        weight->columns < 1 || weight->columns % 128 ||
-        weight->block_rows != 1 || weight->block_columns != 32) return -1;
-    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
-    size_t packed_stride = columns / 2, scale_stride = columns / 32;
-    if (weight->data_bytes != rows * packed_stride ||
-        weight->scale_bytes != rows * scale_stride) return -1;
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation_scales); free(activation); return -1;
-    }
-    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
-                                    input, columns, 128) != 0) {
-        free(activation_scales); free(activation); return -1;
-    }
-    float fp4[16], fp8_unused[256], e8[256];
-    build_decode_tables_v4(fp4, fp8_unused, e8);
-    const uint8_t *packed = weight->data, *scales = weight->scales;
-    int64_t tiles = (weight->rows + ROW_TILE - 1) / ROW_TILE;
-    #pragma omp parallel for schedule(static)
-    for (int64_t tile = 0; tile < tiles; tile++) {
-        int count = (int)(weight->rows - tile * ROW_TILE);
-        if (count > ROW_TILE) count = ROW_TILE;
-        size_t row_data[ROW_TILE], row_scale[ROW_TILE];
-        float sums[ROW_TILE] = {0};
-        for (int lane = 0; lane < count; lane++) {
-            size_t row = (size_t)tile * ROW_TILE + (size_t)lane;
-            row_data[lane] = row * packed_stride;
-            row_scale[lane] = row * scale_stride;
-        }
-        for (size_t base = 0; base < columns; base += 32) {
-            float block_scales[ROW_TILE];
-            for (int lane = 0; lane < count; lane++)
-                block_scales[lane] = e8[scales[row_scale[lane] + base / 32]];
-            for (size_t offset = 0; offset < 32; offset++) {
-                size_t column = base + offset;
-                float x = activation[column];
-                for (int lane = 0; lane < count; lane++) {
-                    uint8_t byte = packed[row_data[lane] + column / 2];
-                    uint8_t code = column & 1 ? byte >> 4 : byte & 15;
-                    sums[lane] += x * fp4[code] * block_scales[lane];
-                }
-            }
-        }
-        for (int lane = 0; lane < count; lane++)
-            output[(size_t)tile * ROW_TILE + (size_t)lane] = sums[lane];
-    }
-    free(activation_scales); free(activation); return 0;
+    return coli_fp4_matvec_serial_ref(output, weight, input);
 }
 
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,

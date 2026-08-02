@@ -4,6 +4,14 @@
 #include <stdlib.h>
 
 #include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 static int dual_same_shape(const ColiTensorView *a, const ColiTensorView *b) {
     return a && b && a->rows == b->rows && a->columns == b->columns &&
@@ -38,32 +46,10 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
-    float fp4[16], e8[256];
-    for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
-    for (int i = 0; i < 256; i++) e8[i] = coli_e8m0_decode((uint8_t)i);
-    const uint8_t *data_a = a->data, *data_b = b->data;
-    const uint8_t *scales_a = a->scales, *scales_b = b->scales;
-    #pragma omp parallel for schedule(static)
-    for (int64_t row = 0; row < a->rows; row++) {
-        size_t row_data = (size_t)row * packed_stride;
-        size_t row_scale = (size_t)row * scale_stride;
-        float sum_a = 0.0f, sum_b = 0.0f;
-        for (size_t base = 0; base < columns; base += 32) {
-            float scale_a = e8[scales_a[row_scale + base / 32]];
-            float scale_b = e8[scales_b[row_scale + base / 32]];
-            for (size_t offset = 0; offset < 32; offset++) {
-                size_t column = base + offset;
-                uint8_t byte_a = data_a[row_data + column / 2];
-                uint8_t byte_b = data_b[row_data + column / 2];
-                uint8_t code_a = column & 1 ? byte_a >> 4 : byte_a & 15;
-                uint8_t code_b = column & 1 ? byte_b >> 4 : byte_b & 15;
-                float x = activation[column];
-                sum_a += x * fp4[code_a] * scale_a;
-                sum_b += x * fp4[code_b] * scale_b;
-            }
-        }
-        output_a[row] = sum_a; output_b[row] = sum_b;
-    }
+    matmul_mxfp4(output_a, activation, a->data, a->scales,
+                 1, (int)columns, (int)rows);
+    matmul_mxfp4(output_b, activation, b->data, b->scales,
+                 1, (int)columns, (int)rows);
     free(activation_scales); free(activation); return 0;
 }
 
