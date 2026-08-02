@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -23,14 +24,30 @@
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
  * malloc gigante prima ancora di leggere: lo respingiamo. */
 #define ST_MAX_HEADER (512ll << 20)
+#define ST_MAX_RANK 8
+
+enum {
+    ST_DTYPE_BF16 = 0,
+    ST_DTYPE_F16,
+    ST_DTYPE_F32,
+    ST_DTYPE_U8,
+    ST_DTYPE_I8 = ST_DTYPE_U8,
+    ST_DTYPE_I64,
+    ST_DTYPE_F8_E4M3,
+    ST_DTYPE_F8_E8M0
+};
 
 typedef struct {
     char   *name;
     int     fd;
     int64_t off;       /* offset assoluto del dato dentro al file */
     int64_t nbytes;
-    int     dtype;     /* 0=BF16 1=F16 2=F32 */
+    int     dtype;     /* ST_DTYPE_* */
     int64_t numel;
+    int     shard;
+    uint64_t offset;   /* compatibility alias for off */
+    int     rank;
+    int64_t shape[ST_MAX_RANK];
 } st_tensor;
 
 typedef struct {
@@ -39,6 +56,7 @@ typedef struct {
     int        fds[512];
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
+    int64_t    sizes[512];
     int        nfd;
 #define ST_MAX_MIR 4       /* extra read replicas beyond the primary (multi-SSD) */
     int        mfds[ST_MAX_MIR][512];  /* MIRROR: fds of replica copy r+1 (multi-SSD), -1 = absent */
@@ -73,12 +91,28 @@ static uint64_t st_hash(const char *s){
 }
 
 static int st_dtype_code(const char *s) {
-    if (!strcmp(s, "BF16")) return 0;
-    if (!strcmp(s, "F16"))  return 1;
-    if (!strcmp(s, "F32"))  return 2;
-    if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
-    if (!strcmp(s, "I8"))   return 3;
+    if (!strcmp(s, "BF16")) return ST_DTYPE_BF16;
+    if (!strcmp(s, "F16"))  return ST_DTYPE_F16;
+    if (!strcmp(s, "F32"))  return ST_DTYPE_F32;
+    if (!strcmp(s, "U8"))   return ST_DTYPE_U8;
+    if (!strcmp(s, "I8"))   return ST_DTYPE_U8; /* legacy byte-container alias */
+    if (!strcmp(s, "I64"))  return ST_DTYPE_I64;
+    if (!strcmp(s, "F8_E4M3")) return ST_DTYPE_F8_E4M3;
+    if (!strcmp(s, "F8_E8M0")) return ST_DTYPE_F8_E8M0;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+}
+
+static int st_dtype_width(int dtype) {
+    switch (dtype) {
+        case ST_DTYPE_U8:
+        case ST_DTYPE_F8_E4M3:
+        case ST_DTYPE_F8_E8M0: return 1;
+        case ST_DTYPE_BF16:
+        case ST_DTYPE_F16: return 2;
+        case ST_DTYPE_F32: return 4;
+        case ST_DTYPE_I64: return 8;
+        default: return 0;
+    }
 }
 
 static inline float bf16_to_f32(uint16_t h) {
@@ -105,6 +139,7 @@ static int st_open_fd(shards *S, const char *path) {
     int fd = open(path, COMPAT_O_RDONLY);
     if (fd < 0) { perror(path); exit(1); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
+    { struct stat st; S->sizes[S->nfd] = fstat(fd, &st) == 0 ? (int64_t)st.st_size : -1; }
 #ifdef O_DIRECT
     S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
@@ -438,13 +473,17 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         struct stat sst;
         if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
         int64_t fsz = (int64_t)sst.st_size;
+        if (fsz < 8) {
+            fprintf(stderr, "%s: safetensors file is shorter than its header prefix\n", files[fi]);
+            exit(1);
+        }
         uint64_t hlen;
         st_pread_full(fd, &hlen, 8, 0, "pread hlen");
         /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
          * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
-        if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
+        if (hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
             fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
                     files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
         char *hdr = malloc(hlen + 1);
@@ -467,11 +506,20 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             /* un header crafted puo' omettere i campi o dare tipi sbagliati:
              * senza questi guard si dereferenzia NULL (json_get) o si legge
              * off->kids[0/1] oltre i limiti dell'array. */
-            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
-                !shp || shp->t != J_ARR) {
+            if (!m || m->t != J_OBJ || !dt || dt->t != J_STR ||
+                !off || off->t != J_ARR || off->len != 2 ||
+                !off->kids[0] || off->kids[0]->t != J_NUM ||
+                !off->kids[1] || off->kids[1]->t != J_NUM ||
+                !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
-            int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+            double ad = off->kids[0]->num, bd = off->kids[1]->num;
+            if (!isfinite(ad) || !isfinite(bd) || ad < 0.0 || bd < 0.0 ||
+                ad >= ldexp(1.0, 63) || bd >= ldexp(1.0, 63) ||
+                floor(ad) != ad || floor(bd) != bd) {
+                fprintf(stderr, "%s: tensor '%s' has non-integer data offsets\n",
+                        files[fi], name); exit(1); }
+            int64_t a0 = (int64_t)ad, b0 = (int64_t)bd;
             /* offset dichiarati dal file: non-negativi, ordinati e dentro al
              * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
              * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
@@ -485,8 +533,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * numel*esz==nbytes in st_read_f32, riaprendo l'OOB. */
             int64_t numel = 1; int bad_shape = 0;
             for (int k = 0; k < shp->len; k++) {
-                int64_t d = (int64_t)shp->kids[k]->num;
-                if (d < 0 || (d != 0 && numel > INT64_MAX / d)) { bad_shape = 1; break; }
+                jval *dim = shp->kids[k];
+                if (!dim || dim->t != J_NUM || !isfinite(dim->num) ||
+                    dim->num < 0.0 || dim->num >= ldexp(1.0, 63) ||
+                    floor(dim->num) != dim->num) { bad_shape = 1; break; }
+                int64_t d = (int64_t)dim->num;
+                if (d != 0 && numel > INT64_MAX / d) { bad_shape = 1; break; }
                 numel *= d;
             }
             if (bad_shape) {
@@ -499,19 +551,27 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 S->t = nt;
             }
             st_tensor *t = &S->t[S->n++];
+            memset(t, 0, sizeof(*t));
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->shard = st_fidx(S, fd); t->offset = (uint64_t)t->off;
+            t->rank = shp->len;
+            for (int k = 0; k < shp->len; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
-            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
-              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+            { int esz = st_dtype_width(t->dtype);
+              int packed_raw = t->dtype == ST_DTYPE_U8;
+              if (!packed_raw && (esz == 0 ||
+                  (numel != 0 && numel > INT64_MAX / esz) ||
+                  t->nbytes != numel * (int64_t)esz)) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        json_free(root);
+        free(arena);
         free(hdr);
     }
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
@@ -520,7 +580,13 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
     for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
     for (int i = 0; i < S->n; i++) {
         uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
-        while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
+        while (S->hidx[h] >= 0) {
+            if (!strcmp(S->t[S->hidx[h]].name, S->t[i].name)) {
+                fprintf(stderr, "duplicate tensor: %s\n", S->t[i].name);
+                exit(1);
+            }
+            h = (h + 1) & (S->hcap - 1);
+        }
         S->hidx[h] = i;
     }
 }
@@ -705,6 +771,56 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+}
+
+/* Range helpers and lifecycle support for engines that keep a shards index in
+ * an owned runtime object. These are non-fatal once indexing has succeeded. */
+static int st_read_at_range(shards *S, int shard, uint64_t offset,
+                            size_t length, void *destination) {
+    if (!S || !destination || shard < 0 || shard >= S->nfd ||
+        S->sizes[shard] < 0 || offset > (uint64_t)S->sizes[shard] ||
+        length > (uint64_t)S->sizes[shard] - offset)
+        return -1;
+    unsigned char *output = (unsigned char *)destination;
+    size_t done = 0;
+    while (done < length) {
+        ssize_t count = pread(S->fds[shard], output + done, length - done,
+                              (off_t)(offset + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        done += (size_t)count;
+    }
+    return 0;
+}
+
+static int st_prefetch_at_range(shards *S, int shard, uint64_t offset,
+                                size_t length) {
+    if (!S || shard < 0 || shard >= S->nfd || S->sizes[shard] < 0 ||
+        offset > (uint64_t)S->sizes[shard] ||
+        length > (uint64_t)S->sizes[shard] - offset)
+        return -1;
+    return posix_fadvise(S->fds[shard], (off_t)offset, (off_t)length,
+                         POSIX_FADV_WILLNEED);
+}
+
+static void st_destroy(shards *S) {
+    if (!S) return;
+    st_mirror_reset(S);
+    for (int i = 0; i < S->n; i++) free(S->t[i].name);
+    for (int i = 0; i < S->nfd; i++) {
+        if (S->fds[i] >= 0) close(S->fds[i]);
+        if (S->dfds[i] >= 0) close(S->dfds[i]);
+        free(S->paths[i]);
+    }
+    for (int i = 0; i < S->fmt_n; i++) {
+        free(S->fmt_name[i]);
+        free(S->fmt_val[i]);
+    }
+    free(S->fmt_name);
+    free(S->fmt_val);
+    free(S->hidx);
+    free(S->t);
+    memset(S, 0, sizeof(*S));
 }
 
 #endif
