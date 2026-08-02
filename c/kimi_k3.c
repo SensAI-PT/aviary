@@ -1264,24 +1264,43 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
-    /* Serve calls this once per request. It used to calloc Lc/Rc over the old
-     * pointers without freeing them, leaking n_layers x max_t x (kv_lora +
-     * qk_rope) floats every turn — on K3's 24 MLA layers at 4k context that is
-     * hundreds of MB per conversation. Keep the buffers when they are already
-     * big enough, which is also what makes prefix reuse possible: growing them
-     * discards the positions fed[] describes. */
+    /* Serve calls this once per request, and it used to calloc Lc/Rc over the
+     * old pointers without freeing them: n_layers x max_t x (kv_lora +
+     * qk_rope) floats leaked every turn, hundreds of MB over a conversation on
+     * the 24 MLA layers at 4k context.
+     *
+     * GROW, DO NOT RESTART. Freeing and re-allocating also discards every
+     * position already computed, which defeats KV prefix reuse in the one case
+     * it exists for: a conversation whose prompt is longer every turn asks for
+     * a larger max_t every turn, so the state would be thrown away immediately
+     * before the point of using it. (Caught by CI on the Inkling side, where
+     * the same shape of bug sat in the same place.)
+     *
+     * Lc/Rc are laid out [position][kv_lora] and [position][qk_rope], so unlike
+     * inkling's head-major K/V a grow is a straight prefix copy — no re-layout.
+     * The 69 KDA layers are untouched here: their recurrent state does not
+     * scale with max_t and survives on its own. */
     if(m->Lc && max_t<=m->max_t) return;
-    if(m->Lc) for(int i=0;i<c->n_layers;i++){ free(m->Lc[i]); free(m->Rc[i]); }
-    free(m->Lc); free(m->Rc);
+
+    float **oldL=m->Lc, **oldR=m->Rc;
+    int keep=(m->Lc && m->kvp.len>0 && m->kvp.len<=max_t) ? m->kvp.len : 0;
+
     m->max_t=max_t;
     m->Lc=calloc(c->n_layers,sizeof(float*));
     m->Rc=calloc(c->n_layers,sizeof(float*));
-    /* the record is sized with the KV it describes; growing discards it */
-    kv_prefix_alloc(&m->kvp,max_t);
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
         m->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         m->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
+        if(keep){
+            memcpy(m->Lc[i], oldL[i], (size_t)keep*c->kv_lora*sizeof(float));
+            memcpy(m->Rc[i], oldR[i], (size_t)keep*c->qk_rope*sizeof(float));
+        }
     }
+    if(oldL) for(int i=0;i<c->n_layers;i++){ free(oldL[i]); free(oldR[i]); }
+    free(oldL); free(oldR);
+
+    /* the record describes those same positions, so it survives with them */
+    if(!kv_prefix_grow(&m->kvp,max_t,keep)) kv_prefix_clear(&m->kvp);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -1517,10 +1536,20 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
      * the emitted tokens are unchanged in both cases. */
     kv_alloc(m,np+q->max_tok+8);
     int reuse=kv_prefix_reuse(&m->kvp, ids, np);
+    if(getenv("K3_PREFIX_LOG")){
+        /* Report the decision either way, with the state behind a "no".
+         * "It did not get faster" is otherwise the same observation as
+         * "reuse is not wired up" — for a user as much as for a test. */
+        if(reuse)
+            fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse,np,100.0*reuse/np);
+        else
+            fprintf(stderr,"[PREFIX] no reuse: held=%d cap=%d prompt=%d%s\n",
+                    m->kvp.len,m->kvp.cap,np,
+                    (m->kvp.len>0 && m->kvp.len<np) ? " (diverged)" : "");
+        fflush(stderr);
+    }
     if(!reuse) model_state_reset(m);
-    else if(getenv("K3_PREFIX_LOG"))
-        fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
-                reuse,np,100.0*reuse/np);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
