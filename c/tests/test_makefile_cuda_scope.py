@@ -32,10 +32,16 @@ def recipe(target, *variables):
 
 
 def cuda_flag_is_accepted():
-    """CUDA=1 is a hard error outside Linux ("supported only on Linux"), so on
-    macOS and Windows there is no recipe to inspect at all — the assertions
-    below would fail on an absence rather than a regression."""
-    return "only on Linux" not in recipe("colibri", "CUDA=1")
+    """Whether this toolchain emits a CUDA recipe at all.
+
+    CUDA=1 is a hard error off Linux and the wording differs per platform
+    ("supported only on Linux" on macOS, "On Windows use: make CUDA_DLL=1" under
+    MSYS2), so matching the message is fragile — the Windows text was missed the
+    first time and the job failed on an absence rather than a regression. Test
+    the FACT instead: if the engine that definitely HAS a CUDA backend does not
+    receive -DCOLI_CUDA, there is no recipe here worth inspecting.
+    """
+    return "-DCOLI_CUDA" in recipe("colibri", "CUDA=1")
 
 
 @unittest.skipUnless(shutil.which("make"), "make is not installed")
