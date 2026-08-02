@@ -1707,10 +1707,21 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
      * brings its own audio must not match a text-only state either. */
     if (naud > 0) kv_prefix_taint(&m->kvp);
     int reuse = kv_prefix_reuse(&m->kvp, ids, np);
+    if (getenv("INK_PREFIX_LOG")) {
+        /* Report the decision either way, with the reason when it is no. "It
+         * did not get faster" is otherwise indistinguishable from "reuse is not
+         * wired up", both for a user and for the CI gate. */
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, np, 100.0 * reuse / np);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
+                    m->kvp.len, m->kvp.cap, np,
+                    m->kvp.tainted ? " tainted" : "",
+                    (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
+        fflush(stderr);
+    }
     if (!reuse) state_reset(m);
-    else if (getenv("INK_PREFIX_LOG"))
-        fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
-                reuse, np, 100.0 * reuse / np);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */

@@ -15,6 +15,7 @@ why this gate lives in CI on a fixture rather than in a benchmark on hardware.
 import json
 import os
 import subprocess
+import threading
 import sys
 import time
 import unittest
@@ -71,6 +72,13 @@ class Engine:
         self.p = subprocess.Popen([str(ENGINE), "8"], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, bufsize=0)
+        # Drain stderr continuously. Reading it only at close() loses whatever
+        # the engine wrote after the pipe filled, and an empty capture is
+        # indistinguishable from an engine that said nothing -- which is exactly
+        # the ambiguity that made the first failure here unreadable.
+        self._err = []
+        self._pump = threading.Thread(target=self._drain, daemon=True)
+        self._pump.start()
         deadline = time.time() + 300
         while time.time() < deadline:
             line = self.p.stdout.readline()
@@ -102,13 +110,18 @@ class Engine:
             elif kind == "ERROR":
                 raise RuntimeError(f"engine error: {text}")
 
+    def _drain(self):
+        for line in iter(self.p.stderr.readline, b""):
+            self._err.append(line.decode(errors="replace"))
+
     def close(self):
         try:
             self.p.stdin.close()
             self.p.wait(timeout=60)
         except Exception:
             self.p.kill()
-        return self.p.stderr.read().decode(errors="replace")
+        self._pump.join(timeout=10)
+        return "".join(self._err)
 
 
 @unittest.skipUnless(ENGINE.exists(), "inkling is not built")
@@ -145,7 +158,8 @@ class InklingPrefixServeTest(unittest.TestCase):
 
         self.assertIn("[PREFIX] reusing", log,
                       "the second turn did not reuse the first turn's state; "
-                      "this test proves nothing unless it does")
+                      "this test proves nothing unless it does.\n"
+                      "engine said:\n" + (log or "(nothing on stderr)"))
         self.assertEqual(reused, fresh,
                          "reusing the prefix changed the output — the engine "
                          "answered from a state that is not this conversation")
