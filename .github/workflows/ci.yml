@@ -73,12 +73,11 @@ jobs:
       # tests do not apply. They need no GPU and no HIP SDK — the fixtures are
       # stub DLLs this job's MinGW gcc/objdump build on the fly.
       #
-      # shell: pwsh overrides the job default on purpose. Under the MSYS2 shell
-      # the UCRT64 interpreter reports os.sep == '/', so the loader's
-      # backslash-joined paths compare unequal and the path tests fail; the same
-      # interpreter reports '\' when launched from PowerShell. Run the tests from
-      # pwsh with the runner's native CPython, and put MSYS2's UCRT64 bin on PATH
-      # only so gcc/objdump are reachable for fixture compilation.
+      # shell: pwsh overrides the job default so the tests run outside the MSYS2
+      # shell; MSYS2 is on PATH only so gcc/objdump/make are reachable for
+      # fixture compilation. The tests themselves are separator-agnostic (they
+      # normalise both sides before comparing), so neither interpreter choice nor
+      # the shape of the temp root can decide the outcome.
       - name: Windows backend-loader contract tests (no GPU)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -101,12 +100,9 @@ jobs:
                          'HIP_VISIBLE_DEVICES','CUDA_VISIBLE_DEVICES') {
             Remove-Item "env:$v" -ErrorAction SilentlyContinue
           }
-          python -c "import sys, os; print('python', sys.executable); print('os.sep', repr(os.sep))"
+          python -c "import sys, os, tempfile; print('python', sys.executable); print('os.sep', repr(os.sep)); print('tmp', tempfile.gettempdir())"
           gcc --version | Select-Object -First 1
           make --version | Select-Object -First 1
-          if ((python -c "import os; print(os.sep)") -ne '\') {
-            throw "expected a native Windows CPython (os.sep '\'); the loader path tests need it"
-          }
           cd c
           $out = python -m unittest tests.test_backend_loader -v 2>&1 | Out-String
           $out

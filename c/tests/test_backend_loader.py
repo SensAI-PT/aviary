@@ -129,6 +129,19 @@ _FORBIDDEN_IMPORT_MARKERS = ("cudart", "nvcuda", "hiprtc", "rocblas", "rocwmma",
 _RUNTIME_MARKER_A = 0xA1
 _RUNTIME_MARKER_B = 0xB2
 _RUNTIME_BASENAME = "amdhip64_7.dll"
+
+
+def _same_path(a, b):
+    """Compare two Windows paths as paths, not as strings.
+
+    Both separator conventions can be live in one process: under MSYS2 the temp
+    root arrives as ``D:/a/_temp/msys64/tmp/...`` with forward slashes, while the
+    loader joins with ``\\`` -- which is the correct Windows separator and is not
+    something the loader should change. Comparing the two as raw strings then
+    fails on the separator alone, so normalise both sides instead.
+    """
+    return (os.path.normcase(os.path.normpath(str(a)))
+            == os.path.normcase(os.path.normpath(str(b))))
 _TEST_ACCESSOR = "coli_test_bound_runtime"
 _RUNTIME_DIR_VAR = "COLI_HIP_RUNTIME_DIR"
 
@@ -1686,8 +1699,10 @@ class LoaderPathHelperTest(_HelperTestBase):
         f = self.fixture
         proc, out = f.run_helper("configured", f.runtime_a_dir)
         self.assertEqual(out.get("valid"), "1", proc.stdout)
-        self.assertEqual(out["cfg_path"],
-                         str(f.runtime_a_dir / _RUNTIME_BASENAME))
+        self.assertTrue(_same_path(out["cfg_path"],
+                                   f.runtime_a_dir / _RUNTIME_BASENAME),
+                        "%r != %r" % (out["cfg_path"],
+                                      str(f.runtime_a_dir / _RUNTIME_BASENAME)))
         self.assertTrue(out["cfg_final"].lower().endswith(_RUNTIME_BASENAME))
         self.assertEqual(out.get("cfg_error"), "0")
 
@@ -1697,7 +1712,9 @@ class LoaderPathHelperTest(_HelperTestBase):
         proc, out = self.fixture.run_helper("configured", missing)
         self.assertEqual(out.get("valid"), "0", proc.stdout)
         # The path is still built, so a diagnostic can name it.
-        self.assertEqual(out["cfg_path"], str(missing / _RUNTIME_BASENAME))
+        self.assertTrue(_same_path(out["cfg_path"], missing / _RUNTIME_BASENAME),
+                        "%r != %r" % (out["cfg_path"],
+                                      str(missing / _RUNTIME_BASENAME)))
         self.assertNotEqual(out.get("cfg_error"), "0")
 
 
