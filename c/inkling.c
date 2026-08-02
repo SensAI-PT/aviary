@@ -33,7 +33,8 @@
 #endif
 #include "st.h"
 #include "tok.h"
-#include "route_trace.h"                          /* shared routing telemetry (#700) */
+#include "route_trace.h"
+#include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -143,6 +144,9 @@ typedef struct {
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
+    /* KV prefix reuse: what the current K/V and conv states were built from.
+     * See kv_prefix.h — recorded where the tokens are fed, never derived. */
+    kv_prefix kvp;
 } Model;
 
 /* ---------- utility ---------- */
@@ -1406,6 +1410,11 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos0 + S;
+    /* record what was just fed, at the positions it went to (kv_prefix.h).
+     * Audio taints the record: every frame carries the same token id while the
+     * mel payload differs, so ids alone cannot tell two clips apart. */
+    kv_prefix_record(&m->kvp, ids, pos0, S);
+    if (dmel && naud > 0) kv_prefix_taint(&m->kvp);
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
     if (tf_out) {
@@ -1431,6 +1440,7 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 static void state_reset(Model *m) {
     Cfg *c = &m->c;
     m->kv_len = 0;
+    kv_prefix_clear(&m->kvp);
     for (int i = 0; i < c->n_layers; i++) {
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++)
@@ -1443,6 +1453,11 @@ static void kv_alloc(Model *m, int max_t) {
     if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
     if (m->K) for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
     free(m->K); free(m->V);
+    /* The record is sized with the KV it describes: growing these buffers
+     * discards the positions it refers to, so it is dropped at the same
+     * moment. A failed allocation just disables reuse. */
+    kv_prefix_alloc(&m->kvp, max_t);
+    m->kv_len = 0;
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
@@ -1646,13 +1661,38 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
                m->audio_norm ? "" : " — snapshot has no audio tensors");
         fflush(stdout); free(ids); return;
     }
-    state_reset(m);
+    /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
+     * A chat client resends the whole transcript each turn, so turn N used to
+     * re-process turns 1..N-1 from scratch — the cost of a message grew with
+     * the conversation, and every replayed position pulled its experts off
+     * disk again. When this prompt begins with the sequence the state already
+     * holds, that state IS the state at that position: keep it and prefill
+     * only the tail.
+     *
+     * Requirements, all necessary:
+     *   - kv_alloc must not have grown (it frees the K/V fed[] describes), so
+     *     the reuse decision is taken AFTER it
+     *   - at least one new token, since the state cannot be rewound
+     *   - no audio on either side: every audio frame carries the same token id,
+     *     so ids alone cannot tell two different clips apart
+     * Either the reused positions are token-identical or nothing is reused;
+     * the emitted tokens are unchanged in both cases. */
     kv_alloc(m, np + q->max_tok + 8);
+    /* naud>0 taints this turn before the comparison, not after: a request that
+     * brings its own audio must not match a text-only state either. */
+    if (naud > 0) kv_prefix_taint(&m->kvp);
+    int reuse = kv_prefix_reuse(&m->kvp, ids, np);
+    if (!reuse) state_reset(m);
+    else if (getenv("INK_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                reuse, np, 100.0 * reuse / np);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
-    float *logit = step_mm(m, ids, np, 0, NULL, q->audio, naud);
+    /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
+     * the KV slots are position-indexed, so this has to be the real offset. */
+    float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
