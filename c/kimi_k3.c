@@ -1497,7 +1497,12 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
     ChatB b={T,ids,0,cap,
         chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
         chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
-    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0) return -1;
+    /* -2, not -1: the caller must be able to tell a bad payload from a snapshot
+     * whose tokenizer has no XTML tokens. Serve reported both as "invalid K3
+     * chat payload", which sent at least one user hunting through a request
+     * body that was perfectly well formed. The CLI path has always named the
+     * real cause; serve now does too. */
+    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0) return -2;
     sp[0]=b.sp_open; sp[1]=b.sp_close; sp[2]=b.sp_sep; sp[3]=b.sp_eom;
     const char *p=wire, *end=wire+nwire;
     if(nwire<8||memcmp(p,"K3CHAT1\n",8)) return -1;
@@ -1602,6 +1607,17 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     if(m->c.bos>=0) ids[np++]=m->c.bos;
     if(q->plen>=8&&!memcmp(q->payload,"K3CHAT1\n",8)){
         int n=chat_build_wire(T,q->payload,q->plen,&thinking,ids+np,cap-np,sp);
+        if(n==-2){
+            /* Not the request's fault: this snapshot's tokenizer.json has no
+             * <|open|>/<|close|>/<|sep|>/<|end_of_msg|>, so no chat turn can be
+             * built from it. Say that, and say where a usable one comes from. */
+            printf("ERROR %s tokenizer.json has no XTML chat tokens "
+                   "(<|open|> <|close|> <|sep|> <|end_of_msg|>); "
+                   "regenerate it with tools/k3_tokenizer.py\n",q->id);
+            fflush(stdout);
+            fprintf(stderr,"[K3] chat: XTML special tokens not in tokenizer.json — "
+                           "regenerate with tools/k3_tokenizer.py\n");
+            free(ids); return; }
         if(n<0){ printf("ERROR %s invalid K3 chat payload\n",q->id); fflush(stdout); free(ids); return; }
         np+=n; chat=1;
     } else {
