@@ -181,7 +181,7 @@ available.
 → CUDA attention+dense 0.72 → **1.07 tok/s** with the GPU-resident pipeline at
 decode ([#273](https://github.com/JustVugg/colibri/issues/273), merged in #274).
 
-## AMD GPU (experimental)
+## AMD GPU
 
 The AMD sibling of the CUDA split above, and the same reasoning: MinGW gcc
 cannot compile `.cu`, and Windows hipcc targets the MSVC ABI, so the backend is
@@ -189,13 +189,15 @@ built into a standalone `coli_hip.dll` rather than linked into the host. The
 same `c/backend_cuda.cu` and the same `coli_cuda_*` ABI the Linux HIP path
 already reuses are used unchanged — see [GPU_BACKENDS.md](../GPU_BACKENDS.md).
 
-> **Still experimental: no validated end-to-end AMD GPU inference on Windows.**
-> The host now has a complete runtime-loading path — it resolves and loads
-> `coli_hip.dll`, and enforces which HIP runtime that DLL binds to — but none
-> of it has been exercised against real hardware yet. Nothing here claims
-> working inference, verified token generation, or upstream acceptance. Real
-> `gfx1151` validation is the next step, and until it happens treat this as a
-> developer-facing path only. The CPU path is unaffected and always available.
+> **Validated end to end on one configuration.** The host resolves and loads
+> `coli_hip.dll`, enforces which HIP runtime that DLL binds to, and has been
+> exercised on real hardware: an AMD Radeon(TM) 8060S Graphics reporting
+> `gfx1151`. Teacher forcing and a fixed-length free decode both produced the
+> same token IDs on CPU and on the hybrid HIP path.
+>
+> That is one GPU, one SDK and one toolchain — see
+> [Tested and untested](#amd-tested-and-untested) for the exact boundary before
+> you rely on it. The CPU path is unaffected and always available.
 
 ### What you need
 
@@ -234,13 +236,46 @@ Generated artifacts: `c/coli_hip.dll`, plus `c/coli_hip.lib` if the linker emits
 an import library (and `.exp`/`.pdb` on toolchains that produce them). All are
 git-ignored and removed by `make -C c clean`.
 
-> **Validated on:** AMD Radeon 8060S (`gfx1151`) with a source-built HIP SDK and
-> Visual Studio 2022 (MSVC 14.44). Other SDK versions and MSVC toolchains are
-> expected to work but have not been exercised — there is **no hosted CI
-> coverage** for this path, because no hosted runner ships a Windows HIP
-> toolchain.
+> **Validated on:** AMD Radeon(TM) 8060S Graphics (`gfx1151`), TheRock HIP
+> 7.14.60850, Visual Studio 2022 MSVC **14.44.35207**, Windows SDK
+> **10.0.26100.0**. Other SDK versions and MSVC toolchains are expected to work
+> but have not been exercised — there is **no hosted CI coverage** for this
+> path, because no hosted runner ships a Windows HIP toolchain or an AMD GPU.
 
-### Runtime setup (experimental, developer-facing)
+#### Pin the MSVC toolset
+
+hipcc's clang picks the **newest** installed MSVC toolset. On a machine that
+also carries Visual Studio 2026 that is MSVC **14.51.36231**, whose `<cmath>`
+declares comparison builtins that collide with HIP's `__device__` overloads, and
+the backend fails to compile. Pin the toolset for the build shell:
+
+```powershell
+$vs2022 = "C:\Program Files\Microsoft Visual Studio\2022\Community"
+$env:VCToolsVersion     = "14.44.35207"
+$env:VCToolsInstallDir  = "$vs2022\VC\Tools\MSVC\14.44.35207\"
+```
+
+VS2026 may stay installed; it simply must not be the toolset hipcc selects.
+
+#### Isolate a stale machine-wide `HIP_PATH`
+
+The HIP SDK installer sets a machine-wide `HIP_PATH`, and on a machine with more
+than one ROCm/HIP install it can point somewhere you did not intend. Override it
+**inside the build shell only** — do not edit the machine-wide value:
+
+```powershell
+$env:HIP_PATH = $sdk          # the SDK you actually want, for this shell only
+# ROCM_PATH / ROCM_HOME / HIP_DEVICE_LIB_PATH are read by the ROCm toolchain, not
+# by Colibri; clear them so a second install cannot redirect headers or bitcode:
+Remove-Item env:ROCM_PATH, env:ROCM_HOME, env:HIP_DEVICE_LIB_PATH -EA SilentlyContinue
+```
+
+The build shell also needs `C:\Windows\System32` on `PATH` (native executables
+invoked by the toolchain fail without it), and a writable `TMP`/`TEMP`/`TMPDIR`
+— clang writes temporary files there and reports "unable to make temporary file"
+when they are unset, which MSYS2 shells commonly leave empty.
+
+### Runtime setup
 
 Running a HIP host needs two things in place. Both are checked before any GPU
 work starts, and anything that cannot be proven disables the GPU tier rather
@@ -291,6 +326,77 @@ not been validated on hardware here.
 **CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
 entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
 
+### Putting model tensors on the GPU — and checking that it happened
+
+`COLI_CUDA=1` initialises the backend. It does **not**, on its own, put a single
+model tensor on the GPU. Add `CUDA_DENSE=1` to make the dense tensors eligible:
+
+```powershell
+$env:COLI_CUDA  = "1"
+$env:COLI_GPU   = "0"
+$env:CUDA_DENSE = "1"
+$env:COLI_HIP_RUNTIME_DIR = "$sdk\bin"
+.\colibri.exe 64 16 16
+```
+
+Routed experts stay on **CPU** in this configuration. They become GPU-eligible
+only through the existing expert-placement controls (`CUDA_EXPERT_GB` together
+with a pin or usage source); that combination has not been validated on Windows
+HIP.
+
+**Verify residency — the device line is not proof.** A run can print
+
+```
+[CUDA] device 0: AMD Radeon(TM) 8060S Graphics, 84.0 GB VRAM, sm_115
+```
+
+and still execute every tensor on the CPU. The line that settles it is printed
+at the end of the run:
+
+```
+[CUDA] resident set: 46 tensors, 0.00 GB VRAM
+```
+
+`N = 0` means **no model tensor was resident on the GPU**, even though the
+device was discovered — the usual cause is `CUDA_DENSE` not being set. Treat
+`resident set: N tensors` with `N > 0` as the evidence, and check it every time.
+(The `GB` figure rounds at 1e9, so a small model legitimately shows `0.00 GB`
+alongside a non-zero tensor count.)
+
+**CPU fallback keeps the command successful.** If a tensor fails to upload, the
+engine logs it, moves that tensor to the CPU and carries on; the process still
+exits 0 and the numbers stay correct. You get a line per tensor for the first
+few, an escalation notice once several have failed, and a final count:
+
+```
+[CUDA] N tensors ran on CPU after failed uploads: this run did NOT use the GPU for them.
+```
+
+Read those together with the resident set — a run can be *partly* on the GPU.
+
+**Lifecycle.** Normal one-shot model exits rely on **Windows process teardown**
+to release the backend and the HIP runtime; `coli_cuda_shutdown` is not called
+on the ordinary teacher-forcing or decode exit paths. This matches the existing
+Windows CUDA host behaviour and is safe for one-shot CLI use — it is process
+teardown, not an explicit backend shutdown.
+
+<a id="amd-tested-and-untested"></a>
+### Tested and untested
+
+**Tested**, on the configuration named above: the native Windows HIP build; the
+host loading `coli_hip.dll` from its own directory; exact runtime binding with
+fail-closed identity and duplicate-runtime checks; device discovery reporting
+`gfx1151`; a real GPU kernel returning results identical to the CPU reference;
+teacher forcing against the bundled synthetic oracle; and a fixed-length free
+decode producing the same token IDs on CPU and on the hybrid HIP path, with 46
+dense tensors resident.
+
+**Not tested, and not claimed:** routed experts on the GPU or full-GPU MoE
+inference; production-scale models; performance, throughput or memory-scaling
+conclusions; long-run or server-mode stability; any GPU, driver, SDK or MSVC
+toolchain other than the one listed; and behaviour against upstream `dev`
+commits made after this work was validated.
+
 ### Generating the synthetic GLM oracle model
 
 To exercise the engine end to end you need *a* model, and the smallest one is
@@ -310,7 +416,7 @@ binary and needs no Python once the model files exist.
 **1. Create an isolated environment.** Nothing is installed system-wide:
 
 ```powershell
-$tooling = "C:\Development\colibri-validation\glm-oracle-tooling"
+$tooling = "$env:USERPROFILE\colibri-oracle-tooling"   # anywhere outside the repo
 uv venv --python "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" "$tooling\venv"
 
 # CPU-only Torch from the official PyTorch CPU index; the rest from PyPI
@@ -341,10 +447,11 @@ current directory. `c/ref_glm.json` is a tracked file, so generating inside `c/`
 would overwrite it. Run it from outside the repository instead:
 
 ```powershell
-$out = "$tooling\model"
+$repo = "<your colibri checkout>"       # e.g. "$env:USERPROFILE\src\colibri"
+$out  = "$tooling\model"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 Push-Location $out
-& "$tooling\venv\Scripts\python.exe" C:\Development\colibri\c\tools\make_glm_oracle.py
+& "$tooling\venv\Scripts\python.exe" "$repo\c\tools\make_glm_oracle.py"
 Pop-Location
 # -> $out\glm_tiny\{config.json,model.safetensors} and $out\ref_glm.json
 ```
