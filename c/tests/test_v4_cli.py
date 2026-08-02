@@ -1,19 +1,19 @@
+import argparse
 import importlib.machinery
 import importlib.util
-import argparse
-import subprocess
-import sys
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent.parent
-CLI = HERE / "v4"
+CLI = HERE / "coli"
 
 
 def load_cli():
-    loader = importlib.machinery.SourceFileLoader("v4_cli", str(CLI))
+    loader = importlib.machinery.SourceFileLoader("coli_v4_cli_test", str(CLI))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -21,104 +21,70 @@ def load_cli():
 
 
 class V4CliTest(unittest.TestCase):
-    def run_cli(self, *args):
-        return subprocess.run(
-            [sys.executable, str(CLI), *args],
-            cwd=HERE,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_cli()
+
+    def make_model(self, model_type="deepseek_v4"):
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        (root / "config.json").write_text(
+            json.dumps({"model_type": model_type}), encoding="utf-8"
         )
+        (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+        return directory, root
 
-    def test_chat_help_uses_explicit_model_and_ram(self):
-        result = self.run_cli("chat", "--help")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--model", result.stdout)
-        self.assertIn("--ram", result.stdout)
+    def test_model_arch_detects_deepseek_v4(self):
+        directory, root = self.make_model()
+        try:
+            self.assertEqual(self.cli.model_arch(str(root)), "deepseek_v4")
+        finally:
+            directory.cleanup()
 
-    def test_model_is_required(self):
-        result = self.run_cli("chat", "--ram", "24")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--model", result.stderr)
+    def test_engine_for_selects_deepseek_v4_binary(self):
+        directory, root = self.make_model()
+        try:
+            expected = "deepseek_v4.exe" if os.name == "nt" else "deepseek_v4"
+            self.assertEqual(Path(self.cli.engine_for(str(root))).name, expected)
+        finally:
+            directory.cleanup()
 
-    def test_missing_model_is_reported_before_engine(self):
-        with tempfile.TemporaryDirectory() as directory:
-            missing = str(Path(directory) / "missing")
-            result = self.run_cli("chat", "--model", missing, "--ram", "24")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("model not found", result.stderr)
+    def test_v4_engine_environment_forwards_ram_and_context(self):
+        args = argparse.Namespace(ngen=8, temp=0.0, ram=64, ctx=4096)
+        env = self.cli.env_for_engine(args, "deepseek_v4")
+        self.assertEqual(env["NGEN"], "8")
+        self.assertEqual(env["RAM_GB"], "64")
+        self.assertEqual(env["CTX"], "4096")
 
-    def test_multi_turn_prompt_format(self):
-        cli = load_cli()
-        history = cli.new_history("Be concise.")
-        prompt = cli.turn_prompt(history, "Hello", False)
+    def test_openai_renderer_uses_native_v4_multiturn_template(self):
+        import openai_server
+
+        prompt = openai_server.render_chat_v4(
+            [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+                {"role": "user", "content": "Again"},
+            ],
+            enable_thinking=True,
+        )
         self.assertEqual(
             prompt,
-            cli.BOS + "Be concise." + cli.USER + "Hello" + cli.ASSISTANT + "</think>",
-        )
-        history = cli.completed_history(prompt, "Hi!")
-        next_prompt = cli.turn_prompt(history, "Again", True)
-        self.assertEqual(
-            next_prompt,
-            prompt + "Hi!" + cli.EOS + cli.USER + "Again" + cli.ASSISTANT + "<think>",
+            "<\uff5cbegin\u2581of\u2581sentence\uff5c>Be concise."
+            "<\uff5cUser\uff5c>Hello<\uff5cAssistant\uff5c></think>Hi!"
+            "<\uff5cend\u2581of\u2581sentence\uff5c>"
+            "<\uff5cUser\uff5c>Again<\uff5cAssistant\uff5c><think>",
         )
 
-    def test_compact_stats_uses_wall_ttft_and_ram_plan(self):
-        cli = load_cli()
-        log = (
-            "ram_tiers available=24.00GiB dense=resident projected=23.95GiB\n"
-            "prefill_timing startup=2.0s wall_to_first=15.500s "
-            "target_tok_s=2.0 combined_tok_s=1.250000\n"
-            "decode_timing tokens=4 seconds=4.0 tok_s=1.000000\n"
-            "summary dspark_rounds=1 proposed=4 accepted=2 rate=0.500 enabled=1\n"
-        )
-        self.assertEqual(
-            cli.compact_stats(log),
-            "RAM 23.95/24.00 GiB | TTFT 15.50s | prefill 1.250 tok/s | "
-            "decode 1.000 tok/s | DSpark acceptance 50.0%",
-        )
+    def test_openai_renderer_rejects_unwired_tools(self):
+        import openai_server
 
-    def test_engine_command_prefers_prompt_file(self):
-        cli = load_cli()
-        args = argparse.Namespace(
-            model=str(HERE), draft_model=None, ngen=32, ram=0,
-            stop_sentence=False,
-        )
-        command = cli.engine_command(args, raw=True, prompt_file=r"C:\tmp\prompt.txt")
-        self.assertIn("--prompt-file", command)
-        self.assertIn("--no-dspark", command)
-        self.assertIn(r"C:\tmp\prompt.txt", command)
-        self.assertNotIn("你好", command)
+        with self.assertRaises(openai_server.APIError):
+            openai_server.render_chat_v4(
+                [{"role": "user", "content": "hello"}],
+                tools=[{"type": "function"}],
+            )
 
-    def test_engine_command_enables_explicit_dspark_model(self):
-        cli = load_cli()
-        args = argparse.Namespace(
-            model=str(HERE), draft_model=str(HERE / "draft"), ngen=1,
-            ram=0, stop_sentence=False,
-        )
-        command = cli.engine_command(args, prompt="hello")
-        self.assertIn("--draft-model", command)
-        self.assertIn(str((HERE / "draft").resolve()), command)
-        self.assertNotIn("--no-dspark", command)
-
-    def test_engine_command_keeps_combined_dspark_default(self):
-        cli = load_cli()
-        args = argparse.Namespace(
-            model=str(HERE), draft_model=None, model_has_dspark=True,
-            ngen=1, ram=0, stop_sentence=False,
-        )
-        command = cli.engine_command(args, prompt="hello")
-        self.assertNotIn("--no-dspark", command)
-        self.assertNotIn("--draft-model", command)
-
-    def test_write_prompt_file_is_utf8(self):
-        cli = load_cli()
-        path = cli.write_prompt_file("你好")
-        try:
-            self.assertEqual(Path(path).read_text(encoding="utf-8"), "你好")
-        finally:
-            Path(path).unlink(missing_ok=True)
 
 if __name__ == "__main__":
     unittest.main()
