@@ -5,7 +5,6 @@ This is intentional heavy validation — not part of light `make check`.
 
 Comparison contract (documented in the JSON and docs/deepseek-v4.md):
   - top-1 token exact match for teacher-forcing and greedy windows
-  - optional DSpark on/off greedy token identity
   - logits max-abs / top-k ranking are reserved for a future transformers
     oracle (`source=transformers`); coli-self fixtures only claim token match
 
@@ -13,9 +12,8 @@ Preferred source when transformers + DeepseekV4ForCausalLM are available:
   record reference tokens from the official implementation.
 
 Fallback (current default on most machines):
-  drive the C engine with --record-oracle / --no-dspark (source=coli-self).
-  That proves reproducibility and DSpark losslessness vs the target path, not
-  bit-exact parity with Hugging Face.
+  drive the target-only C engine with --record-oracle (source=coli-self).
+  That proves reproducibility, not bit-exact parity with Hugging Face.
 """
 from __future__ import annotations
 
@@ -63,7 +61,6 @@ def try_transformers_oracle(model: str, prompt: str, max_new: int) -> dict | Non
         "comparison": {
             "top1_token": "exact",
             "logits": "max abs error may be reported by future tooling",
-            "dspark": "greedy tokens must match --no-dspark",
         },
         "prompt_ids": prompt_ids,
         "full_ids": full,
@@ -89,7 +86,7 @@ def coli_self_oracle(
     memory_gb: float | None,
 ) -> dict:
     args = [model, prompt, "--max-tokens", str(max_new),
-            "--record-oracle", str(output), "--no-dspark"]
+            "--record-oracle", str(output)]
     if memory_gb is not None:
         args.extend(["--memory-gb", str(memory_gb)])
     proc = run_c(binary, args)
@@ -105,7 +102,6 @@ def validate(
     teacher_forcing: int,
     greedy: int,
     memory_gb: float | None,
-    check_dspark: bool,
 ) -> int:
     args = [
         model,
@@ -120,49 +116,8 @@ def validate(
         print("[oracle] token validation FAILED", file=sys.stderr)
         return proc.returncode
 
-    if not check_dspark:
-        print("[oracle] token validation OK (DSpark check skipped)", file=sys.stderr)
-        return 0
-
-    data = json.loads(oracle_path.read_text(encoding="utf-8"))
-    prompt = data.get("prompt") or "What is the capital of France?"
-    full = data["full_ids"]
-    prompt_ids = data["prompt_ids"]
-    want = full[len(prompt_ids):len(prompt_ids) + greedy]
-
-    def collect(no_dspark: bool) -> list[int]:
-        out_path = oracle_path.with_suffix(".tmp_ids.json")
-        cmd = [model, prompt, "--max-tokens", str(greedy),
-               "--record-oracle", str(out_path)]
-        # Explicit either way: record-oracle alone must not imply --no-dspark,
-        # otherwise the on/off identity check is a no-op.
-        if no_dspark:
-            cmd.append("--no-dspark")
-        if memory_gb is not None:
-            cmd.extend(["--memory-gb", str(memory_gb)])
-        result = run_c(binary, cmd)
-        if result.returncode != 0:
-            raise SystemExit(f"DSpark compare run failed ({no_dspark=})")
-        payload = json.loads(out_path.read_text(encoding="utf-8"))
-        out_path.unlink(missing_ok=True)
-        got = payload["full_ids"][len(payload["prompt_ids"]):]
-        return got[:greedy]
-
-    off = collect(True)
-    on = collect(False)
-    expected = want[:greedy]
-    off_ok = len(off) == len(expected) and off == expected
-    on_ok = len(on) == len(expected) and on == expected
-    same = off == on
-    all_ok = off_ok and on_ok and same
-    print(
-        f"[oracle] DSpark on/off identity: {'OK' if all_ok else 'FAIL'} "
-        f"(no_dspark vs fixture {'OK' if off_ok else 'FAIL'}, "
-        f"dspark vs fixture {'OK' if on_ok else 'FAIL'}, "
-        f"on/off equality {'OK' if same else 'FAIL'})",
-        file=sys.stderr,
-    )
-    return 0 if all_ok else 1
+    print("[oracle] target token validation OK", file=sys.stderr)
+    return 0
 
 
 def main() -> int:
@@ -176,7 +131,6 @@ def main() -> int:
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--teacher-forcing", type=int, default=32)
     parser.add_argument("--greedy", type=int, default=20)
-    parser.add_argument("--check-dspark", action="store_true")
     parser.add_argument(
         "--prefer-transformers",
         action="store_true",
@@ -220,7 +174,6 @@ def main() -> int:
         args.teacher_forcing,
         args.greedy,
         args.memory_gb,
-        args.check_dspark,
     )
 
 

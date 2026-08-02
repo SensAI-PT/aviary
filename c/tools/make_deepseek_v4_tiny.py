@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the committed tiny DeepSeek V4 + DSpark oracle fixture.
+"""Generate the deterministic tiny DeepSeek V4 target oracle fixture.
 
-This is a regeneration tool, not a CI dependency.  It deliberately requires
-PyTorch and a Transformers release that contains the official
-DeepseekV4ForCausalLM implementation.  Reference tokens always come from that
-implementation; there is no C-engine fallback.
+The dedicated V4 CI job runs this with pinned dependencies.  It deliberately
+requires PyTorch and a Transformers release that contains the official
+DeepseekV4ForCausalLM implementation. Reference tokens always come from that
+implementation; there is no C-engine fallback and the generated safetensors
+file is never committed.
 """
 from __future__ import annotations
 
@@ -37,11 +38,6 @@ INDEX_DIM = 32
 SLIDING = 8
 COMPRESS_RATIOS = [0, 4, 8]
 MAX_POSITIONS = 128
-DSPARK_STAGES = 1
-DSPARK_BLOCK = 2
-DSPARK_MARKOV_RANK = 16
-DSPARK_TARGET_LAYERS = [1]
-DSPARK_NOISE_TOKEN = 3
 
 E2M1 = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -242,7 +238,7 @@ def make_hf_config(DeepseekV4Config):
     )
 
 
-def make_runtime_config(transformers_version: str, dspark: bool = False) -> dict:
+def make_runtime_config(transformers_version: str) -> dict:
     config = {
         "architectures": ["DeepseekV4ForCausalLM"],
         "model_type": "deepseek_v4",
@@ -296,13 +292,6 @@ def make_runtime_config(transformers_version: str, dspark: bool = False) -> dict
             "weight_block_size": [128, 128],
         },
     }
-    if dspark:
-        config.update(
-            dspark_block_size=DSPARK_BLOCK,
-            dspark_noise_token_id=DSPARK_NOISE_TOKEN,
-            dspark_markov_rank=DSPARK_MARKOV_RANK,
-            dspark_target_layer_ids=DSPARK_TARGET_LAYERS,
-        )
     return config
 
 
@@ -429,80 +418,6 @@ def add_target_tensors(torch, model):
                 output[f"{c}.ffn.experts.{expert}.{name}.scale"] = scales
             for name, (packed, _, _) in zip(names, converted):
                 output[f"{c}.ffn.experts.{expert}.{name}.weight"] = packed
-    return output
-
-
-def add_dspark_tensors(torch, model):
-    """Create one valid production-layout DSpark stage.
-
-    The independent target oracle remains Transformers.  DSpark correctness is
-    asserted by lossless target verification, so the draft weights may be a
-    deterministic reduced stage derived from target layer 2.
-    """
-    state = model.state_dict()
-    output: OrderedDict[str, object] = OrderedDict()
-
-    def put_bf16(name: str, value) -> None:
-        output[name] = bf16_round(torch, value).to(torch.bfloat16)
-
-    def put_f32(name: str, value) -> None:
-        output[name] = value.detach().float().contiguous()
-
-    def put_fp8(name: str, value) -> None:
-        quantized, scales, _ = quantize_fp8(torch, value)
-        output[name + ".weight"] = quantized
-        output[name + ".scale"] = scales
-
-    put_bf16("embed.weight", state["model.embed_tokens.weight"])
-    source = "model.layers.2"
-    c = "mtp.0"
-    put_f32(f"{c}.attn.attn_sink", state[f"{source}.self_attn.sinks"])
-    put_bf16(f"{c}.attn.kv_norm.weight", state[f"{source}.self_attn.kv_norm.weight"])
-    put_bf16(f"{c}.attn.q_norm.weight", state[f"{source}.self_attn.q_a_norm.weight"])
-    put_fp8(f"{c}.attn.wkv", state[f"{source}.self_attn.kv_proj.weight"])
-    put_fp8(f"{c}.attn.wo_a", state[f"{source}.self_attn.o_a_proj.weight"])
-    put_fp8(f"{c}.attn.wo_b", state[f"{source}.self_attn.o_b_proj.weight"])
-    put_fp8(f"{c}.attn.wq_a", state[f"{source}.self_attn.q_a_proj.weight"])
-    put_fp8(f"{c}.attn.wq_b", state[f"{source}.self_attn.q_b_proj.weight"])
-    put_bf16(f"{c}.attn_norm.weight", state[f"{source}.input_layernorm.weight"])
-    put_bf16(f"{c}.ffn.gate.weight", state[f"{source}.mlp.gate.weight"])
-    put_f32(f"{c}.ffn.gate.bias", state[f"{source}.mlp.gate.e_score_correction_bias"])
-    put_fp8(f"{c}.ffn.shared_experts.w1", state[f"{source}.mlp.shared_experts.gate_proj.weight"])
-    put_fp8(f"{c}.ffn.shared_experts.w2", state[f"{source}.mlp.shared_experts.down_proj.weight"])
-    put_fp8(f"{c}.ffn.shared_experts.w3", state[f"{source}.mlp.shared_experts.up_proj.weight"])
-    put_bf16(f"{c}.ffn_norm.weight", state[f"{source}.post_attention_layernorm.weight"])
-    put_f32(f"{c}.hc_attn_base", state[f"{source}.attn_hc.base"])
-    put_f32(f"{c}.hc_attn_fn", state[f"{source}.attn_hc.fn"])
-    put_f32(f"{c}.hc_attn_scale", state[f"{source}.attn_hc.scale"])
-    put_f32(f"{c}.hc_ffn_base", state[f"{source}.ffn_hc.base"])
-    put_f32(f"{c}.hc_ffn_fn", state[f"{source}.ffn_hc.fn"])
-    put_f32(f"{c}.hc_ffn_scale", state[f"{source}.ffn_hc.scale"])
-
-    gate_up = state[f"{source}.mlp.experts.gate_up_proj"]
-    down = state[f"{source}.mlp.experts.down_proj"]
-    for expert in range(EXPERTS):
-        matrices = [gate_up[expert, :MOE], down[expert], gate_up[expert, MOE:]]
-        names = ("w1", "w2", "w3")
-        converted = [quantize_fp4(torch, matrix) for matrix in matrices]
-        for name, (_, scales, _) in zip(names, converted):
-            output[f"{c}.ffn.experts.{expert}.{name}.scale"] = scales
-        for name, (packed, _, _) in zip(names, converted):
-            output[f"{c}.ffn.experts.{expert}.{name}.weight"] = packed
-
-    identity = torch.eye(HIDDEN, dtype=torch.float32)
-    put_fp8("mtp.0.main_proj", identity)
-    put_bf16("mtp.0.main_norm.weight", torch.ones(HIDDEN))
-    put_bf16("mtp.0.norm.weight", state["model.norm.weight"])
-    put_f32("mtp.0.hc_head_fn", state["model.hc_head.hc_fn"])
-    put_f32("mtp.0.hc_head_base", state["model.hc_head.hc_base"])
-    put_f32("mtp.0.hc_head_scale", state["model.hc_head.hc_scale"])
-    markov = torch.zeros((VOCAB, DSPARK_MARKOV_RANK), dtype=torch.float32)
-    put_bf16("mtp.0.markov_head.markov_w1.weight", markov)
-    put_bf16("mtp.0.markov_head.markov_w2.weight", markov)
-    put_bf16(
-        "mtp.0.confidence_head.proj.weight",
-        torch.zeros((1, HIDDEN + DSPARK_MARKOV_RANK), dtype=torch.float32),
-    )
     return output
 
 
@@ -636,7 +551,6 @@ def main() -> int:
     initialize_router_coverage(torch, model)
 
     target = add_target_tensors(torch, model)
-    dspark = add_dspark_tensors(torch, model)
     reference = make_reference(torch, transformers, model)
 
     output = args.output.resolve()
@@ -644,26 +558,19 @@ def main() -> int:
         if not args.force:
             raise SystemExit(f"output exists (use --force): {output}")
         shutil.rmtree(output)
-    (output / "dspark").mkdir(parents=True)
+    output.mkdir(parents=True)
     (output / "config.json").write_text(
         json.dumps(make_runtime_config(transformers.__version__), indent=2) + "\n",
         encoding="utf-8",
     )
-    (output / "dspark" / "config.json").write_text(
-        json.dumps(make_runtime_config(transformers.__version__, dspark=True), indent=2) + "\n",
-        encoding="utf-8",
-    )
     tokenizer = json.dumps(make_tokenizer(), separators=(",", ":")) + "\n"
     (output / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
-    (output / "dspark" / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
     write_safetensors(torch, output / "model.safetensors", target)
-    write_safetensors(torch, output / "dspark" / "model.safetensors", dspark)
     (output / "ref.json").write_text(
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
     )
 
     print_manifest("target", target)
-    print_manifest("dspark", dspark)
     total = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
     print(f"wrote {output} ({total} bytes, transformers={transformers.__version__})")
     return 0
