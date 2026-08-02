@@ -614,7 +614,11 @@ def cmd_doctor(a):
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
     report=run_doctor(
-        a.model, ram, ctx, devices, vram, engine_path=GLM, deep=a.deep,
+        # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
+        # no matter which model it was pointed at: a built kimi_k3/inkling was
+        # reported "engine is not built", and a stale colibri would have been
+        # reported ready for a model that never runs on it (#783).
+        a.model, ram, ctx, devices, vram, engine_path=engine_for(a.model), deep=a.deep,
         mirror_dir=os.environ.get("COLI_MODEL_MIRROR"),
     )
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
