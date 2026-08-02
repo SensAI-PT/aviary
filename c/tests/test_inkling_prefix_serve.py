@@ -90,23 +90,31 @@ class Engine:
         raise RuntimeError("engine never reported READY")
 
     def ask(self, rid, prompt):
-        payload = prompt.encode()
-        header = f"SUBMIT {rid} 0 {len(payload)} {MAXTOK} 0 1\n".encode()
-        self.p.stdin.write(header + payload + b"\n")
+        """Returns the generated payload as BYTES.
+
+        Never as str. A random-init model emits arbitrary byte sequences that
+        are mostly not valid UTF-8, so decoding with errors="replace" turns them
+        into U+FFFD and re-encoding yields entirely different bytes. Feeding
+        that back as the next turn's prefix made the prompt diverge from the
+        state the engine actually held -- a fault in the harness that looked
+        exactly like a fault in the engine.
+        """
+        assert isinstance(prompt, bytes), "prompts stay bytes end to end"
+        header = f"SUBMIT {rid} 0 {len(prompt)} {MAXTOK} 0 1\n".encode()
+        self.p.stdin.write(header + prompt + b"\n")
         self.p.stdin.flush()
         chunks = []
         while True:
             line = self.p.stdout.readline()
             if not line:
                 raise RuntimeError("engine closed mid-request")
-            text = line.decode(errors="replace").rstrip("\n")
+            text = line.decode("latin-1").rstrip("\n")
             kind = text.split(" ", 1)[0]
             if kind == "DATA":
-                chunks.append(self.p.stdout.read(int(text.split()[2]))
-                              .decode(errors="replace"))
+                chunks.append(self.p.stdout.read(int(text.split()[2])))
                 self.p.stdout.readline()          # the newline after the payload
             elif kind in ("DONE", "END"):
-                return "".join(chunks)
+                return b"".join(chunks)
             elif kind == "ERROR":
                 raise RuntimeError(f"engine error: {text}")
 
@@ -145,10 +153,11 @@ class InklingPrefixServeTest(unittest.TestCase):
 
     def test_reused_prefix_yields_identical_tokens(self):
         warm = Engine()
-        first = warm.ask("1", "The capital of France is")
+        opening = b"The capital of France is"
+        first = warm.ask("1", opening)
         # Turn 2 EXTENDS what the state already holds — the shape a chat client
         # produces when it resends the transcript with a new question appended.
-        second_prompt = "The capital of France is" + first + " and the capital of Spain is"
+        second_prompt = opening + first + b" and the capital of Spain is"
         reused = warm.ask("2", second_prompt)
         log = warm.close()
 
@@ -168,12 +177,12 @@ class InklingPrefixServeTest(unittest.TestCase):
         """The rejection path matters as much as the reuse path: a prompt that
         shares no prefix must start over, not splice itself onto stale state."""
         eng = Engine()
-        eng.ask("1", "The capital of France is")
-        diverged = eng.ask("2", "Completely different opening text here")
+        eng.ask("1", b"The capital of France is")
+        diverged = eng.ask("2", b"Completely different opening text here")
         log = eng.close()
 
         cold = Engine(log_prefix=False)
-        fresh = cold.ask("1", "Completely different opening text here")
+        fresh = cold.ask("1", b"Completely different opening text here")
         cold.close()
 
         self.assertEqual(diverged, fresh,
