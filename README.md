@@ -459,20 +459,22 @@ Two things that differ per model, both documented in the per-model page:
 
 ## DeepSeek V4
 
-The experimental CPU path for **DeepSeek V4 Flash + DSpark** uses native FP4
-experts, automatic RAM planning, and lossless speculative verification. It is
-supported on x86-64 Linux and Windows/MSYS2; other platforms keep validating
-the main colibri engine through `make check`.
+The experimental CPU path for **DeepSeek V4 Flash** uses native FP4 experts,
+automatic RAM planning, shared `st.h` / `quant.h` infrastructure, and a
+persistent target engine. DSpark is intentionally kept for a separate stacked
+follow-up. The target engine is supported on x86-64/aarch64 Linux and
+Windows/MSYS2.
 
 ```bash
 cd c
 make deepseek-v4
-python ./v4 run --model /path/to/DeepSeek-V4-Flash-DSpark --ram 32 \
-  --stop-sentence "What is the capital of France?"
+python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
+  "What is the capital of France?"
+# The same model also works with: coli chat / coli serve / coli web
 ```
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, benchmarks,
-checkpoint validation, and the committed tiny independent oracle.
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for status, checkpoint
+validation, unified CLI/server usage, and the generated tiny independent oracle.
 
 ## What's next
 
