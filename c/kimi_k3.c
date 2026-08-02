@@ -81,7 +81,8 @@
 #include "tok.h"
 #include "quant.h"
 #include "omp_tune.h"
-#include "route_trace.h"                 /* shared routing telemetry (#700) */
+#include "route_trace.h"
+#include "kv_prefix.h"                    /* KV prefix reuse (shared) */
 
 /* ---------- config ---------- */
 typedef struct {
@@ -154,6 +155,11 @@ typedef struct {
     float **cwq, **cwk, **cwv;            /* conv windows [proj*conv_k], oldest first */
     /* MLA cache */
     float **Lc, **Rc; int max_t;
+    /* KV prefix reuse: what the current state was built from (kv_prefix.h).
+     * K3 has no single KV to inspect — 69 KDA layers carry a RECURRENT state
+     * and only the 24 MLA layers keep Lc/Rc — so an explicit record of the
+     * tokens fed is the only description of it that cannot drift. */
+    kv_prefix kvp;
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
@@ -1250,14 +1256,28 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         }
         m->t_head+=now_s()-t0;
     }
+    /* record what was just fed, at the positions it went to (kv_prefix.h) */
+    kv_prefix_record(&m->kvp, ids, pos0, C);
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
 }
 
 static void kv_alloc(Model *m, int max_t){
-    Cfg *c=&m->c; m->max_t=max_t;
+    Cfg *c=&m->c;
+    /* Serve calls this once per request. It used to calloc Lc/Rc over the old
+     * pointers without freeing them, leaking n_layers x max_t x (kv_lora +
+     * qk_rope) floats every turn — on K3's 24 MLA layers at 4k context that is
+     * hundreds of MB per conversation. Keep the buffers when they are already
+     * big enough, which is also what makes prefix reuse possible: growing them
+     * discards the positions fed[] describes. */
+    if(m->Lc && max_t<=m->max_t) return;
+    if(m->Lc) for(int i=0;i<c->n_layers;i++){ free(m->Lc[i]); free(m->Rc[i]); }
+    free(m->Lc); free(m->Rc);
+    m->max_t=max_t;
     m->Lc=calloc(c->n_layers,sizeof(float*));
     m->Rc=calloc(c->n_layers,sizeof(float*));
+    /* the record is sized with the KV it describes; growing discards it */
+    kv_prefix_alloc(&m->kvp,max_t);
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
         m->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         m->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
@@ -1416,6 +1436,7 @@ typedef struct {
 
 static void model_state_reset(Model *m){
     Cfg *c=&m->c;
+    kv_prefix_clear(&m->kvp);   /* the record describes the state we are dropping */
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -1483,14 +1504,31 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         fflush(stdout); free(ids); return;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
-    model_state_reset(m);
+    /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
+     * A chat client resends the whole transcript each turn, so turn N used to
+     * re-process turns 1..N-1 from scratch — the cost of a message grew with
+     * the conversation, and every replayed position pulled its experts off
+     * disk again. When this prompt begins with the sequence the state already
+     * holds, that state IS the state at that position: keep it and prefill
+     * only the tail. This is why kv_alloc above must run FIRST and must keep
+     * its buffers: growing them discards the positions fed[] describes.
+     * At least one new token is required, since the state cannot be rewound.
+     * Either the reused positions are token-identical or nothing is reused;
+     * the emitted tokens are unchanged in both cases. */
     kv_alloc(m,np+q->max_tok+8);
+    int reuse=kv_prefix_reuse(&m->kvp, ids, np);
+    if(!reuse) model_state_reset(m);
+    else if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                reuse,np,100.0*reuse/np);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
     uint64_t hit0=m->hits, miss0=m->miss;
     float *lo=NULL;
-    for(int i=0;i<np;i+=chunk){
+    /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
+     * position-indexed, so the loop starts at `reuse`, not at 0. */
+    for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
         free(lo); lo=step_chunk(m,ids+i,i,C);
     }
