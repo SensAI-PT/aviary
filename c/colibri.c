@@ -604,6 +604,13 @@ static void cuda_stats_print(void){
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
+    if(calls&&g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
+        uint64_t dc=0,de=0,dr=0;
+        coli_cuda_group_stats_device(g_cuda_devices[i],&dc,&de,&dr,NULL,NULL,NULL);
+        fprintf(stderr,"[CUDA]   device %d groups: %llu call, %llu expert, %llu rows "
+            "(%.2f expert/call)\n",g_cuda_devices[i],(unsigned long long)dc,
+            (unsigned long long)de,(unsigned long long)dr,dc?(double)de/dc:0.0);
+    }
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
@@ -4311,6 +4318,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * no pipe_wait is needed here; the CPU loop keeps its own waits. Any issue
          * failure drops the layer back to the collect-in-loop + sync-group path. */
         int early_issued=0, done_j[64]={0};
+        double early_issue_start=0;
         {
             static int g_group_async2=-1;
             if(g_group_async2<0) g_group_async2=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
@@ -4355,7 +4363,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(all){
                         static int announced2;
                         if(!announced2){ announced2=1; fprintf(stderr,"[CUDA] expert group overlap active\n"); }
-                        early_issued=1; g_ovl_mark=now_s();
+                        early_issued=1; early_issue_start=tg0; g_ovl_mark=now_s();
                         for(int q=0;q<npg;q++) done_j[pg_j[q]]=1;
                         /* stash packing for the take phase */
                         for(int di=0;di<g_cuda_ndev;di++){ dev_nc0[di]=pd_nc[di]; dev_off0[di]=pd_off[di]; dev_total0[di]=pd_total[di];
@@ -4659,6 +4667,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             m->t_emm+=now_s()-tg1; g_ovl_take+=now_s()-tg1;
+            if(g_prof&&early_issue_start>0) m->t_egpu+=now_s()-early_issue_start;
         }
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
@@ -4705,6 +4714,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         memcpy(group_y+(int64_t)dev_off[di]*D,hy,(size_t)dev_total[di]*D*sizeof(float)); }
                     else dev_ok[di]=0;      /* per-device sync failure: CPU fallback below */
                 }
+                if(g_prof) m->t_egpu+=now_s()-tg;
             } else for(int di=0;di<g_cuda_ndev;di++)
                 if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
         }
@@ -6064,6 +6074,10 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
      * EN: soft MTP guard (#163): 24-proposal window, pause and re-arm instead of the
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
+    int gd_min_pct=getenv("COLI_MTP_GUARD_PCT")?atoi(getenv("COLI_MTP_GUARD_PCT")):70;
+    int gd_window=getenv("COLI_MTP_GUARD_WINDOW")?atoi(getenv("COLI_MTP_GUARD_WINDOW")):24;
+    if(gd_min_pct<0)gd_min_pct=0;if(gd_min_pct>100)gd_min_pct=100;
+    if(gd_window<4)gd_window=4;if(gd_window>256)gd_window=256;
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
@@ -6109,7 +6123,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
              * ma il vecchio g_draft=0 era permanente. EN: adaptive pause; the old
              * g_draft=0 latch was permanent. */
             if(gd_pause>0){ gd_pause--; if(!gd_pause){ gd_prop0=m->mtp_prop; gd_acc0=m->mtp_acc; } }
-            else if(m->mtp_prop-gd_prop0>=24 && (m->mtp_acc-gd_acc0)*10 < m->mtp_prop-gd_prop0){
+            else if(m->mtp_prop-gd_prop0>=(uint64_t)gd_window &&
+                    (m->mtp_acc-gd_acc0)*100 < (m->mtp_prop-gd_prop0)*(uint64_t)gd_min_pct){
                 fprintf(stderr,"[MTP] %.0f%% acceptance over the last %llu proposals: drafts paused for %d tokens\n",
                     100.0*(m->mtp_acc-gd_acc0)/(m->mtp_prop-gd_prop0),
                     (unsigned long long)(m->mtp_prop-gd_prop0), (int)GUARD_PAUSE_TOKENS);
@@ -6575,6 +6590,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     double dt=now_s()-t0, tot=m->hits+m->miss;
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n",g_cp_enq);
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -8039,6 +8055,9 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
      * count and pinned only the leftovers (measured: 9,280 VRAM + 1,721 RAM
      * on a box whose RAM fits ~11k — the cold tail then paid disk forever). */
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    double placed_w[COLI_CUDA_MAX_DEVICES]={0};
+    int load_balance=getenv("CUDA_EXPERT_LOAD_BALANCE")?
+                     atoi(getenv("CUDA_EXPERT_LOAD_BALANCE")):0;
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0, prefix_est=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
@@ -8140,7 +8159,10 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                 for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
                     int best=-1;
                     for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=projected &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
+                        (best<0||
+                         (load_balance && (placed_w[i]<placed_w[best] ||
+                           (placed_w[i]==placed_w[best]&&placed_b[i]<placed_b[best])))||
+                         (!load_balance&&placed_b[i]<placed_b[best]))) best=i;
                     if(best<0) break;
                     tried[best]=1;
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
@@ -8163,6 +8185,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+                        placed_w[best]+=(double)r[a].c;
                         if(g_cuda_release_host) expert_host_release(m,s);
                         placed=1;
                     } else {
@@ -8186,6 +8209,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
             g_cuda_expert_auto?safe_total/1e9:budget/1e9,
             g_cuda_expert_auto?", auto":"",
             g_cuda_reserve_gb);
+        if(load_balance) fprintf(stderr,
+            "[CUDA] expert device assignment: frequency-load balanced (experimental)\n");
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
         /* #653: on integrated / unified-memory GPUs (Grace-Blackwell GB10, Jetson) the
