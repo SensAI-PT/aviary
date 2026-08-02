@@ -41,6 +41,11 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
  * backend keeps no copy of the table so it cannot drift from the CPU decoder. */
 COLI_CUDA_DLLEXPORT int coli_cuda_e8_set_grid(const void *grid);
 
+/* Publish the fmt=8 e4m3 decode table (quant.h's E4M3_LUT, 256 f32) the same
+ * way. Must be called after coli_cuda_init; fmt=8 uploads are refused until it
+ * succeeds, because kernels would decode against a zero-initialized table. */
+COLI_CUDA_DLLEXPORT int coli_cuda_fp8_set_lut(const float *lut);
+
 /* Upload without executing, so capacity failures happen during model startup. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
         const void *weights, const float *scales,

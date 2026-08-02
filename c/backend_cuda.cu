@@ -145,12 +145,21 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
+    if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
     return 0;
 }
 
 /* The E8 codebook, uploaded once per device from quant.h's e8_grid so the table
  * has a single source of truth and cannot drift from the CPU decoder. */
 __constant__ uint8_t c_e8_grid[256][4];
+
+/* The fmt=8 e4m3 decode table, uploaded once per device from quant.h's
+ * E4M3_LUT — same single-source-of-truth arrangement as c_e8_grid. Uploads of
+ * fmt=8 tensors are refused until it is published (g_fp8_lut_ready): a kernel
+ * reading the zero-initialized table would compute silent zeros, the exact
+ * failure mode this format's dispatch work exists to prevent. */
+__constant__ float c_e4m3[256];
+static int g_fp8_lut_ready;
 
 /* A super-block is 98 bytes, so nothing inside it is guaranteed 4- or 2-byte
  * aligned: assemble the words byte-wise instead of dereferencing. */
@@ -246,6 +255,17 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
             if (g >= ng) g = ng - 1;  /* tail elements in the last (partial) group */
             sum += xs[i] * weight_at(weights, fmt, row, i) * scl[g];
         }
+    } else if (fmt == 8) {
+        /* fp8-e4m3 (matmul_fp8): one byte per weight (layout of fmt=1), one f32
+         * scale per 128x128 BLOCK of [O,I] — scales[(o/128)*ceil(I/128) + i/128].
+         * The block edge is a fixed property of the format (FP8_BLOCK), so the
+         * geometry derives from I alone and gs/ng are ignored: this branch is
+         * correct no matter which call site launched it. NaN bytes decode to NaN
+         * through the LUT and propagate, same policy as the CPU path. */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
+        for (int i = threadIdx.x; i < I; i += blockDim.x)
+            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -259,7 +279,7 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6) ? partial[0] * scales[o] : partial[0];
+        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 8) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -576,6 +596,43 @@ __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
+/* fmt=8 fp8-e4m3 variants: same structure as the g4 kernels, but one byte per
+ * weight (decoded through c_e4m3) and the scale is per 128x128 BLOCK of the
+ * member's [O,I] matrix — sc[(o/128)*ceil(I/128) + i/128]. The block edge is a
+ * property of the format, so the geometry derives from the dims alone; these
+ * kernels require every member to be fmt=8 (no ride-along: a per-row member's
+ * scales are [O], which this indexing would read out of bounds). */
+__global__ static void grouped_hidden_f8_dual(float *gate,float *up,const float *x,
+                                              const GroupDesc *desc,int I,int D){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*D;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*D;
+    int nblk=(D+127)>>7;
+    const float *gsc=d.gs+(size_t)(o>>7)*nblk;
+    const float *usc=d.us+(size_t)(o>>7)*nblk;
+    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    for(int i=threadIdx.x;i<D;i+=blockDim.x){float xv=xs[i];int b=i>>7;
+        ga+=xv*c_e4m3[gr[i]]*gsc[b];ua+=xv*c_e4m3[ur[i]]*usc[b];}
+    __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
+    /* same fused epilogue as the w4/g4 duals: scales applied in the
+     * accumulation, silu(gate)*up lands in gate[], up[] is never written */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0],u=upv[0];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
+}
+__global__ static void grouped_down_f8(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*I;
+    int nblk=(I+127)>>7;
+    const float *dsc=d.ds+(size_t)(o>>7)*nblk;
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum=0;
+    for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=xs[i]*c_e4m3[row[i]]*dsc[i>>7];
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale,
@@ -770,6 +827,19 @@ extern "C" int coli_cuda_e8_set_grid(const void *grid) {
     return 1;
 }
 
+/* Publish quant.h's E4M3_LUT the same way — one source of truth for the fmt=8
+ * decode on CPU and GPU. Until this succeeds, fmt=8 uploads are refused. */
+extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
+    if (!lut || g_nctx < 1) return 0;
+    for (int i = 0; i < g_nctx; i++) {
+        if (!select_ctx(&g_ctx[i])) return 0;
+        if (!cuda_ok(cudaMemcpyToSymbol(c_e4m3, lut, sizeof(c_e4m3)), "e4m3 LUT upload"))
+            return 0;
+    }
+    g_fp8_lut_ready = 1;
+    return 1;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
@@ -934,12 +1004,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
      * quantized format that legitimately arrives with scales == NULL. */
     if (!rb || (fmt && fmt != 6 && !scales)) return 0;
+    if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
     t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
+    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
+        t->ng = (I + 127) / 128;
+        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
+    }
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
         !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
@@ -1268,7 +1343,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -1282,10 +1357,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
+        any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
+        all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
-    /* Mixed E8 groups cannot use either homogeneous grouped kernel. */
-    if(any_e8&&!all_e8){
+    /* Mixed E8/FP8 groups cannot use a homogeneous grouped kernel. */
+    if((any_e8&&!all_e8)||(any_f8&&!all_f8)){
         int off=0;
         for(int c=0;c<count;c++){
             if(!coli_cuda_expert_mlp(gates[c],ups[c],downs[c],
@@ -1333,6 +1410,11 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_f8){
+        /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -1453,7 +1535,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
-        all_q4=1,any_g4=0;
+        all_q4=1,any_g4=0,any_f8=0,all_f8=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -1468,9 +1550,12 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
                 !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
+        any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
+        all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
+    if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
     if(total>8) return 0;                       /* decode-scale only */
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
@@ -1493,6 +1578,14 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(all_f8){
+        /* fp8-e4m3 groups on the async decode path: same kernels as the sync
+         * dispatch, silu fused in the dual epilogue. */
+        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
@@ -1558,11 +1651,19 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
 }
 
 
+/* The absorb kernels decode `w` through weight_at + absorb_scale, which know
+ * per-row and fmt=4 group scales only. Refuse anything else (fmt=5/6/8) rather
+ * than mis-decode it — the caller keeps its CPU attention path. (`proj`
+ * tensors are exempt: they run through quant_matmul, which dispatches every
+ * format it uploads.) A dedicated block-scale absorb for fmt=8 is follow-up
+ * work, same shape as routing fmt=4 through the grouped kernels was. */
+static int absorb_fmt_ok(const ColiCudaTensor *w){ return w && w->fmt <= 4; }
+
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,
                                             int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
+    if(!absorb_fmt_ok(w)||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
@@ -1584,7 +1685,7 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
 static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
         const float *q,const float *latent,const float *rope,int S,int H,int Q,int R,int V,
         int K,int T,float scale){
-    if(!w||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+    if(!absorb_fmt_ok(w)||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
        T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -1630,7 +1731,7 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
         float *out,const float *q,const void *const *keys,
         const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    if(!w||!proj||!out||!q||!keys||!latent||!rope||!lengths||S<1||S>512||T<1||T>8192||
+    if(!absorb_fmt_ok(w)||!proj||!out||!q||!keys||!latent||!rope||!lengths||S<1||S>512||T<1||T>8192||
        H<1||Q<1||R<1||V<1||K<1||K>512||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);
@@ -2052,7 +2153,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -2116,7 +2217,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
@@ -2138,7 +2239,7 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+    if(!absorb_fmt_ok(w)||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
@@ -2153,7 +2254,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale){
     if (fault_injected()) return 0;
-    if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
+    if(!absorb_fmt_ok(w)||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);

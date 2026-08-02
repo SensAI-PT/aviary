@@ -54,6 +54,7 @@ typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
 typedef int            (*fn_e8_set_grid)(const void *grid);
+typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
@@ -118,6 +119,7 @@ static struct {
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
     fn_e8_set_grid     e8_set_grid;
+    fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -232,6 +234,7 @@ static int coli_cuda_load(void){
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
+    RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -367,6 +370,11 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, cons
 int coli_cuda_e8_set_grid(const void *grid){
     if(!g_cuda.available || !g_cuda.e8_set_grid) return 0;   /* fmt=6 stays CPU-side */
     return g_cuda.e8_set_grid(grid);
+}
+
+int coli_cuda_fp8_set_lut(const float *lut){
+    if(!g_cuda.available || !g_cuda.fp8_set_lut) return 0;   /* fmt=8 stays CPU-side */
+    return g_cuda.fp8_set_lut(lut);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
