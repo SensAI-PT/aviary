@@ -135,7 +135,13 @@ typedef struct {
 
 /* ---------- routed-expert streaming (native MXFP4 from the HF shards) ---- */
 typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s */
-typedef struct { int eid; uint8_t *buf, *base; uint64_t used; } Slot;
+static char g_k3_usage[2100];   /* <snap>/.coli_usage, or COLI_USAGE */
+typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot;
+/* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
+ * THIS session; the pin knows the history of every session before it. Capped at
+ * half the layer budget so the adaptive half always survives — an all-pinned cache
+ * that guessed wrong is slower than no pin at all (measured on GLM: 0.17 vs 0.25
+ * tok/s when the pins came from a single prompt). */
                           /* base = 4K-aligned allocation (O_DIRECT target);
                            * buf = expert data view inside it (= base + off%4K) */
 typedef struct { Slot *s; int n, cap; } LCache;
@@ -1039,11 +1045,96 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
         for(int a=0;a<promo;a++){
             int q=nmiss-1-a; Slot *dst;
             if(lc->n<lc->cap) dst=&lc->s[lc->n++];
-            else { int lru=0; for(int i=1;i<lc->n;i++) if(lc->s[i].used<lc->s[lru].used) lru=i; dst=&lc->s[lru]; }
+            else {
+                /* LRU over the UNPINNED slots. pin_seed caps pinned at cap/2, so a
+                 * victim always exists; the -1 fallback is a belt-and-braces guard
+                 * against a future caller pinning everything and deadlocking here. */
+                int lru=-1;
+                for(int i=0;i<lc->n;i++){
+                    if(lc->s[i].pinned) continue;
+                    if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
+                }
+                if(lru<0) break;                    /* every slot pinned: keep the read */
+                dst=&lc->s[lru];
+            }
             Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
             dst->used=++m->clock;
         }
     }
+}
+
+/* ---- AUTOPIN: seed the layer caches from the accumulated history ----------
+ *
+ * K3 counted every routed selection (rt_route) and could READ a history file,
+ * but only when COLI_USAGE named one by hand, and it never WROTE one — so the
+ * read path was unreachable for anyone who did not already have a profile from
+ * somewhere else. colibri.c has seeded itself from <snap>/.coli_usage since the
+ * beginning and inkling.c does too; this brings K3 in line.
+ *
+ * The quota scales with CONFIDENCE in the history, exactly as colibri.c does it:
+ * a handful of turns is a bad predictor and pinning on it steals slots from the
+ * LRU, which at least adapts to the session in front of it. Below 5,000 recorded
+ * selections nothing is pinned at all; the quota reaches its cap of half the
+ * layer budget at 200,000, which is a few hours of real use.
+ *
+ * Cost is bounded and paid once: at most cap/2 experts per sparse layer, read
+ * sequentially at startup rather than demand-faulted mid-token. */
+static void k3_usage(const char *argv0){
+    fprintf(stderr,
+      "usage: %s <model_dir> [prompt] [options]\n"
+      "\n"
+      "  --chat              apply the K3 chat template to the prompt\n"
+      "  --system TEXT       system message (implies --chat)\n"
+      "  --ngen N            tokens to generate (default 32)\n"
+      "  --ids \"1 2 3\"       raw token ids instead of a prompt\n"
+      "                      (needed when the snapshot has no tokenizer.json;\n"
+      "                       generate one with tools/k3_tokenizer.py)\n"
+      "\n"
+      "  %s /path/to/kimi \"What is the capital of France?\" --ngen 64\n"
+      "\n"
+      "For an interactive session use the launcher instead, which starts this\n"
+      "engine for you and does not need the GLM engine built:\n"
+      "  coli chat --model /path/to/kimi\n"
+      "\n"
+      "environment: SERVE=1 serve mode (SNAP=<dir>) - COLI_VULKAN=1 GPU path\n"
+      "             OMP_NUM_THREADS=<physical cores> - AUTOPIN=0 no pin seeding\n",
+      argv0, argv0);
+}
+
+static void pin_seed(Model *m, int64_t hist){
+    Cfg *c=&m->c;
+    if(getenv("AUTOPIN") && atoi(getenv("AUTOPIN"))==0) return;
+    if(hist<5000) return;
+    double conf=(double)hist/200000.0; if(conf>1) conf=1;
+    int pinned_total=0;
+    for(int li=0; li<c->n_layers; li++){
+        if(!m->L[li].sparse) continue;
+        LCache *lc=&m->ecache[li];
+        int quota=(int)(lc->cap*0.5*conf);
+        if(quota<1) continue;
+        if(quota>lc->cap/2) quota=lc->cap/2;
+        const uint32_t *u=rt_counts(li);
+        if(!u) continue;
+        /* top-`quota` by recorded use: a partial selection sort, since quota is
+         * small (half a cache) and E is 896 — no allocation, no qsort callback. */
+        for(int slot=0; slot<quota && lc->n<lc->cap; slot++){
+            int best=-1; uint32_t bestc=0;
+            for(int e=0;e<c->n_experts;e++){
+                if(u[e]<=bestc) continue;
+                int taken=0;
+                for(int i=0;i<lc->n;i++) if(lc->s[i].eid==e){ taken=1; break; }
+                if(!taken){ best=e; bestc=u[e]; }
+            }
+            if(best<0) break;                       /* history is exhausted */
+            Slot *d=&lc->s[lc->n];
+            expert_read(m,li,best,d);
+            d->eid=best; d->used=++m->clock; d->pinned=1;
+            lc->n++; pinned_total++;
+        }
+    }
+    if(pinned_total)
+        fprintf(stderr,"[PIN] %d experts pinned from history (%lld selections, %.0f%% confidence)\n",
+                pinned_total,(long long)hist,100.0*conf);
 }
 
 static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
@@ -1406,7 +1497,12 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
     ChatB b={T,ids,0,cap,
         chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
         chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
-    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0) return -1;
+    /* -2, not -1: the caller must be able to tell a bad payload from a snapshot
+     * whose tokenizer has no XTML tokens. Serve reported both as "invalid K3
+     * chat payload", which sent at least one user hunting through a request
+     * body that was perfectly well formed. The CLI path has always named the
+     * real cause; serve now does too. */
+    if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0) return -2;
     sp[0]=b.sp_open; sp[1]=b.sp_close; sp[2]=b.sp_sep; sp[3]=b.sp_eom;
     const char *p=wire, *end=wire+nwire;
     if(nwire<8||memcmp(p,"K3CHAT1\n",8)) return -1;
@@ -1511,6 +1607,17 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     if(m->c.bos>=0) ids[np++]=m->c.bos;
     if(q->plen>=8&&!memcmp(q->payload,"K3CHAT1\n",8)){
         int n=chat_build_wire(T,q->payload,q->plen,&thinking,ids+np,cap-np,sp);
+        if(n==-2){
+            /* Not the request's fault: this snapshot's tokenizer.json has no
+             * <|open|>/<|close|>/<|sep|>/<|end_of_msg|>, so no chat turn can be
+             * built from it. Say that, and say where a usable one comes from. */
+            printf("ERROR %s tokenizer.json has no XTML chat tokens "
+                   "(<|open|> <|close|> <|sep|> <|end_of_msg|>); "
+                   "regenerate it with tools/k3_tokenizer.py\n",q->id);
+            fflush(stdout);
+            fprintf(stderr,"[K3] chat: XTML special tokens not in tokenizer.json — "
+                           "regenerate with tools/k3_tokenizer.py\n");
+            free(ids); return; }
         if(n<0){ printf("ERROR %s invalid K3 chat payload\n",q->id); fflush(stdout); free(ids); return; }
         np+=n; chat=1;
     } else {
@@ -1639,9 +1746,15 @@ static void serve_loop(Model *m, Tok *T){
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
-    if(!serving&&argc<2){
-        fprintf(stderr,"usage: %s <model_dir> [prompt] [--ids \"1 2 3\"] [--ngen N]\n",argv[0]);
-        return 1;
+    /* Usage was printed only when there were NO arguments, so `--help` fell
+     * through as the model directory and the engine went looking for
+     * "--help/config.json". Nobody should have to read the source to find the
+     * argument order. Print it for the help flags too, and from every refusal
+     * below, so an error says what to do instead of only what went wrong. */
+    if(!serving && (argc<2 || !strcmp(argv[1],"--help") || !strcmp(argv[1],"-h")
+                          || !strcmp(argv[1],"help"))){
+        k3_usage(argv[0]);
+        return argc<2 ? 1 : 0;          /* asking for help is not a failure */
     }
     const char *snap=serving?getenv("SNAP"):argv[1], *prompt=NULL, *idstr=NULL, *sysmsg=NULL, *wirepath=NULL;
     if(!snap||!*snap){ fprintf(stderr,"set SNAP=<Kimi K3 snapshot directory>\n"); return 1; }
@@ -1679,9 +1792,22 @@ int main(int argc, char **argv){
      * silently absorbed and written back out. See docs/routing-telemetry.md. */
     for(int i=0;i<m.c.n_layers;i++) if(!m.L[i].sparse) rt_drop_row(i);
     rt_drop_row(m.c.n_layers);
-    { const char *up=getenv("COLI_USAGE");           /* optional history to seed from */
-      if(up&&*up){ int64_t h=rt_load(up);
-        if(h>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)h,up); } }
+    /* LEARNED CACHE. Expert use accumulates in <snap>/.coli_usage across sessions
+     * and seeds the pins at startup, the same convention colibri.c and inkling.c
+     * already follow. COLI_USAGE overrides the location; USAGE_SAVE=0 makes the
+     * run read-only, for benchmark loops that would otherwise skew the profile
+     * they are measuring. */
+    { const char *up=getenv("COLI_USAGE");
+      if(up&&*up) snprintf(g_k3_usage,sizeof(g_k3_usage),"%s",up);
+      else        snprintf(g_k3_usage,sizeof(g_k3_usage),"%s/.coli_usage",snap);
+      int64_t h=rt_load(g_k3_usage);
+      if(h>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",
+                      (long long)h,g_k3_usage);
+      /* #780: without a half-life the ranking freezes — after ~18M recorded
+       * selections one more turn moves it by 0.2% and the profile stops
+       * following the workload. */
+      if(getenv("COLI_USAGE_DECAY")) rt_decay();
+      pin_seed(&m,h); }
     if(getenv("K3_TRACE")){
         m.trace=fopen(getenv("K3_TRACE"),"wb");
         if(!m.trace){ perror(getenv("K3_TRACE")); return 1; }
@@ -1723,10 +1849,12 @@ int main(int argc, char **argv){
             fprintf(stderr,"\n");
         }
     } else if(prompt){
-        if(!has_tok){ fprintf(stderr,"no tokenizer.json — pass --ids (generate one with tools/k3_tokenizer.py)\n"); return 1; }
+        if(!has_tok){ fprintf(stderr,"no tokenizer.json in the snapshot — pass --ids instead\n\n");
+                      k3_usage(argv[0]); return 1; }
         if(m.c.bos>=0) ids[np++]=m.c.bos;
         np+=tok_encode(&T,prompt,(int)strlen(prompt),ids+np,65536-np);
-    } else { fprintf(stderr,"no prompt and no --ids\n"); return 1; }
+    } else { fprintf(stderr,"no prompt and no --ids: nothing to generate from\n\n");
+             k3_usage(argv[0]); return 1; }
     fprintf(stderr,"[K3] prompt: %d tokens | ngen %d | temp %.2f\n",np,ngen,temp);
     int max_t=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):np+ngen;
     kv_alloc(&m,max_t);
@@ -1800,7 +1928,8 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
     if(m.trace) fclose(m.trace);
-    { const char *up=getenv("COLI_USAGE");
-      if(up&&*up) rt_save(up,0); }                   /* same bytes as every other engine */
+    { const char *sv=getenv("USAGE_SAVE");
+      if(!(sv && atoi(sv)==0) && g_k3_usage[0])
+          rt_save(g_k3_usage,0); }                   /* same bytes as every other engine */
     return 0;
 }
