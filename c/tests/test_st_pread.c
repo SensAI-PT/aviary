@@ -49,7 +49,33 @@ int main(void) {
     st_read_raw(&S, "t", out, 0);
     for (int i = 0; i < 96; i++) CHECK(out[i] == (unsigned char)(i * 7 + 3));
 
+    /* 1b) the capped variant passes a read that fits, byte for byte */
+    unsigned char capped[96] = {0};
+    st_read_raw_cap(&S, "t", capped, sizeof(capped), 0);
+    CHECK(memcmp(capped, out, 96) == 0);
+
 #ifndef _WIN32
+    /* 1c) a header declaring more bytes than the destination holds. st_init cannot
+     * catch this for dtype 3 (packed quant bytes legitimately have numel != nbytes),
+     * so the bound has to be the caller's -- st_read_raw_cap makes it one. Runs on
+     * the intact shard: the cap is checked before any pread, so truncation below
+     * would only obscure which refusal fired. */
+    int cap_pipe[2]; CHECK(pipe(cap_pipe) == 0);
+    pid_t cap_pid = fork(); CHECK(cap_pid >= 0);
+    if (cap_pid == 0) {
+        dup2(cap_pipe[1], 2); close(cap_pipe[0]); close(cap_pipe[1]);
+        unsigned char small[64];
+        st_read_raw_cap(&S, "t", small, sizeof(small), 0);   /* 96 > 64: must exit(1) */
+        _exit(42);                                            /* reaching here = bug */
+    }
+    close(cap_pipe[1]);
+    char cap_err[512] = {0};
+    ssize_t cn = read(cap_pipe[0], cap_err, sizeof(cap_err)-1); (void)cn;
+    close(cap_pipe[0]);
+    int cap_status = 0; waitpid(cap_pid, &cap_status, 0);
+    CHECK(WIFEXITED(cap_status) && WEXITSTATUS(cap_status) == 1);
+    CHECK(strstr(cap_err, "destination holds") != NULL);
+
     /* 2) shard truncated AFTER st_init (init validates static bounds, so the
      * pread path only fires when the file shrinks underneath a live handle):
      * child must exit(1) with an honest message, not perror's "Success" */
