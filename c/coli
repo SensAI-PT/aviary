@@ -236,6 +236,31 @@ def resource_request(a, env):
 def env_for(a):
     explicit_env = set(os.environ)
     e = dict(os.environ, SNAP=a.model)
+    # OMP_NUM_THREADS on EVERY platform, not only Windows.
+    #
+    # glm.c's self-exec tuning (colibri.c, the COLI_OMP_TUNED block) sets
+    # OMP_WAIT_POLICY and GOMP_SPINCOUNT but never the thread count -- and it
+    # skips itself entirely when COLI_CUDA or COLI_METAL is on. So on Linux
+    # nothing ever sets OMP_NUM_THREADS and libgomp falls back to nproc, i.e.
+    # LOGICAL cores. On any SMT host that over-subscribes by 2x, which is
+    # precisely what physical_cpu_count()'s own docstring warns about:
+    # "two SMT siblings share one AVX-512 unit and contend".
+    #
+    # Measured, GLM-5.2 744B on 4x RTX A6000 + EPYC 7402P (24 cores / 48
+    # threads), CTX=32768, .coli_usage restored between runs:
+    #
+    #   OMP_NUM_THREADS   routed CPU read   decode      per thread
+    #      4               6.48 GB/s        1.28 tok/s   1.62 GB/s
+    #      8              12.50             1.97         1.56
+    #     16              23.97             2.63         1.49
+    #     24 (physical)   30.10             2.90         1.25
+    #     48 (logical)    17.35             2.06         0.36   <- today's default
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins, and the whole
+    # thing stays behind COLI_NO_OMP_TUNE like the rest of the OMP tuning.
+    if not e.get("COLI_NO_OMP_TUNE"):
+        from resource_plan import physical_cpu_count
+        e.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -247,11 +272,9 @@ def env_for(a):
             # prima di main, quindi su Windows vanno nell'ambiente del figlio.
             # niente OMP_PROC_BIND/OMP_PLACES: la libgomp di MinGW non supporta
             # l'affinity su Windows ("Affinity not supported on this configuration")
-            from resource_plan import physical_cpu_count
             for k, v in (("OMP_WAIT_POLICY", "active"),
                          ("GOMP_SPINCOUNT", "200000"),
-                         ("OMP_DYNAMIC", "FALSE"),
-                         ("OMP_NUM_THREADS", str(physical_cpu_count()))):
+                         ("OMP_DYNAMIC", "FALSE")):
                 e.setdefault(k, v)
         # Default Windows misurati sul box di riferimento (docs/tuning-9950x3d-5090.md),
         # tutti lossless e tutti setdefault (un override esplicito vince sempre):
