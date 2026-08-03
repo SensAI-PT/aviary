@@ -8267,6 +8267,34 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
+/* Automatic history pinning and the adaptive LRU share the expert RAM budget.
+ * Preserve the LRU capacity affordable before pinning, up to the requested
+ * cap; explicit PIN/PIN_GB settings bypass this policy and remain authoritative. */
+static double autopin_preserve_lru(double planned_pin, double expert_available,
+                                   double lru_reserve){
+    if(planned_pin<=0.0 || expert_available<=lru_reserve) return 0.0;
+    double max_pin=expert_available-lru_reserve;
+    return planned_pin<max_pin?planned_pin:max_pin;
+}
+
+static double autopin_lru_reserve(double expert_available, double bytes_per_slot,
+                                  int requested_cap, int *preserved_cap){
+    int cap=0;
+    if(expert_available>0.0 && bytes_per_slot>0.0 && requested_cap>0){
+        int affordable=(int)(expert_available/bytes_per_slot);
+        cap=requested_cap<affordable?requested_cap:affordable;
+    }
+    if(preserved_cap) *preserved_cap=cap;
+    return (double)cap*bytes_per_slot;
+}
+
+static double expert_cache_bytes_per_slot(Model *m, int ebits){
+    int nsp=0;
+    for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
+    if(m->has_mtp) nsp+=2;
+    return (double)nsp*(double)expert_bytes_probe(m,ebits);
+}
+
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
@@ -9307,7 +9335,19 @@ int main(int argc, char **argv){
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
            * qualche ora di chat) arriva a meta' del budget expert. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+          double expert_available=expert_avail(&m,ram_env,ebits,est_ctx);
+          double planned_pin=expert_available*0.5*conf;
+          int preserved_cap=0;
+          double lru_reserve=autopin_lru_reserve(
+              expert_available,expert_cache_bytes_per_slot(&m,ebits),
+              m.ecap,&preserved_cap);
+          double pin_bytes=autopin_preserve_lru(
+              planned_pin,expert_available,lru_reserve);
+          if(pin_bytes+1.0<planned_pin)
+              fprintf(stderr,"[PIN] auto: %.1f GB plan capped to %.1f GB to preserve "
+                  "the no-pin LRU cap %d/layer\n",
+                  planned_pin/1e9,pin_bytes/1e9,preserved_cap);
+          double pin_gb=pin_bytes/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
