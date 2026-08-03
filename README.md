@@ -544,6 +544,28 @@ on ideas and evidence from the following open research and systems work:
   [kTransformers](https://github.com/kvcache-ai/ktransformers) for the open
   inference systems and expert-offload work that make comparisons reproducible.
 
+The engine also stands on concrete engineering work, not only ideas. Each of
+these is used or reimplemented in the tree today:
+
+- [safetensors](https://github.com/huggingface/safetensors) — the container
+  every engine reads (`c/st.h`), including its fp8 and I64 dtypes.
+- [tiktoken](https://github.com/openai/tiktoken) — `c/tok.h` reimplements its
+  `byte_pair_encode` exactly, merging the adjacent pair whose concatenation has
+  the lowest vocab id, so a tiktoken-derived vocabulary needs no merges list.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — the GBNF grammar subset
+  in `c/grammar.h` follows its syntax and its set-of-stacks PDA, and the Metal
+  path borrows its `newBufferWithBytesNoCopy` residency trick.
+- [vLLM](https://github.com/vllm-project/vllm) — the reference for output
+  semantics the engine matches position by position (e.g. where the final norm
+  lands relative to the LM head).
+- [transformers](https://github.com/huggingface/transformers) — the oracle:
+  CI reproduces a random-init model token for token against it.
+- [DietGPU](https://github.com/facebookresearch/dietgpu) — the GPU ANS codec
+  behind the experimental compressed expert tier (`COLI_ANS`).
+- [rocWMMA](https://github.com/ROCm/rocWMMA) — the HIP backend maps CUDA's
+  `nvcuda::wmma` fragment/mma_sync API onto it (`c/backend_gpu_compat.h`), which
+  is what lets one .cu source compile for both vendors.
+
 ## License
 
 Apache 2.0. GLM-5.2 weights are released by Z.ai under MIT.
