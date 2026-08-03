@@ -1,8 +1,10 @@
-"""Aviary worker agent — local Engine + control-plane heartbeat."""
+"""Aviary worker agent — local Engine + control-plane heartbeat.
+
+Model-agnostic: uses Colibri's model_arch / argv_for_arch / Engine resolution.
+"""
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import socket
@@ -23,11 +25,33 @@ from aviary.protocol import (
 from aviary.registry import DEFAULT_HEARTBEAT_SEC
 
 try:
-    from openai_server import APIServer, Engine, default_engine, default_model_id, model_family, DEFAULT_CORS_ORIGINS
+    from openai_server import (
+        ARCH,
+        APIServer,
+        DEFAULT_CORS_ORIGINS,
+        Engine,
+        default_engine,
+        model_arch,
+    )
     from resource_plan import analyze_model, discover_gpus, memory_available
 except ImportError:
-    from openai_server import APIServer, Engine, default_engine, default_model_id, model_family, DEFAULT_CORS_ORIGINS  # type: ignore
+    from openai_server import (  # type: ignore
+        ARCH,
+        APIServer,
+        DEFAULT_CORS_ORIGINS,
+        Engine,
+        default_engine,
+        model_arch,
+    )
     discover_gpus = memory_available = analyze_model = None  # type: ignore
+
+
+def _default_model_id(arch: str) -> str:
+    return {
+        "kimi": "kimi-k3-colibri",
+        "inkling": "inkling-colibri",
+        "hy3": "hy3-colibri",
+    }.get(arch, "glm-5.2-colibri")
 
 
 def _local_ip_for(peer: tuple[str, int]) -> str:
@@ -67,6 +91,7 @@ class ControlConnection:
         payload = {
             "host": self.advertise_host,
             "model_path": self.model_path,
+            "arch": ARCH,
         }
         eng = self.engine
         if getattr(eng, "hwinfo", None):
@@ -109,6 +134,7 @@ class ControlConnection:
             "uptime_sec": time.time() - self._started,
             "hits": getattr(eng, "hits", None) or "",
             "hits_seq": getattr(eng, "hits_seq", 0),
+            "arch": ARCH,
         }
         if getattr(eng, "hwinfo", None):
             payload["hwinfo"] = eng.hwinfo
@@ -121,7 +147,6 @@ class ControlConnection:
 
     def _run(self):
         self._started = time.time()
-        timeout = DEFAULT_RPC_TIMEOUT_MS / 1000.0
         while not self._stop.is_set():
             sock = None
             try:
@@ -151,9 +176,9 @@ class ControlConnection:
                         except ProtocolError:
                             break
                         next_beat = now + DEFAULT_HEARTBEAT_SEC
-                    sock.settimeout(max(0.1, next_beat - time.time()))
                     try:
-                        kind, fields, _ = read_frame(sock, int(max(100, (next_beat - time.time()) * 1000)))
+                        kind, fields, _ = read_frame(
+                            sock, int(max(100, (next_beat - time.time()) * 1000)))
                         if kind == "EOF":
                             break
                         if kind == "PING":
@@ -176,29 +201,32 @@ class ControlConnection:
 
 
 def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api_key=None,
-              control_port=None, advertise_host=None, cap=8, max_tokens=1024, env=None,
+              control_port=None, advertise_host=None, cap=None, max_tokens=1024, env=None,
               max_queue=8, queue_timeout=300, kv_slots=1, engine_path=None):
+    import openai_server
+
     parsed = urlparse(master_url if "://" in master_url else f"http://{master_url}")
     master_host = parsed.hostname or "127.0.0.1"
     control_port = control_port or int(os.environ.get("AVIARY_CONTROL_PORT", "9002"))
     node_id = load_or_create_node_id(model)
-    model_id = model_id or os.environ.get("COLI_MODEL_ID") or default_model_id(model)
+    arch = model_arch(model)
+    openai_server.ARCH = arch
+    model_id = model_id or os.environ.get("COLI_MODEL_ID") or _default_model_id(arch)
     advertise = advertise_host or (host if host not in ("0.0.0.0", "::") else None)
-    family = model_family(model)
     engine_bin = engine_path or str(default_engine())
 
     server = APIServer((host, port), None, model_id, api_key, max_tokens,
                        cors_origins=DEFAULT_CORS_ORIGINS,
                        max_queue=max_queue, queue_timeout=queue_timeout,
-                       kv_slots=kv_slots, family=family)
-    runtime = Engine(engine_bin, model, cap, max_tokens, env, kv_slots, family)
+                       kv_slots=kv_slots)
+    runtime = Engine(engine_bin, model, cap, max_tokens, env, kv_slots, arch)
     server.engine = runtime
 
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
                                 advertise, runtime, server.scheduler)
     control.start()
 
-    print(f"Aviary agent {node_id} listening on http://{host}:{port}/v1 "
+    print(f"Aviary agent {node_id} arch={arch} listening on http://{host}:{port}/v1 "
           f"(master control {master_host}:{control_port})", file=sys.stderr)
 
     previous = signal.getsignal(signal.SIGTERM)

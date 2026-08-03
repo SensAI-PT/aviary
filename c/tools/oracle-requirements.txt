@@ -1,0 +1,8 @@
+# Deps for tiny-model oracles (Inkling: make_tiny_inkling.py; Hy3: make_hy3_oracle.py).
+# ci.yml `inkling-oracle` and `hy3-oracle` install exactly this file; setup-python
+# hashes it for the pip cache key. CPU torch: random-init fixtures, no GPU wanted.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch
+transformers>=5.14   # Inkling architecture support (InklingForCausalLM)
+safetensors

@@ -175,6 +175,7 @@ typedef struct {
     int attn_vis_s;
 } Model;
 
+#include "route_trace.h"   /* shared .coli_usage / ROUTE_TRACE (#700) */
 #include "telemetry.h"
 #include "decode_batch.h"
 
@@ -963,7 +964,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     int nrows=c->n_layers+1;
     m->ecap=cap; m->ecache=calloc(nrows,sizeof(ESlot*)); m->ecn=calloc(nrows,sizeof(int));
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
-    m->eusage=calloc(nrows,sizeof(uint32_t*));
+    rt_init("hy3",c->n_layers,c->n_experts);   /* owns .coli_usage counters */
+    m->eusage=rt_counts_all();                 /* alias: bump sites unchanged */
     m->eheat=calloc(nrows,sizeof(uint32_t*));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
@@ -999,7 +1001,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.down_proj.weight",i);
             l->sh_down=qt_load_first(m,nm2,nm,D,sI,dbits);
             m->ecache[i]=calloc(cap,sizeof(ESlot));
-            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
@@ -1072,7 +1073,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(mtp_nb,sizeof(mtp_nb),"model.layers.%d.final_layernorm.weight",i);
             m->mtp_norm=ld_first(m,mtp_na,mtp_nb);
             m->ecache[i]=calloc(cap,sizeof(ESlot));
-            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             #undef PM
         }
@@ -1714,6 +1714,7 @@ static double mem_available_gb(void){
 #endif
 }
 
+
 static double kv_pool_bytes(Model *m, int max_ctx){
     Cfg *c=&m->c;
     int nl=c->n_layers+(m->has_mtp?1:0);
@@ -1945,6 +1946,7 @@ static void perf_report(Model *m){
         100.0*m->t_emm/total, 100.0*m->t_head/total);
 }
 
+
 /* log-likelihood scoring (SCORE=requests.txt): one forward per line, teacher-forcing */
 static double logprob_target(const float *lo, int V, int target, int *am){
     float mx=lo[0]; int best=0; for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];best=i;} }
@@ -2058,6 +2060,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
 }
 
 static void run_serve(Model *m, const char *snap){
+    coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");

@@ -295,10 +295,62 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 static inline int64_t i3_groups(int I){ return ((int64_t)I + I3_GROUP - 1) / I3_GROUP; }
 static inline int64_t i3_rowbytes(int I){ return i3_groups(I) * I3_GBYTES; }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int g_i3_avx512=1;
+/* one full 64-value group -> f32 partial. Relies on immintrin.h arriving via the
+ * __AVX2__-gated include above (AVX512F implies AVX2 on clang/gcc/MSVC), same as
+ * dot_i4f_avx512. */
+static inline float dot_i3g64_avx512(const uint8_t *lo, const uint8_t *hi, const float *x){
+    const __m128i m2=_mm_set1_epi8(3); const __m512i c4=_mm512_set1_epi8(4);
+    __m128i by=_mm_loadu_si128((const __m128i*)lo);
+    __m128i p0=_mm_and_si128(by,m2),                   p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+    __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+    __m128i l01=_mm_unpacklo_epi8(p0,p1), h01=_mm_unpackhi_epi8(p0,p1);
+    __m128i l23=_mm_unpacklo_epi8(p2,p3), h23=_mm_unpackhi_epi8(p2,p3);
+    __m512i lov=_mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(
+        _mm512_castsi128_si512(_mm_unpacklo_epi16(l01,l23)),
+        _mm_unpackhi_epi16(l01,l23),1),
+        _mm_unpacklo_epi16(h01,h23),2),
+        _mm_unpackhi_epi16(h01,h23),3);            /* byte k = low 2 bits of value k */
+    uint64_t hb; memcpy(&hb,hi,8);                 /* mask bit k = high bit of value k */
+    __m512i wq=_mm512_sub_epi8(_mm512_mask_add_epi8(lov,(__mmask64)hb,lov,c4),c4); /* [-4,3] in order */
+    __m512 ac0=_mm512_setzero_ps(), ac1=_mm512_setzero_ps();
+    ac0=_mm512_fmadd_ps(_mm512_loadu_ps(x),    _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_castsi512_si128(wq))),      ac0);
+    ac1=_mm512_fmadd_ps(_mm512_loadu_ps(x+16), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,1))), ac1);
+    ac0=_mm512_fmadd_ps(_mm512_loadu_ps(x+32), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,2))), ac0);
+    ac1=_mm512_fmadd_ps(_mm512_loadu_ps(x+48), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(wq,3))), ac1);
+    return _mm512_reduce_add_ps(_mm512_add_ps(ac0,ac1));
+}
+static int i3_avx512_selftest(void){
+    /* fixed group, asymmetric in every lane: pseudo-random 3-bit values with
+     * distinct nonzero integer activations. All terms and partials are small
+     * integers (exact in f32 under ANY summation order), so the compare is
+     * exact — any lane permutation, bias error or plane mix-up shifts the sum. */
+    uint8_t lo[16]={0}, hi[8]={0}; float x[I3_GROUP]; double ref=0;
+    uint64_t r=0x9E3779B97F4A7C15ull;
+    for(int k=0;k<I3_GROUP;k++){
+        r^=r<<13; r^=r>>7; r^=r<<17;
+        unsigned u=(unsigned)(r&7);
+        lo[k>>2]|=(uint8_t)((u&3)<<((k&3)*2));
+        hi[k>>3]|=(uint8_t)((u>>2)<<(k&7));
+        x[k]=(k&1)?-(float)(k+1):(float)(k+1);
+        ref+=(double)x[k]*((int)u-4);
+    }
+    float got=dot_i3g64_avx512(lo,hi,x);
+    if(got!=(float)ref){ fprintf(stderr,"AVX512 i3 selftest: %.9g != %.9g\n",got,ref); return 0; }
+    return 1;
+}
+#endif
+
 /* Dequant-on-use with PER-GROUP scale. Exact f32 path only (no IDOT in v1: int8
  * activations don't compose with per-group accumulation without a kernel
  * restructure — follow-up). NEON: low plane = matmul_i2's unpack, high plane
- * expanded via vtst on bit masks; x86 stays scalar for now (follow-up). */
+ * expanded via vtst on bit masks. AVX-512(F+BW): same unpack at 128-bit, high
+ * plane loaded as a __mmask64 (bit k = value k) driving a masked +4; one full
+ * group per iteration (dot_i3g64_avx512; I3_AVX512=0 falls back to scalar).
+ * Other x86 stays scalar (follow-up). Both vector arms reorder fma WITHIN a
+ * group only; the per-group partial is scaled by scale[g] and added to the
+ * row accumulator in scalar order, exactly like the scalar loop. */
 static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
     int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
     #pragma omp parallel for schedule(static)
@@ -312,7 +364,9 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
                 const uint8_t *lo=wrow+g*I3_GBYTES, *hi=lo+16;
                 int base=(int)(g*I3_GROUP), n = I-base < I3_GROUP ? I-base : I3_GROUP;
                 float a=0; int k=0;
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                if(g_i3_avx512 && n==I3_GROUP){ a=dot_i3g64_avx512(lo,hi,xs+base); k=I3_GROUP; }
+#elif defined(__ARM_NEON)
                 if(n==I3_GROUP){
                     const uint8x8_t m2v=vdup_n_u8(3); const int8x16_t b4q=vdupq_n_s8(4);
                     const uint8x16_t bitm={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
@@ -344,6 +398,114 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
                 acc += a*srow[g];
             }
             y[(int64_t)s*O+o]=acc;
+        }
+    }
+}
+
+/* ---- fmt=8: native FP8-e4m3 passthrough (Z.ai GLM-5.2-FP8 read path) ------
+ * PUBLIC ordinal. This format was minted fmt=6 during original development,
+ * then re-tagged fmt=100 (PRIVATE ORDINAL BLOCK, see colibri.c's QT struct
+ * comment) after #465 (E8/IQ3, above) claimed ordinal 6 upstream out from
+ * under it; graduated to fmt=7 when the maintainer assigned that ordinal on
+ * #524; renumbered a second time to fmt=8 after #705 merged into dev claiming
+ * fmt=7 for MXFP4 (Kimi K3 Vulkan tier, backend_vulkan.c) while this PR was
+ * still open. Both renumbers were pure retags, per the private-block
+ * convention's own "find-and-replace, zero on-disk impact" promise: nothing
+ * on disk carries the ordinal. See qt_resolve_fmt in colibri.c ("THE DESIGN
+ * LANDMINE") for the disambiguation this needs against BOTH fmt=1 (int8) and
+ * fmt=6 (E8/IQ3).
+ *
+ * fmt=8 weight bytes are O*I raw e4m3 bytes -- byte-identical to int8 (fmt=1).
+ * What makes this a DIFFERENT format is the scale: one f32 per 128x128 BLOCK of
+ * the [O,I] weight matrix (shape [ceil(O/128),ceil(I/128)]), not one f32 per
+ * output row. Dequant is w[o,i] = e4m3_decode(byte) * scale[o/128, i/128]
+ * (MULTIPLY, not divide) -- mirrors tools/convert_fp8_to_int4.py's dequant()
+ * exactly, which is the authoritative reference for how Z.ai's checkpoints read
+ * on the source side. This f32 encoding is a declared PROPERTY of the format,
+ * not the only one it can carry -- DeepSeek-V4 ships this identical weight
+ * geometry with UE8M0 (1-byte, power-of-two) block scales instead; qt_resolve_fmt
+ * recognizes that byte signature and refuses it BY NAME rather than
+ * misreading it as f32 (UE8M0 decode itself is not implemented in this build).
+ *
+ * 256-entry decode LUT, cross-checked byte-for-byte against PyTorch's
+ * torch.float8_e4m3fn (the exact dtype safetensors reports for these shards):
+ * sign(1) exp(4,bias=7) mant(3), subnormal at exp==0, and the OCP E4M3-FN
+ * convention that exp==0xF is NOT reserved for infinity -- only mant==0x7 at
+ * exp==0xF is NaN (max finite is exp=0xF,mant=0x6 -> 448). A static compile-time
+ * table (not a lazily-initialized one) is used deliberately: matmul_fp8 below
+ * runs inside #pragma omp parallel for, and a lazy-init global would race under
+ * concurrent first use.
+ *
+ * NaN POLICY (decided, documented per the build spec): a NaN byte (0x7F/0xFF)
+ * decodes to a real IEEE NaN and is left to propagate through the dot product,
+ * exactly like any other source of a NaN weight (fmt=0/f32 tensors are never
+ * scrubbed either). The engine already has a dedicated, TESTED safety net for
+ * NaN reaching the sampler (argmax_v/dist_build, see tests/test_logit_nan.c:
+ * "degrade + diagnose, never silently corrupt") -- fmt=8 relies on that existing
+ * downstream net rather than adding a second, redundant weight-level scrub. */
+static const float E4M3_LUT[256] = {
+    0x0.0p+0f,0x1.0000000000000p-9f,0x1.0000000000000p-8f,0x1.8000000000000p-8f,0x1.0000000000000p-7f,0x1.4000000000000p-7f,0x1.8000000000000p-7f,0x1.c000000000000p-7f,
+    0x1.0000000000000p-6f,0x1.2000000000000p-6f,0x1.4000000000000p-6f,0x1.6000000000000p-6f,0x1.8000000000000p-6f,0x1.a000000000000p-6f,0x1.c000000000000p-6f,0x1.e000000000000p-6f,
+    0x1.0000000000000p-5f,0x1.2000000000000p-5f,0x1.4000000000000p-5f,0x1.6000000000000p-5f,0x1.8000000000000p-5f,0x1.a000000000000p-5f,0x1.c000000000000p-5f,0x1.e000000000000p-5f,
+    0x1.0000000000000p-4f,0x1.2000000000000p-4f,0x1.4000000000000p-4f,0x1.6000000000000p-4f,0x1.8000000000000p-4f,0x1.a000000000000p-4f,0x1.c000000000000p-4f,0x1.e000000000000p-4f,
+    0x1.0000000000000p-3f,0x1.2000000000000p-3f,0x1.4000000000000p-3f,0x1.6000000000000p-3f,0x1.8000000000000p-3f,0x1.a000000000000p-3f,0x1.c000000000000p-3f,0x1.e000000000000p-3f,
+    0x1.0000000000000p-2f,0x1.2000000000000p-2f,0x1.4000000000000p-2f,0x1.6000000000000p-2f,0x1.8000000000000p-2f,0x1.a000000000000p-2f,0x1.c000000000000p-2f,0x1.e000000000000p-2f,
+    0x1.0000000000000p-1f,0x1.2000000000000p-1f,0x1.4000000000000p-1f,0x1.6000000000000p-1f,0x1.8000000000000p-1f,0x1.a000000000000p-1f,0x1.c000000000000p-1f,0x1.e000000000000p-1f,
+    0x1.0000000000000p+0f,0x1.2000000000000p+0f,0x1.4000000000000p+0f,0x1.6000000000000p+0f,0x1.8000000000000p+0f,0x1.a000000000000p+0f,0x1.c000000000000p+0f,0x1.e000000000000p+0f,
+    0x1.0000000000000p+1f,0x1.2000000000000p+1f,0x1.4000000000000p+1f,0x1.6000000000000p+1f,0x1.8000000000000p+1f,0x1.a000000000000p+1f,0x1.c000000000000p+1f,0x1.e000000000000p+1f,
+    0x1.0000000000000p+2f,0x1.2000000000000p+2f,0x1.4000000000000p+2f,0x1.6000000000000p+2f,0x1.8000000000000p+2f,0x1.a000000000000p+2f,0x1.c000000000000p+2f,0x1.e000000000000p+2f,
+    0x1.0000000000000p+3f,0x1.2000000000000p+3f,0x1.4000000000000p+3f,0x1.6000000000000p+3f,0x1.8000000000000p+3f,0x1.a000000000000p+3f,0x1.c000000000000p+3f,0x1.e000000000000p+3f,
+    0x1.0000000000000p+4f,0x1.2000000000000p+4f,0x1.4000000000000p+4f,0x1.6000000000000p+4f,0x1.8000000000000p+4f,0x1.a000000000000p+4f,0x1.c000000000000p+4f,0x1.e000000000000p+4f,
+    0x1.0000000000000p+5f,0x1.2000000000000p+5f,0x1.4000000000000p+5f,0x1.6000000000000p+5f,0x1.8000000000000p+5f,0x1.a000000000000p+5f,0x1.c000000000000p+5f,0x1.e000000000000p+5f,
+    0x1.0000000000000p+6f,0x1.2000000000000p+6f,0x1.4000000000000p+6f,0x1.6000000000000p+6f,0x1.8000000000000p+6f,0x1.a000000000000p+6f,0x1.c000000000000p+6f,0x1.e000000000000p+6f,
+    0x1.0000000000000p+7f,0x1.2000000000000p+7f,0x1.4000000000000p+7f,0x1.6000000000000p+7f,0x1.8000000000000p+7f,0x1.a000000000000p+7f,0x1.c000000000000p+7f,0x1.e000000000000p+7f,
+    0x1.0000000000000p+8f,0x1.2000000000000p+8f,0x1.4000000000000p+8f,0x1.6000000000000p+8f,0x1.8000000000000p+8f,0x1.a000000000000p+8f,0x1.c000000000000p+8f,       NAN,
+     -0x0.0p+0f,-0x1.0000000000000p-9f,-0x1.0000000000000p-8f,-0x1.8000000000000p-8f,-0x1.0000000000000p-7f,-0x1.4000000000000p-7f,-0x1.8000000000000p-7f,-0x1.c000000000000p-7f,
+    -0x1.0000000000000p-6f,-0x1.2000000000000p-6f,-0x1.4000000000000p-6f,-0x1.6000000000000p-6f,-0x1.8000000000000p-6f,-0x1.a000000000000p-6f,-0x1.c000000000000p-6f,-0x1.e000000000000p-6f,
+    -0x1.0000000000000p-5f,-0x1.2000000000000p-5f,-0x1.4000000000000p-5f,-0x1.6000000000000p-5f,-0x1.8000000000000p-5f,-0x1.a000000000000p-5f,-0x1.c000000000000p-5f,-0x1.e000000000000p-5f,
+    -0x1.0000000000000p-4f,-0x1.2000000000000p-4f,-0x1.4000000000000p-4f,-0x1.6000000000000p-4f,-0x1.8000000000000p-4f,-0x1.a000000000000p-4f,-0x1.c000000000000p-4f,-0x1.e000000000000p-4f,
+    -0x1.0000000000000p-3f,-0x1.2000000000000p-3f,-0x1.4000000000000p-3f,-0x1.6000000000000p-3f,-0x1.8000000000000p-3f,-0x1.a000000000000p-3f,-0x1.c000000000000p-3f,-0x1.e000000000000p-3f,
+    -0x1.0000000000000p-2f,-0x1.2000000000000p-2f,-0x1.4000000000000p-2f,-0x1.6000000000000p-2f,-0x1.8000000000000p-2f,-0x1.a000000000000p-2f,-0x1.c000000000000p-2f,-0x1.e000000000000p-2f,
+    -0x1.0000000000000p-1f,-0x1.2000000000000p-1f,-0x1.4000000000000p-1f,-0x1.6000000000000p-1f,-0x1.8000000000000p-1f,-0x1.a000000000000p-1f,-0x1.c000000000000p-1f,-0x1.e000000000000p-1f,
+    -0x1.0000000000000p+0f,-0x1.2000000000000p+0f,-0x1.4000000000000p+0f,-0x1.6000000000000p+0f,-0x1.8000000000000p+0f,-0x1.a000000000000p+0f,-0x1.c000000000000p+0f,-0x1.e000000000000p+0f,
+    -0x1.0000000000000p+1f,-0x1.2000000000000p+1f,-0x1.4000000000000p+1f,-0x1.6000000000000p+1f,-0x1.8000000000000p+1f,-0x1.a000000000000p+1f,-0x1.c000000000000p+1f,-0x1.e000000000000p+1f,
+    -0x1.0000000000000p+2f,-0x1.2000000000000p+2f,-0x1.4000000000000p+2f,-0x1.6000000000000p+2f,-0x1.8000000000000p+2f,-0x1.a000000000000p+2f,-0x1.c000000000000p+2f,-0x1.e000000000000p+2f,
+    -0x1.0000000000000p+3f,-0x1.2000000000000p+3f,-0x1.4000000000000p+3f,-0x1.6000000000000p+3f,-0x1.8000000000000p+3f,-0x1.a000000000000p+3f,-0x1.c000000000000p+3f,-0x1.e000000000000p+3f,
+    -0x1.0000000000000p+4f,-0x1.2000000000000p+4f,-0x1.4000000000000p+4f,-0x1.6000000000000p+4f,-0x1.8000000000000p+4f,-0x1.a000000000000p+4f,-0x1.c000000000000p+4f,-0x1.e000000000000p+4f,
+    -0x1.0000000000000p+5f,-0x1.2000000000000p+5f,-0x1.4000000000000p+5f,-0x1.6000000000000p+5f,-0x1.8000000000000p+5f,-0x1.a000000000000p+5f,-0x1.c000000000000p+5f,-0x1.e000000000000p+5f,
+    -0x1.0000000000000p+6f,-0x1.2000000000000p+6f,-0x1.4000000000000p+6f,-0x1.6000000000000p+6f,-0x1.8000000000000p+6f,-0x1.a000000000000p+6f,-0x1.c000000000000p+6f,-0x1.e000000000000p+6f,
+    -0x1.0000000000000p+7f,-0x1.2000000000000p+7f,-0x1.4000000000000p+7f,-0x1.6000000000000p+7f,-0x1.8000000000000p+7f,-0x1.a000000000000p+7f,-0x1.c000000000000p+7f,-0x1.e000000000000p+7f,
+    -0x1.0000000000000p+8f,-0x1.2000000000000p+8f,-0x1.4000000000000p+8f,-0x1.6000000000000p+8f,-0x1.8000000000000p+8f,-0x1.a000000000000p+8f,-0x1.c000000000000p+8f,       NAN,
+};
+static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
+
+#define FP8_BLOCK 128
+static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
+
+/* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
+ * per-128x128-BLOCK f32 scale [ceil(O/128),ceil(I/128)]. Scalar reference path
+ * (no SIMD in v1 -- BW-bound like the Metal kernel, and this format's hot path
+ * is the GPU one; a vectorized CPU kernel is future work if measured needed).
+ * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
+ * convention so cross-block cancellation doesn't cost precision unfairly. */
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w = q8 + (int64_t)o*I;
+        int64_t blkO = o / FP8_BLOCK;
+        const float *scl = bscale + blkO*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi]; float acc=0;
+                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+                a += (double)acc*sc;
+            }
+            y[(int64_t)s*O+o]=(float)a;
         }
     }
 }
@@ -750,12 +912,12 @@ typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch
 static _Thread_local QScratch g_qscratch;
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     if(xn>g_qscratch.xq_cap){
-        int8_t *p=realloc(g_qscratch.xq,xn);
+        int8_t *p=(int8_t*)realloc(g_qscratch.xq,xn);
         if(!p){ fprintf(stderr,"OOM quant scratch\n"); exit(1); }
         g_qscratch.xq=p; g_qscratch.xq_cap=xn;
     }
     if(sn>g_qscratch.sx_cap){
-        float *p=realloc(g_qscratch.sx,sn*sizeof(float));
+        float *p=(float*)realloc(g_qscratch.sx,sn*sizeof(float));
         if(!p){ fprintf(stderr,"OOM quant scales\n"); exit(1); }
         g_qscratch.sx=p; g_qscratch.sx_cap=sn;
     }
@@ -1185,6 +1347,148 @@ static inline void e8_rot_rows(float *rows, int nr, int dim){
     }
 }
 
+/* ---- MXFP4 (OCP microscaling FP4) ----------------------------------------
+ * The native layout of compressed-tensors "mxfp4-pack-quantized" checkpoints
+ * (Kimi K3 routed experts are QAT in this format — pass-through, never
+ * re-encoded):
+ *   packed [O, I/2]  u8 — e2m1 nibbles, LOW nibble = even column, bit3 = sign,
+ *                         bits 0..2 index {0,.5,1,1.5,2,3,4,6}
+ *   scales [O, I/32] u8 — ue8m0 exponent per 32-column group, w = v * 2^(s-127)
+ * = 4.25 bits/weight all-in. The exponent is decoded with the bit trick
+ * (s<<23 as a float): exact for s in [1,254]; s=0 (2^-127, denormal) decodes
+ * to +0 and s=255 to +inf on BOTH the scalar and SIMD paths, so the two stay
+ * bit-identical — real checkpoints never contain either. */
+static const float mx4_lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                                  -0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+static inline float mx4_scale(uint8_t s){
+    union { uint32_t u; float f; } b; b.u = (uint32_t)s << 23; return b.f;
+}
+static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                         int S, int I, int O){
+    int rb=(I+1)/2, ng=(I+31)/32;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const uint8_t *scl=e8s+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+#ifdef __AVX2__
+            if(I%32==0){
+                /* doubled e2m1 values are exact int8 -> one pshufb decodes a
+                 * nibble vector; the 0.5f un-doubling rides the group scale */
+                const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+                const __m128i m4=_mm_set1_epi8(0x0F);
+                __m256 acc=_mm256_setzero_ps();
+                for(int g=0;g<ng;g++){
+                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
+                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));  /* cols g*32+0..15  */
+                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));  /* cols g*32+16..31 */
+                    const float *xg=xs+g*32;
+                    __m256 ga=_mm256_mul_ps(_mm256_loadu_ps(xg),
+                                            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n0)));
+                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+8),
+                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n0,8))),ga);
+                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+16),
+                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n1)),ga);
+                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+24),
+                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n1,8))),ga);
+                    acc=_mm256_fmadd_ps(ga,_mm256_set1_ps(mx4_scale(scl[g])*0.5f),acc);
+                }
+                y[(int64_t)s*O+o]=hsum256(acc);
+                continue;
+            }
+#endif
+            for(int g=0;g<ng;g++){
+                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+                float sc=mx4_scale(scl[g]), ga=0;
+                for(int i=base;i<base+glen;i+=2){
+                    uint8_t byte=w[i>>1];
+                    ga+=xs[i]*mx4_lut[byte&0xF];
+                    if(i+1<base+glen) ga+=xs[i+1]*mx4_lut[byte>>4];
+                }
+                a+=ga*sc;
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
+/* IDOT variant of matmul_mxfp4: per-32-group int8 activation quantization +
+ * integer dots. The doubled e2m1 values are exact int8 (same LUT as the float
+ * path), so a group reduces to maddubs(|w|, sign(x,w)) like dot_i4i8 — no
+ * per-weight int->float conversion. Group-exact scale folding:
+ *     y = sum_g idot_g * (2^(e8-127) * 0.5) * xscale_g
+ * Activation-quant noise (~0.4%/group) rides on top of the e2m1 grid; gate
+ * with K3_IDOT=0 in the K3 engine for exact-float A/B. */
+static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                            int S, int I, int O){
+    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
+    int rb=I/2, ng=I/32;
+    int8_t *xq=(int8_t*)malloc((size_t)S*I);
+    float *xsc=(float*)malloc((size_t)S*ng*sizeof(float));
+    if(!xq||!xsc){ fprintf(stderr,"OOM mxfp4 idot scratch\n"); exit(1); }
+    for(int s=0;s<S;s++)
+        for(int g=0;g<ng;g++){
+            const float *xg=x+(int64_t)s*I+g*32;
+            float am=0; for(int i=0;i<32;i++){ float a=fabsf(xg[i]); if(a>am)am=a; }
+            float sc=am/127.f; if(sc<1e-20f)sc=1e-20f;
+            xsc[(int64_t)s*ng+g]=sc; float inv=1.f/sc;
+            int8_t *qg=xq+(int64_t)s*I+g*32;
+            for(int i=0;i<32;i++){
+                int v=(int)lrintf(xg[i]*inv);
+                if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
+            }
+        }
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const uint8_t *scl=e8s+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const int8_t *xr=xq+(int64_t)s*I;
+            const float *xsr=xsc+(int64_t)s*ng;
+#ifdef __AVX2__
+            {
+                const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+                const __m128i m4=_mm_set1_epi8(0x0F);
+                const __m256i ones=_mm256_set1_epi16(1);
+                __m256 acc=_mm256_setzero_ps();
+                for(int g=0;g<ng;g++){
+                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
+                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));
+                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));
+                    __m256i wv=_mm256_set_m128i(n1,n0);        /* signed doubled e2m1 */
+                    __m256i xv=_mm256_loadu_si256((const __m256i*)(xr+g*32));
+                    /* |w| <= 12, |x| <= 127: pair sums <= 3048, no int16 overflow */
+                    __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),
+                                                   _mm256_sign_epi8(xv,wv));
+                    acc=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(p,ones)),
+                                        _mm256_set1_ps(mx4_scale(scl[g])*0.5f*xsr[g]),acc);
+                }
+                y[(int64_t)s*O+o]=hsum256(acc);
+                continue;
+            }
+#endif
+            {
+                static const int8_t l2[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+                float a=0;
+                for(int g=0;g<ng;g++){
+                    const int8_t *qg=xr+g*32;
+                    int32_t gi=0;
+                    for(int i=0;i<32;i+=2){
+                        uint8_t byte=w[(g*32+i)>>1];
+                        gi+=(int32_t)l2[byte&0xF]*qg[i]+(int32_t)l2[byte>>4]*qg[i+1];
+                    }
+                    a+=(float)gi*(mx4_scale(scl[g])*0.5f*xsr[g]);
+                }
+                y[(int64_t)s*O+o]=a;
+            }
+        }
+    }
+    free(xq); free(xsc);
+}
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
@@ -1200,6 +1504,52 @@ static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *u
                 uint16_t dh; memcpy(&dh, blk+96, 2);
                 float d=e8_fp16_to_f32(dh);
                 int base=(int)(b*E8_QK);
+#ifdef __AVX2__
+                /* One 8-weight lane is exactly one AVX2 register, which is what the
+                 * format's own shape suggests: a lane is two 4-dim grid rows (8
+                 * contiguous codebook bytes) plus 8 signs. So instead of expanding a
+                 * sub-block into a stack buffer and re-reading it, each lane is
+                 * decoded straight into a register and FMA'd against x:
+                 *   - the 8 grid bytes widen with one vpmovzxbd,
+                 *   - the sign byte (7 stored bits + the parity-derived 8th) expands
+                 *     to 8 lane masks with an AND/CMPEQ against the bit-select vector
+                 *     and is applied as an XOR of the float sign bit — no branches,
+                 *     which is what made the scalar expansion expensive,
+                 *   - 0.5 (the grid's half-unit convention) folds into the sub-scale.
+                 * Two accumulators over the 32 FMAs of a super-block keep this off a
+                 * single dependency chain, and one horizontal add per 256 weights
+                 * replaces one per 32. */
+                if(base+E8_QK<=I){
+                    const __m256i sel=_mm256_setr_epi32(1,2,4,8,16,32,64,128);
+                    const __m256i sgn=_mm256_set1_epi32((int)0x80000000u);
+                    __m256 ac[2]={_mm256_setzero_ps(),_mm256_setzero_ps()};
+                    for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                        uint32_t word; memcpy(&word, blk+E8_QK/4+ib*4, 4);
+                        float db=d*(0.5f+(float)((word>>28)&0xF))*0.5f;
+                        __m256 vdb=_mm256_set1_ps(0.5f*db);
+                        const uint8_t *ix=blk+ib*8;
+                        int off=base+ib*E8_SUB;
+                        for(int l=0;l<4;l++){
+                            uint32_t sv=(word>>(7*l))&0x7Fu;
+                            uint32_t s8=sv|((uint32_t)__builtin_parity(sv)<<7); /* odd parity closes the lane */
+                            uint32_t g0,g1;
+                            memcpy(&g0,e8_grid[ix[l*2+0]],4);
+                            memcpy(&g1,e8_grid[ix[l*2+1]],4);
+                            __m128i by=_mm_cvtsi64_si128((long long)((uint64_t)g0|((uint64_t)g1<<32)));
+                            __m256 v=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(by)),vdb);
+                            __m256i m=_mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32((int)s8),sel),sel);
+                            v=_mm256_xor_ps(v,_mm256_castsi256_ps(_mm256_and_si256(m,sgn)));
+                            ac[l&1]=_mm256_fmadd_ps(v,_mm256_loadu_ps(xs+off+l*8),ac[l&1]);
+                        }
+                    }
+                    __m256 t=_mm256_add_ps(ac[0],ac[1]);
+                    __m128 h=_mm_add_ps(_mm256_castps256_ps128(t),_mm256_extractf128_ps(t,1));
+                    h=_mm_add_ps(h,_mm_movehl_ps(h,h));
+                    h=_mm_add_ss(h,_mm_shuffle_ps(h,h,1));
+                    acc+=_mm_cvtss_f32(h);
+                    continue;
+                }
+#endif
                 for(int ib=0; ib<E8_QK/E8_SUB; ib++){
                     int off=base+ib*E8_SUB;
                     if(off>=I) break;

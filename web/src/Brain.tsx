@@ -5,6 +5,7 @@ import { endpoint } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
+interface AtlasEntry { affinity: Record<string, number>; entropy: number; top: string; label: string }
 
 const TIER_KEYS = ["tier.disk", "tier.ram", "tier.vram"] as const
 const TIER_RGB: [number, number, number][] = [[58, 71, 80], [90, 155, 216], [78, 214, 165]]

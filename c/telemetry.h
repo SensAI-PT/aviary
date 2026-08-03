@@ -37,6 +37,10 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 
 /* CPU model + cores + RAM (GB); empty/zero where unavailable. */
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double *ram_avail){
     cpu[0]=0;
 #ifdef _WIN32
@@ -47,6 +51,8 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
       char *b=(char*)r; b[47]=0; while(*b==' ')b++;
       snprintf(cpu,cn,"%s",b); }
 #endif
+#elif defined(__APPLE__)
+    { size_t sl=cn; if(sysctlbyname("machdep.cpu.brand_string",cpu,&sl,NULL,0)) cpu[0]=0; }
 #else
     FILE *ci=fopen("/proc/cpuinfo","r");
     if(ci){ char ln[256];
@@ -65,6 +71,15 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
     *ram_total=*ram_avail=0;
 #ifdef _WIN32
     compat_meminfo(ram_total,ram_avail);
+#elif defined(__APPLE__)
+    { uint64_t ms=0; size_t sl=sizeof(ms);
+      if(!sysctlbyname("hw.memsize",&ms,&sl,NULL,0)) *ram_total=(double)ms/1e9;
+      int64_t pgsz=0; sl=sizeof(pgsz);
+      if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
+      vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
+      if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)==KERN_SUCCESS)
+          /* macOS analogue of Linux MemAvailable: free + inactive + purgeable */
+          *ram_avail=(double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9; }
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;
@@ -165,25 +180,13 @@ static void hits_emit(Model *m){
     printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
 }
 
-static void stats_dump_q(Model *m, const char *path, int quiet){
-    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
-    FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
-    Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
-        for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
-    fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
-}
+/* The history format lives in route_trace.h so every engine writes the same bytes;
+ * these keep the Model-shaped call sites unchanged. */
+static void stats_dump_q(Model *m, const char *path, int quiet){ (void)m; rt_save(path,quiet); }
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
 static char g_usage_path[2100]="";
-static int64_t usage_load(Model *m, const char *path){
-    FILE *f=fopen(path,"r"); if(!f) return 0;
-    Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
-    while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
-    fclose(f); return tot;
-}
+static int64_t usage_load(Model *m, const char *path){ (void)m; return rt_load(path); }
 static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
 
 #endif /* TELEMETRY_H */
