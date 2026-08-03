@@ -69,6 +69,7 @@
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
 #endif
+#include "omp_tune.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -1672,11 +1673,22 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * block scales; everything else is per-row O. Using the per-row bound for a
          * grouped/blocked format would reject a legitimate container (fmt=5 regressed
          * exactly that way). */
-        st_read_f32_cap(&m->S,sn,t->s,
+        /* fmt=8 goes through st_read_scale_f32: the block-scale GEOMETRY is the
+         * same in a container we repacked (f32 scales) and in a native fp8
+         * checkpoint (UE8M0, one byte per block) -- same shape, same meaning,
+         * same multiply. Only the encoding of the number differs. The reader
+         * accepts either and always yields f32, so matmul_fp8 stays a single
+         * implementation with no branch in the hot loop.
+         *
+         * Every OTHER format still goes through st_read_f32_cap exactly as
+         * before: fmt 0/1/2/4/5/6 are byte-for-byte unchanged, and an f32-scaled
+         * fmt=8 container behaves identically too (st_read_scale_f32 dispatches
+         * to st_read_f32 for dtype F32, the same call it made before). */
+        if(fmt==8) st_read_scale_f32(&m->S,sn,t->s,fp8_nblk(O)*fp8_nblk(I),drop);
+        else st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
-                        fmt==6 ? (int64_t)1               :
-                        fmt==8 ? fp8_nblk(O)*fp8_nblk(I) : (int64_t)O, drop);
+                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -2921,6 +2933,7 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
+static int g_metal_prefill=0; /* default 0: S>4 prefill attention stays on the CPU (bit-exact). COLI_METAL_PREFILL=1 opts it onto the GPU (~4x, near-tie divergence — see docs/metal.md, #622) */
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */
@@ -3193,7 +3206,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * fmt==2 above for an unrelated reason (its absorb kernel is int4-only);
      * these four checks are the same discipline extended to the tensors that
      * flow through the shared per-fmt shader. */
-    if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
+    if(g_metal_enabled && !kvs && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
@@ -5559,11 +5572,12 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
+    double tl0=now_s();
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
-            fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+            fprintf(stderr,"[prefill] layer %d/%d · %d token · +%.2fs\n", i+1, c->n_layers, S, now_s()-tl0);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
         if(pipe2 && l->sparse && i<c->n_layers &&
@@ -8300,10 +8314,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
     if(floored){
         double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
+        /* eb is printed because it is the one term nobody can check from outside:
+         * every projection here divides by it, so a wrong width is indistinguishable
+         * from a wrong budget in this message (#766). */
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB).%s\n",
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,
+            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
@@ -8848,6 +8865,13 @@ int main(int argc, char **argv){
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+    /* #718: the hot-team block above tunes wake latency but historically left
+     * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
+     * collapse when SMT siblings share each core, measured 2.3x on a 5950X.
+     * The shared helper already protects kimi_k3/olmoe: apply its independent
+     * physical-core sizing here too.  This must stay after the possible re-exec;
+     * omp_set_num_threads() is a runtime API and needs no second exec. */
+    coli_omp_tune_threads("colibri");
 #ifdef _WIN32
     _setmode(fileno(stdout), O_BINARY);
 #endif
@@ -8992,6 +9016,7 @@ int main(int argc, char **argv){
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
+    g_metal_prefill = getenv("COLI_METAL_PREFILL")?atoi(getenv("COLI_METAL_PREFILL")):0; /* default 0: S>4 attention on CPU (bit-exact); =1 opt-in GPU prefill */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
      * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.

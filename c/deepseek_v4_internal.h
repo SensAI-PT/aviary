@@ -16,14 +16,14 @@
 #include "st.h"
 
 #define COLI_ST_MAX_RANK ST_MAX_RANK
-#define COLI_ST_BF16 ST_DTYPE_BF16
-#define COLI_ST_F16 ST_DTYPE_F16
-#define COLI_ST_F32 ST_DTYPE_F32
-#define COLI_ST_U8 ST_DTYPE_U8
-#define COLI_ST_I8 ST_DTYPE_I8
-#define COLI_ST_I64 ST_DTYPE_I64
-#define COLI_ST_F8_E4M3 ST_DTYPE_F8_E4M3
-#define COLI_ST_F8_E8M0 ST_DTYPE_F8_E8M0
+#define COLI_ST_BF16 0
+#define COLI_ST_F16 1
+#define COLI_ST_F32 2
+#define COLI_ST_U8 3
+#define COLI_ST_I8 3
+#define COLI_ST_F8_E4M3 4
+#define COLI_ST_F8_E8M0 5
+#define COLI_ST_I64 6
 
 typedef int ColiSafetensorsDType;
 typedef st_tensor ColiSafetensorsTensor;
@@ -50,6 +50,8 @@ size_t coli_st_shard_count(const ColiSafetensorsIndex *index);
 const char *coli_st_shard_path(const ColiSafetensorsIndex *index, int shard);
 const ColiSafetensorsTensor *coli_st_find(const ColiSafetensorsIndex *index,
                                          const char *name);
+int coli_st_tensor_shard(const ColiSafetensorsIndex *index,
+                         const ColiSafetensorsTensor *tensor);
 int coli_st_read_tensor(const ColiSafetensorsIndex *index,
                         const ColiSafetensorsTensor *tensor, void *destination);
 int coli_st_read_at(const ColiSafetensorsIndex *index, int shard,

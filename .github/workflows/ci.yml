@@ -120,7 +120,21 @@ jobs:
           # forward); the greedy pass exits non-zero on any mismatch, so this
           # gate fails the moment a shared-code change regresses the engine.
           python3 tools/make_tiny_inkling.py tiny_inkling
-          SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_inkling.json
+          # The oracle at several cache capacities (#784): a capacity-1 cache
+          # exercises eviction on every routed expert, which is where a slot
+          # bookkeeping bug shows up and a capacity-8 run never would.
+          for cap in 1 2 8; do
+            SNAP=tiny_inkling ./inkling "$cap" 0 tiny_inkling/ref_inkling.json
+          done
+      - name: KV prefix reuse is token-identical (serve, two turns)
+        run: |
+          cd c
+          # Reusing a previous turn's attention state must change the timing and
+          # nothing else. A wrong reuse length does not crash -- it answers from
+          # another conversation's state and still reads plausibly -- so this is
+          # the only gate that would catch it. Needs the fixture above, which is
+          # why it runs here and not in `make check`.
+          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
 
   engine-hip-syntax:
     name: HIP syntax check

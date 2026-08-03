@@ -624,7 +624,11 @@ def cmd_doctor(a):
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
     report=run_doctor(
-        a.model, ram, ctx, devices, vram, engine_path=GLM, deep=a.deep,
+        # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
+        # no matter which model it was pointed at: a built kimi_k3/inkling was
+        # reported "engine is not built", and a stale colibri would have been
+        # reported ready for a model that never runs on it (#783).
+        a.model, ram, ctx, devices, vram, engine_path=engine_for(a.model), deep=a.deep,
         mirror_dir=os.environ.get("COLI_MODEL_MIRROR"),
     )
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
@@ -681,10 +685,27 @@ def cmd_run(a):
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
     if arch=="deepseek_v4":
-        cmd=[engine,os.path.abspath(a.model),prompt,"--max-tokens",str(a.ngen)]
-        if a.ram: cmd += ["--memory-gb",str(a.ram)]
-        if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
-        sys.exit(subprocess.call(cmd,env=env_for_engine(a,arch)))
+        prompt_path=None
+        try:
+            cmd=[engine,os.path.abspath(a.model)]
+            if sys.platform=="win32":
+                with tempfile.NamedTemporaryFile(
+                        mode="w",encoding="utf-8",newline="",delete=False,
+                        prefix="coli-v4-prompt-",suffix=".txt") as stream:
+                    stream.write(prompt)
+                    prompt_path=stream.name
+                cmd += ["--prompt-file",prompt_path]
+            else:
+                cmd.append(prompt)
+            cmd += ["--max-tokens",str(a.ngen)]
+            if a.ram: cmd += ["--memory-gb",str(a.ram)]
+            if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
+            result=subprocess.call(cmd,env=env_for_engine(a,arch))
+        finally:
+            if prompt_path:
+                try: os.unlink(prompt_path)
+                except OSError: pass
+        sys.exit(result)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.

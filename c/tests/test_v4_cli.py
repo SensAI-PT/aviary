@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent.parent
@@ -55,6 +56,40 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["NGEN"], "8")
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
+
+    def test_windows_v4_run_passes_chinese_prompt_as_utf8_file(self):
+        directory, root = self.make_model()
+        prompt = "请用中文解释：存储、内存和显存如何协同推理？"
+        args = argparse.Namespace(
+            model=str(root), prompt=[prompt], ngen=10, ram=0,
+            temp=None, ctx=0,
+        )
+        captured = {}
+
+        def fake_call(command, env):
+            prompt_index = command.index("--prompt-file") + 1
+            prompt_path = Path(command[prompt_index])
+            captured["command"] = list(command)
+            captured["path"] = prompt_path
+            captured["bytes"] = prompt_path.read_bytes()
+            return 0
+
+        try:
+            with mock.patch.object(self.cli.sys, "platform", "win32"), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="deepseek_v4.exe"), \
+                 mock.patch.object(self.cli, "need_model"), \
+                 mock.patch.object(self.cli, "banner"), \
+                 mock.patch.object(self.cli.subprocess, "call",
+                                   side_effect=fake_call):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.cli.cmd_run(args)
+            self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(captured["bytes"], prompt.encode("utf-8"))
+            self.assertNotIn(prompt, captured["command"])
+            self.assertFalse(captured["path"].exists())
+        finally:
+            directory.cleanup()
 
     def test_openai_renderer_uses_native_v4_multiturn_template(self):
         import openai_server

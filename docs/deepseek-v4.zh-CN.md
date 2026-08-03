@@ -25,10 +25,10 @@
 | safetensors 索引与区间读取 | 共享 `st.h` | 已完成 |
 | fmt7 标准 MXFP4 matmul | 共享 `quant.h` | 已完成 |
 | fmt7 常驻 rows16 专家缓存 | 临时 V4 私有布局 | **TODO：**上游提供常驻 rows16 API 后迁移 |
-| fmt8 E4M3 + UE8M0 128x128 scales | 临时 V4 私有解码器 | **TODO：**上游共享 fmt8 UE8M0 解码实现后替换 |
+| fmt8 E4M3 + UE8M0 128x128 scales | 共享 `st_read_scale_f32` + `quant.h` `matmul_fp8` | 已完成 |
 
-为保证引擎当前可用，最后两条私有路径暂时保留。源码中已经分别标注
-`TODO(upstream-fmt7-rows16)` 和 `TODO(upstream-fmt8-ue8m0)`。
+目前只剩 rows16 常驻缓存布局仍为 V4 私有实现。源码中的
+`TODO(upstream-fmt7-rows16)` 明确标出了删除该专用布局前仍需补齐的共享 API。
 
 ## 内存策略
 
@@ -41,6 +41,17 @@ head 大约占 1.06 GiB；路由专家权重按 RAM 预算流式读取和缓存�
 旧调用方传入 `--no-dspark` 时都能正常工作。
 
 `--ram GiB` 是规划预算，不是操作系统硬上限；不传入时按当前可用内存估算。
+
+## 下载
+
+```bash
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --local-dir /path/to/DeepSeek-V4-Flash
+```
+
+即使下载工具报告成功，个别 shard 也可能被截断。如果 `st.h` 以越界错误拒绝
+某个 shard，请先把所有本地 shard 的文件大小与 Hugging Face 仓库逐一核对，
+不要直接判断为引擎故障。
 
 ## 构建与使用
 
@@ -83,5 +94,5 @@ make deepseek-v4-oracle MODEL=/path/to/DeepSeek-V4-Flash \
 ## 后续工作
 
 - 增加非 greedy 采样与更多服务 slot。
-- 为上述两条临时私有 quant 路径增加共享替代实现。
+- 上游提供常驻 rows16 API 后，删除剩余的 V4 私有 rows16 缓存布局。
 - stacked PR 恢复 DSpark 时必须保持目标 token 不变，并提供开关性能与接受率数据。

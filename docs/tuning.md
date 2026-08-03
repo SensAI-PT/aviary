@@ -38,7 +38,9 @@ overrides print a warning and proceed.
 
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
-limited memory channels; explicit `OMP_*` settings always take precedence.
+limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
+physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
+`COLI_NO_OMP_TUNE` kill switch always take precedence.
 
 > Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
 > the engine's one-time OpenMP tuning re-exec on Linux — the re-exec'd image

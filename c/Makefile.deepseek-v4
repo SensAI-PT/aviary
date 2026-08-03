@@ -49,15 +49,9 @@ endif
 
 include Makefile.deepseek-v4.units
 
-# native_quant.c / native_quant_batch.c are pulled in by the parallel/avx512 TUs.
-SHARED_SOURCES = native_quant_parallel.c \
-	native_quant_dual.c native_quant_batch_avx512.c \
-	native_quant_fp4_rows16.c
-
-SHARED_OBJS = $(SHARED_SOURCES:.c=.o)
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
-V4_OBJS = $(SHARED_OBJS) $(TARGET_OBJS)
+V4_OBJS = $(TARGET_OBJS)
 
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
@@ -65,15 +59,10 @@ deepseek-v4: $(V4_BINARY)
 $(V4_BINARY): $(V4_OBJS)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
-$(SHARED_OBJS): %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# These translation units include native_quant.c directly.
-native_quant_parallel.o native_quant_dual.o native_quant_batch_avx512.o: \
-	native_quant.c native_quant_batch.c native_quant.h quant.h
-
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h st.h json.h compat.h
+	deepseek_v4_internal.h st.h json.h compat.h tensor.h quant.h \
+	native_quant.h native_quant_batch.h native_quant_dual.h \
+	native_quant_fp4_rows16.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)

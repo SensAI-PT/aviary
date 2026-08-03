@@ -16,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import openai_server
 
 
-def run(label: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+def run(
+    label: str,
+    command: list[str],
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         command,
         text=True,
@@ -25,6 +29,7 @@ def run(label: str, command: list[str]) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=180,
+        env=env,
     )
     if result.returncode:
         raise AssertionError(
@@ -193,6 +198,31 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
     print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact")
 
 
+def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) -> None:
+    prompt_tokens = 520
+    prompt_file = temporary / "context-limit-prompt.txt"
+    prompt_file.write_text(token_prompt([1] * prompt_tokens), encoding="utf-8")
+    result = run(
+        "target CLI engine context",
+        [
+            binary.as_posix(),
+            model.as_posix(),
+            "--prompt-file",
+            prompt_file.as_posix(),
+            "--raw-prompt",
+            "--max-tokens",
+            "1",
+        ],
+        env=dict(os.environ, CTX="768"),
+    )
+    stats = re.search(r"v4_tokens prompt=(\d+) generated=(\d+)", result.stderr)
+    if not stats or tuple(map(int, stats.groups())) != (prompt_tokens, 1):
+        raise AssertionError(
+            f"CLI did not use the 768-token engine context: {result.stderr}"
+        )
+    print("PASS target CLI: prompt beyond the old 512-token cap")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -225,6 +255,7 @@ def main() -> int:
             )
         # The 72-token case crosses the 64-token target prefill chunk boundary.
         check_session(binary, fixture, "long", cases["long"], temporary)
+        check_cli_uses_engine_context(binary, fixture, temporary)
         check_serve(binary, fixture, cases["short"])
 
     print("PASS tiny DeepSeek V4 target oracle: all checks completed")

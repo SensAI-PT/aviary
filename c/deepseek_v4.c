@@ -35,8 +35,7 @@ int coli_st_index_open(ColiSafetensorsIndex **out, const char *directory,
         return set_error(error, error_size, "out of memory opening: %s", directory);
     st_init(index, directory);
     if (!index->nfd || !index->n) {
-        st_destroy(index);
-        free(index);
+        coli_st_index_close(index);
         return set_error(error, error_size, "no safetensors tensors in: %s", directory);
     }
     *out = index;
@@ -45,7 +44,21 @@ int coli_st_index_open(ColiSafetensorsIndex **out, const char *directory,
 
 void coli_st_index_close(ColiSafetensorsIndex *index) {
     if (!index) return;
-    st_destroy(index);
+    st_mirror_reset(index);
+    for (int i = 0; i < index->n; i++) free(index->t[i].name);
+    for (int i = 0; i < index->nfd; i++) {
+        if (index->fds[i] >= 0) close(index->fds[i]);
+        if (index->dfds[i] >= 0) close(index->dfds[i]);
+        free(index->paths[i]);
+    }
+    for (int i = 0; i < index->fmt_n; i++) {
+        free(index->fmt_name[i]);
+        free(index->fmt_val[i]);
+    }
+    free(index->fmt_name);
+    free(index->fmt_val);
+    free(index->hidx);
+    free(index->t);
     free(index);
 }
 
@@ -66,35 +79,50 @@ const ColiSafetensorsTensor *coli_st_find(const ColiSafetensorsIndex *index,
     return index && name ? st_find((ColiSafetensorsIndex *)index, name) : NULL;
 }
 
+int coli_st_tensor_shard(const ColiSafetensorsIndex *index,
+                         const ColiSafetensorsTensor *tensor) {
+    return index && tensor
+        ? st_fidx((ColiSafetensorsIndex *)index, tensor->fd) : -1;
+}
+
 int coli_st_read_at(const ColiSafetensorsIndex *index, int shard,
                     uint64_t offset, size_t length, void *destination) {
-    return st_read_at_range((ColiSafetensorsIndex *)index, shard, offset,
-                            length, destination);
+    if (!index || !destination || shard < 0 || shard >= index->nfd ||
+        index->sizes[shard] < 0 || offset > (uint64_t)index->sizes[shard] ||
+        length > (uint64_t)index->sizes[shard] - offset)
+        return -1;
+    unsigned char *output = destination;
+    size_t done = 0;
+    while (done < length) {
+        ssize_t count = pread(index->fds[shard], output + done, length - done,
+                              (off_t)(offset + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        done += (size_t)count;
+    }
+    return 0;
 }
 
 int coli_st_read_tensor(const ColiSafetensorsIndex *index,
                         const ColiSafetensorsTensor *tensor, void *destination) {
-    return tensor ? coli_st_read_at(index, tensor->shard, tensor->offset,
-                                    (size_t)tensor->nbytes, destination) : -1;
+    int shard = coli_st_tensor_shard(index, tensor);
+    return tensor && tensor->off >= 0
+        ? coli_st_read_at(index, shard, (uint64_t)tensor->off,
+                          (size_t)tensor->nbytes, destination) : -1;
 }
 
 int coli_st_prefetch_at(const ColiSafetensorsIndex *index, int shard,
                         uint64_t offset, size_t length) {
-    return st_prefetch_at_range((ColiSafetensorsIndex *)index, shard,
-                                offset, length);
+    if (!index || shard < 0 || shard >= index->nfd ||
+        index->sizes[shard] < 0 || offset > (uint64_t)index->sizes[shard] ||
+        length > (uint64_t)index->sizes[shard] - offset)
+        return -1;
+    return posix_fadvise(index->fds[shard], (off_t)offset, (off_t)length,
+                         POSIX_FADV_WILLNEED);
 }
 
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype) {
-    switch (dtype) {
-        case COLI_ST_BF16: return "BF16";
-        case COLI_ST_F16: return "F16";
-        case COLI_ST_F32: return "F32";
-        case COLI_ST_U8: return "U8/I8";
-        case COLI_ST_I64: return "I64";
-        case COLI_ST_F8_E4M3: return "F8_E4M3";
-        case COLI_ST_F8_E8M0: return "F8_E8M0";
-        default: return "UNKNOWN";
-    }
+    return st_dtype_name(dtype);
 }
 
 void coli_owned_tensor_free(ColiOwnedTensor *tensor) {
@@ -124,20 +152,21 @@ int coli_tensor_load_fp8(ColiOwnedTensor *output,
         scale->shape[1] != (weight->shape[1] + 127) / 128)
         return set_error(error, error_size, "invalid native FP8 tensor: %s", prefix);
     output->data_allocation = malloc((size_t)weight->nbytes);
-    output->scale_allocation = malloc((size_t)scale->nbytes);
+    output->scale_allocation = malloc((size_t)scale->numel * sizeof(float));
     if (!output->data_allocation || !output->scale_allocation) {
         coli_owned_tensor_free(output);
         return set_error(error, error_size, "out of memory loading FP8 tensor: %s", prefix);
     }
     if (coli_st_read_tensor(index, weight, output->data_allocation) != 0 ||
-        coli_st_read_tensor(index, scale, output->scale_allocation) != 0) {
+        st_read_scale_f32((ColiSafetensorsIndex *)index, scale->name,
+                          output->scale_allocation, scale->numel, 0) != scale->numel) {
         coli_owned_tensor_free(output);
         return set_error(error, error_size, "cannot read FP8 tensor: %s", prefix);
     }
     output->view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         output->data_allocation, output->scale_allocation,
-        (size_t)weight->nbytes, (size_t)scale->nbytes,
+        (size_t)weight->nbytes, (size_t)scale->numel * sizeof(float),
         weight->shape[0], weight->shape[1], 128, 128
     };
     return 0;
@@ -355,12 +384,14 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
             if (tensor->shape[dimension] != spec->shape[dimension])
                 return set_error(error, error_size, "shape mismatch: %s", spec->name);
         local.tensor_count++;
-        local.total_bytes += tensor->nbytes;
+        uint64_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
+            ? (uint64_t)tensor->numel * sizeof(float) : (uint64_t)tensor->nbytes;
+        local.total_bytes += resident_bytes;
         switch (tensor->dtype) {
             case COLI_ST_BF16: local.bf16_bytes += tensor->nbytes; break;
             case COLI_ST_F32: local.f32_bytes += tensor->nbytes; break;
             case COLI_ST_F8_E4M3: local.fp8_weight_bytes += tensor->nbytes; break;
-            case COLI_ST_F8_E8M0: local.fp8_scale_bytes += tensor->nbytes; break;
+            case COLI_ST_F8_E8M0: local.fp8_scale_bytes += resident_bytes; break;
             case COLI_ST_I64: local.i64_bytes += tensor->nbytes; break;
             default: break;
         }
@@ -392,12 +423,18 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     for (size_t i = 0; i < weights->plan.tensor_count; i++) {
         const ColiDeepSeekV4TensorSpec *spec = &weights->plan.tensors[i];
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
-        weights->data[i] = malloc((size_t)tensor->nbytes);
+        size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
+            ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
+        weights->data[i] = malloc(resident_bytes);
         if (!weights->data[i]) {
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
-        if (coli_st_read_tensor(index, tensor, weights->data[i]) != 0) {
+        int read_failed = tensor->dtype == COLI_ST_F8_E8M0
+            ? st_read_scale_f32((ColiSafetensorsIndex *)index, spec->name,
+                                weights->data[i], tensor->numel, 0) != tensor->numel
+            : coli_st_read_tensor(index, tensor, weights->data[i]) != 0;
+        if (read_failed) {
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
@@ -677,7 +714,8 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
     const ColiSafetensorsTensor *head;
     if (find_head(model_dir, &index, &head, error, error_size)) return -1;
     unsigned char *data = malloc((size_t)head->nbytes);
-    if (!data || coli_st_read_at(index, head->shard, head->offset,
+    int shard = coli_st_tensor_shard(index, head);
+    if (!data || coli_st_read_at(index, shard, (uint64_t)head->off,
                                  (size_t)head->nbytes, data)) {
         free(data); coli_st_index_close(index);
         snprintf(error, error_size, "cannot load resident BF16 head.weight");
@@ -686,8 +724,8 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
     free(engine->head_cache.data);
     engine->head_cache.data = data;
     engine->head_cache.bytes = head->nbytes;
-    engine->head_cache.offset = head->offset;
-    engine->head_cache.shard = head->shard;
+    engine->head_cache.offset = (uint64_t)head->off;
+    engine->head_cache.shard = shard;
     coli_st_index_close(index); return 0;
 }
 
@@ -1363,9 +1401,9 @@ static int fp8_view(ColiTensorView *view,
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
-        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]),
+        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1], 128, 128
     };
     return 0;
@@ -1577,9 +1615,10 @@ static int attention_token_impl(float *output,
         group_view.data = (const uint8_t *)wo_a.data +
             (size_t)group * o_rank * group_width;
         group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns;
+            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
         group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes = (size_t)scale_rows_per_group * scale_columns;
+        group_view.scale_bytes =
+            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
         result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                      attended + (size_t)group * group_width);
     }
@@ -1759,9 +1798,9 @@ static int fp8_view(ColiTensorView *view,
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
-        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]),
+        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1], 128, 128
     };
     return 0;
@@ -1973,9 +2012,10 @@ static int attention_token_impl(float *output,
         group_view.data = (const uint8_t *)wo_a.data +
             (size_t)group * o_rank * group_width;
         group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns;
+            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
         group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes = (size_t)scale_rows_per_group * scale_columns;
+        group_view.scale_bytes =
+            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
         result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                      attended + (size_t)group * group_width);
     }
@@ -2232,9 +2272,10 @@ int coli_v4_attention_window_batch_ref(
         group_view.data = (const uint8_t *)wo_a.data +
                           (size_t)group * o_rank * group_width;
         group_view.scales = (const uint8_t *)wo_a.scales +
-                            (size_t)group * scale_rows * scale_columns;
+                            (size_t)group * scale_rows * scale_columns * sizeof(float);
         group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes = (size_t)scale_rows * scale_columns;
+        group_view.scale_bytes =
+            (size_t)scale_rows * scale_columns * sizeof(float);
         result = coli_fp8_matmul_batch_ref(
             group_outputs, &group_view, group_inputs, batch);
         for (int item = 0; !result && item < batch; item++)
@@ -2567,9 +2608,9 @@ static int fp8_view(ColiTensorView *view,
         ws->dtype != COLI_ST_F8_E4M3 || ss->dtype != COLI_ST_F8_E8M0)
         return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(ws->shape[0] * ws->shape[1]),
-        (size_t)(ss->shape[0] * ss->shape[1]),
+        (size_t)(ss->shape[0] * ss->shape[1]) * sizeof(float),
         ws->shape[0], ws->shape[1], 128, 128
     };
     return 0;
@@ -2886,9 +2927,9 @@ static int fp8_view(ColiTensorView *view,
     const void *scales = value(weights, name, &ss);
     if (!data || !scales || !ws || !ss || ws->rank != 2) return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(ws->shape[0] * ws->shape[1]),
-        (size_t)(ss->shape[0] * ss->shape[1]),
+        (size_t)(ss->shape[0] * ss->shape[1]) * sizeof(float),
         ws->shape[0], ws->shape[1], 128, 128
     };
     return 0;
@@ -4130,9 +4171,9 @@ static int fp8_view(ColiTensorView *view,
         ws->dtype != COLI_ST_F8_E4M3 || ss->dtype != COLI_ST_F8_E8M0)
         return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(ws->shape[0] * ws->shape[1]),
-        (size_t)(ss->shape[0] * ss->shape[1]),
+        (size_t)(ss->shape[0] * ss->shape[1]) * sizeof(float),
         ws->shape[0], ws->shape[1], 128, 128
     };
     return 0;
@@ -4530,9 +4571,9 @@ static int fp8_view(ColiTensorView *view,
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
     *view = (ColiTensorView){
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0, data, scales,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(weight_spec->shape[0] * weight_spec->shape[1]),
-        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]),
+        (size_t)(scale_spec->shape[0] * scale_spec->shape[1]) * sizeof(float),
         weight_spec->shape[0], weight_spec->shape[1], 128, 128
     };
     return 0;
@@ -4744,9 +4785,10 @@ static int attention_token_impl(float *output,
         group_view.data = (const uint8_t *)wo_a.data +
             (size_t)group * o_rank * group_width;
         group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns;
+            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
         group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes = (size_t)scale_rows_per_group * scale_columns;
+        group_view.scale_bytes =
+            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
         result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                      attended + (size_t)group * group_width);
     }
@@ -4926,21 +4968,22 @@ static int set_error(char *error, size_t size, const char *format, ...) {
 static int compare_tensors(const void *left, const void *right) {
     const ColiSafetensorsTensor *const *a = left;
     const ColiSafetensorsTensor *const *b = right;
-    return ((*a)->offset > (*b)->offset) - ((*a)->offset < (*b)->offset);
+    return ((*a)->off > (*b)->off) - ((*a)->off < (*b)->off);
 }
 
 static int contiguous_group(const ColiSafetensorsTensor *const input[3],
+                            const ColiSafetensorsIndex *index,
                             int *shard, uint64_t *offset, uint64_t *bytes) {
     const ColiSafetensorsTensor *parts[3] = {input[0], input[1], input[2]};
     qsort(parts, 3, sizeof(parts[0]), compare_tensors);
-    if (parts[0]->shard != parts[1]->shard || parts[1]->shard != parts[2]->shard ||
-        parts[0]->offset + parts[0]->nbytes != parts[1]->offset ||
-        parts[1]->offset + parts[1]->nbytes != parts[2]->offset)
+    if (parts[0]->fd != parts[1]->fd || parts[1]->fd != parts[2]->fd ||
+        parts[0]->off + parts[0]->nbytes != parts[1]->off ||
+        parts[1]->off + parts[1]->nbytes != parts[2]->off)
         return -1;
-    *shard = parts[0]->shard;
-    *offset = parts[0]->offset;
-    *bytes = parts[2]->offset + parts[2]->nbytes - parts[0]->offset;
-    return 0;
+    *shard = coli_st_tensor_shard(index, parts[0]);
+    *offset = (uint64_t)parts[0]->off;
+    *bytes = (uint64_t)(parts[2]->off + parts[2]->nbytes - parts[0]->off);
+    return *shard < 0 ? -1 : 0;
 }
 
 static int validate_matrix(const ColiSafetensorsTensor *weight,
@@ -4972,9 +5015,11 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
                              layer, expert, matrix_names[matrix]);
     }
     int scale_shard = -1, weight_shard = -1;
-    if (contiguous_group(record->scale, &scale_shard, &record->scale_offset,
+    if (contiguous_group(record->scale, state->index,
+                         &scale_shard, &record->scale_offset,
                          &record->scale_bytes) != 0 ||
-        contiguous_group(record->weight, &weight_shard, &record->weight_offset,
+        contiguous_group(record->weight, state->index,
+                         &weight_shard, &record->weight_offset,
                          &record->weight_bytes) != 0 || scale_shard != weight_shard)
         return set_error(error, error_size,
                          "expert is not two contiguous ranges: layer=%d expert=%d",
@@ -5004,8 +5049,8 @@ static void fill_tensor_view(ColiTensorView *view,
     view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
     view->scale_format = COLI_SCALE_UE8M0;
     view->data = slot->slab + record->scale_bytes +
-                 (weight->offset - record->weight_offset);
-    view->scales = slot->slab + (scale->offset - record->scale_offset);
+                 ((uint64_t)weight->off - record->weight_offset);
+    view->scales = slot->slab + ((uint64_t)scale->off - record->scale_offset);
     view->data_bytes = (size_t)weight->nbytes;
     view->scale_bytes = (size_t)scale->nbytes;
     view->rows = weight->shape[0];
@@ -6061,11 +6106,12 @@ static int load_embedding(float *state, const ColiSafetensorsIndex *index,
                           const ColiDeepSeekV4Config *config, int token) {
     const ColiSafetensorsTensor *embed = coli_st_find(index, "embed.weight");
     int d = config->hidden_size, hc = config->hc_mult;
+    int shard = coli_st_tensor_shard(index, embed);
     uint16_t *row = malloc((size_t)d * sizeof(*row));
     if (!embed || embed->dtype != COLI_ST_BF16 || !row || token < 0 ||
         token >= config->vocab_size ||
-        coli_st_read_at(index, embed->shard,
-                        embed->offset + (uint64_t)token * d * sizeof(*row),
+        coli_st_read_at(index, shard,
+                        (uint64_t)embed->off + (uint64_t)token * d * sizeof(*row),
                         (size_t)d * sizeof(*row), row)) {
         free(row);
         return -1;
@@ -6135,12 +6181,13 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     }
     int winner = -1;
     float maximum = -FLT_MAX;
+    int shard = coli_st_tensor_shard(index, head);
     for (int start = 0; start < vocab; start += ROWS) {
         int rows = vocab - start < ROWS ? vocab - start : ROWS;
         size_t bytes = (size_t)rows * d * sizeof(*raw);
         if (coli_st_read_at_engine(
-                engine, index, head->shard,
-                head->offset + (uint64_t)start * d * sizeof(*raw),
+                engine, index, shard,
+                (uint64_t)head->off + (uint64_t)start * d * sizeof(*raw),
                 bytes, raw)) {
             free(scores); free(raw);
             return -1;
@@ -7490,9 +7537,10 @@ int main(int argc, char **argv) {
             cli.prompt_mode == COLI_V4_PROMPT_THINKING ? "thinking" : "chat",
             cli.memory_gib > 0.0 ? "limited" : "auto");
 
+    int session_context = engine->runtime.context_tokens;
     ColiV4SessionCreateOptions session_opts = {
-        .max_prompt_tokens = 512,
-        .max_new_tokens_cap = max_new > 512 ? max_new : 512,
+        .max_prompt_tokens = session_context,
+        .max_new_tokens_cap = session_context,
     };
     if (coli_v4_session_create(&session, engine, &session_opts, error,
                                sizeof(error))) {
@@ -7953,21 +8001,22 @@ static int set_error(char *error, size_t size, const char *format, ...) {
 static int compare_tensors(const void *left, const void *right) {
     const ColiSafetensorsTensor *const *a = left;
     const ColiSafetensorsTensor *const *b = right;
-    return ((*a)->offset > (*b)->offset) - ((*a)->offset < (*b)->offset);
+    return ((*a)->off > (*b)->off) - ((*a)->off < (*b)->off);
 }
 
 static int contiguous_group(const ColiSafetensorsTensor *const input[3],
+                            const ColiSafetensorsIndex *index,
                             int *shard, uint64_t *offset, uint64_t *bytes) {
     const ColiSafetensorsTensor *parts[3] = {input[0], input[1], input[2]};
     qsort(parts, 3, sizeof(parts[0]), compare_tensors);
-    if (parts[0]->shard != parts[1]->shard || parts[1]->shard != parts[2]->shard ||
-        parts[0]->offset + parts[0]->nbytes != parts[1]->offset ||
-        parts[1]->offset + parts[1]->nbytes != parts[2]->offset)
+    if (parts[0]->fd != parts[1]->fd || parts[1]->fd != parts[2]->fd ||
+        parts[0]->off + parts[0]->nbytes != parts[1]->off ||
+        parts[1]->off + parts[1]->nbytes != parts[2]->off)
         return -1;
-    *shard = parts[0]->shard;
-    *offset = parts[0]->offset;
-    *bytes = parts[2]->offset + parts[2]->nbytes - parts[0]->offset;
-    return 0;
+    *shard = coli_st_tensor_shard(index, parts[0]);
+    *offset = (uint64_t)parts[0]->off;
+    *bytes = (uint64_t)(parts[2]->off + parts[2]->nbytes - parts[0]->off);
+    return *shard < 0 ? -1 : 0;
 }
 
 static int validate_matrix(const ColiSafetensorsTensor *weight,
@@ -7999,9 +8048,11 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
                              layer, expert, matrix_names[matrix]);
     }
     int scale_shard = -1, weight_shard = -1;
-    if (contiguous_group(record->scale, &scale_shard, &record->scale_offset,
+    if (contiguous_group(record->scale, state->index,
+                         &scale_shard, &record->scale_offset,
                          &record->scale_bytes) != 0 ||
-        contiguous_group(record->weight, &weight_shard, &record->weight_offset,
+        contiguous_group(record->weight, state->index,
+                         &weight_shard, &record->weight_offset,
                          &record->weight_bytes) != 0 || scale_shard != weight_shard)
         return set_error(error, error_size,
                          "expert is not two contiguous ranges: layer=%d expert=%d",
@@ -8031,8 +8082,8 @@ static void fill_tensor_view(ColiTensorView *view,
     view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
     view->scale_format = COLI_SCALE_UE8M0;
     view->data = slot->slab + record->scale_bytes +
-                 (weight->offset - record->weight_offset);
-    view->scales = slot->slab + (scale->offset - record->scale_offset);
+                 ((uint64_t)weight->off - record->weight_offset);
+    view->scales = slot->slab + ((uint64_t)scale->off - record->scale_offset);
     view->data_bytes = (size_t)weight->nbytes;
     view->scale_bytes = (size_t)scale->nbytes;
     view->rows = weight->shape[0];
@@ -8453,12 +8504,14 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
             if (tensor->shape[dimension] != spec->shape[dimension])
                 return set_error(error, error_size, "shape mismatch: %s", spec->name);
         local.tensor_count++;
-        local.total_bytes += tensor->nbytes;
+        uint64_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
+            ? (uint64_t)tensor->numel * sizeof(float) : (uint64_t)tensor->nbytes;
+        local.total_bytes += resident_bytes;
         switch (tensor->dtype) {
             case COLI_ST_BF16: local.bf16_bytes += tensor->nbytes; break;
             case COLI_ST_F32: local.f32_bytes += tensor->nbytes; break;
             case COLI_ST_F8_E4M3: local.fp8_weight_bytes += tensor->nbytes; break;
-            case COLI_ST_F8_E8M0: local.fp8_scale_bytes += tensor->nbytes; break;
+            case COLI_ST_F8_E8M0: local.fp8_scale_bytes += resident_bytes; break;
             case COLI_ST_I64: local.i64_bytes += tensor->nbytes; break;
             default: break;
         }
@@ -8490,12 +8543,18 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     for (size_t i = 0; i < weights->plan.tensor_count; i++) {
         const ColiDeepSeekV4TensorSpec *spec = &weights->plan.tensors[i];
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
-        weights->data[i] = malloc((size_t)tensor->nbytes);
+        size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
+            ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
+        weights->data[i] = malloc(resident_bytes);
         if (!weights->data[i]) {
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
-        if (coli_st_read_tensor(index, tensor, weights->data[i]) != 0) {
+        int read_failed = tensor->dtype == COLI_ST_F8_E8M0
+            ? st_read_scale_f32((ColiSafetensorsIndex *)index, spec->name,
+                                weights->data[i], tensor->numel, 0) != tensor->numel
+            : coli_st_read_tensor(index, tensor, weights->data[i]) != 0;
+        if (read_failed) {
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
@@ -8714,3 +8773,795 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
     return result;
 }
 #endif /* COLI_V4_UNIT_CONFIG */
+
+
+#ifdef COLI_V4_UNIT_NATIVE_QUANT
+/*
+ * The former native_quant.c, native_quant_dual.c, native_quant_batch.c,
+ * and native_quant_fp4_rows16.c implementations are folded into this engine.
+ * The private native_quant_parallel.c and native_quant_batch_avx512.c kernels
+ * duplicated shared quant.h FP8 work and were removed during the fold; the
+ * units below dispatch through the shared matmul_fp8 implementation instead.
+ */
+#include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+#include <float.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+float coli_e8m0_decode(uint8_t value) {
+    if (value == 0xff) return NAN;
+    return ldexpf(1.0f, (int)value - 127);
+}
+
+float coli_e2m1_decode(uint8_t nibble) {
+    static const float values[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return values[nibble & 15];
+}
+
+float coli_e4m3fn_decode(uint8_t value) {
+    int sign = value >> 7;
+    int exponent = (value >> 3) & 15;
+    int mantissa = value & 7;
+    if (exponent == 15 && mantissa == 7) return NAN;
+    float number;
+    if (!exponent)
+        number = ldexpf((float)mantissa, -9);
+    else
+        number = ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    return sign ? -number : number;
+}
+
+uint8_t coli_e4m3fn_encode(float value) {
+    if (isnan(value)) return 0x7f;
+    int negative = signbit(value) != 0;
+    float magnitude = fabsf(value);
+    if (!magnitude) return negative ? 0x80 : 0;
+    if (magnitude >= 448.0f) return (uint8_t)((negative ? 0x80 : 0) | 0x7e);
+
+    uint8_t best = 0;
+#if FLT_RADIX == 2 && FLT_MANT_DIG == 24 && FLT_MAX_EXP == 128
+    /* Exact binary32 round-to-nearest-even conversion in constant time. */
+    if (magnitude < 0.015625f) {
+        float scaled = magnitude * 512.0f;
+        uint8_t rounded = (uint8_t)scaled;
+        float fraction = scaled - rounded;
+        if (fraction > 0.5f || (fraction == 0.5f && (rounded & 1)))
+            rounded++;
+        best = rounded;
+    } else {
+        uint32_t bits;
+        memcpy(&bits, &magnitude, sizeof(bits));
+        int exponent = (int)((bits >> 23) & 0xff) - 127;
+        uint32_t significand = 0x800000u | (bits & 0x7fffffu);
+        uint32_t rounded = significand >> 20;
+        uint32_t remainder = significand & 0xfffffu;
+        if (remainder > 0x80000u ||
+            (remainder == 0x80000u && (rounded & 1u)))
+            rounded++;
+        if (rounded == 16u) {
+            rounded = 8u;
+            exponent++;
+        }
+        best = (uint8_t)((exponent + 7) * 8 + (int)rounded - 8);
+    }
+#else
+    float best_distance = FLT_MAX;
+    for (uint8_t code = 0; code <= 0x7e; code++) {
+        float candidate = coli_e4m3fn_decode(code);
+        float distance = fabsf(candidate - magnitude);
+        if (distance < best_distance ||
+            (distance == best_distance && !(code & 1) && (best & 1))) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+#endif
+    return (uint8_t)(best | (negative ? 0x80 : 0));
+}
+
+float coli_bf16_round(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        uint32_t tie = (bits >> 16) & 1u;
+        bits += 0x7fffu + tie;
+    }
+    bits &= 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+float coli_bf16_decode(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float output;
+    memcpy(&output, &bits, sizeof(output));
+    return output;
+}
+
+void coli_bf16_round_array(float *values, size_t count) {
+    if (!values) return;
+    for (size_t index = 0; index < count; index++)
+        values[index] = coli_bf16_round(values[index]);
+}
+
+static int ceil_log2_positive(float value) {
+    int exponent;
+    float fraction = frexpf(value, &exponent);
+    return fraction == 0.5f ? exponent - 1 : exponent;
+}
+
+int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
+                                const float *input, size_t length,
+                                size_t block_size) {
+    if (!output || !scales || !input || !length || !block_size)
+        return -1;
+    for (size_t base = 0; base < length; base += block_size) {
+        size_t count = length - base < block_size ? length - base : block_size;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < count; i++)
+            maximum = fmaxf(maximum, fabsf(input[base + i]));
+        maximum = fmaxf(maximum, 1e-4f);
+        int scale_exponent = ceil_log2_positive(maximum / 448.0f);
+        if (scale_exponent < -127) scale_exponent = -127;
+        if (scale_exponent > 127) scale_exponent = 127;
+        uint8_t encoded_scale = (uint8_t)(scale_exponent + 127);
+        float scale = coli_e8m0_decode(encoded_scale);
+        scales[base / block_size] = encoded_scale;
+        for (size_t i = 0; i < count; i++) {
+            float normalized = fmaxf(-448.0f,
+                                     fminf(448.0f, input[base + i] / scale));
+            output[base + i] = coli_e4m3fn_decode(
+                coli_e4m3fn_encode(normalized)) * scale;
+        }
+    }
+    return 0;
+}
+
+int coli_fp4_activation_qdq_ref(float *output, uint8_t *scales,
+                                const float *input, size_t length,
+                                size_t block_size) {
+    if (!output || !scales || !input || !length || !block_size)
+        return -1;
+    for (size_t base = 0; base < length; base += block_size) {
+        size_t count = length - base < block_size ? length - base : block_size;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < count; i++)
+            maximum = fmaxf(maximum, fabsf(input[base + i]));
+        maximum = fmaxf(maximum, 6.0f * ldexpf(1.0f, -126));
+        int exponent = ceil_log2_positive(maximum / 6.0f);
+        if (exponent < -127) exponent = -127;
+        if (exponent > 127) exponent = 127;
+        scales[base / block_size] = (uint8_t)(exponent + 127);
+        float scale = coli_e8m0_decode(scales[base / block_size]);
+        for (size_t i = 0; i < count; i++) {
+            float value = fmaxf(-6.0f, fminf(6.0f, input[base + i] / scale));
+            int best = 0;
+            float distance = fabsf(value - coli_e2m1_decode(0));
+            for (int code = 1; code < 16; code++) {
+                float candidate = fabsf(value - coli_e2m1_decode((uint8_t)code));
+                if (candidate < distance) {
+                    distance = candidate;
+                    best = code;
+                }
+            }
+            output[base + i] = coli_e2m1_decode((uint8_t)best) * scale;
+        }
+    }
+    return 0;
+}
+
+int coli_hadamard_bf16_ref(float *values, size_t length) {
+    if (!values || !length || (length & (length - 1))) return -1;
+    for (size_t width = 1; width < length; width *= 2)
+        for (size_t base = 0; base < length; base += 2 * width)
+            for (size_t i = 0; i < width; i++) {
+                float left = values[base + i];
+                float right = values[base + width + i];
+                values[base + i] = left + right;
+                values[base + width + i] = left - right;
+            }
+    float scale = 1.0f / sqrtf((float)length);
+    for (size_t i = 0; i < length; i++)
+        values[i] = coli_bf16_round(values[i] * scale);
+    return 0;
+}
+
+int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    if (!output || !weight || !input ||
+        weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        weight->scale_format != COLI_SCALE_UE8M0 ||
+        !weight->data || !weight->scales || weight->rows < 1 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 1 || weight->block_columns != 32)
+        return -1;
+    size_t rows = (size_t)weight->rows;
+    size_t columns = (size_t)weight->columns;
+    size_t packed_stride = columns / 2;
+    size_t scale_stride = columns / 32;
+    if (weight->data_bytes != rows * packed_stride ||
+        weight->scale_bytes != rows * scale_stride)
+        return -1;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation);
+        free(activation_scales);
+        return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        free(activation);
+        free(activation_scales);
+        return -1;
+    }
+    matmul_mxfp4(output, activation, weight->data, weight->scales,
+                 1, (int)columns, (int)rows);
+    free(activation_scales);
+    free(activation);
+    return 0;
+}
+
+int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    if (!output || !weight || !input ||
+        weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        weight->scale_format != COLI_SCALE_F32 ||
+        !weight->data || !weight->scales || weight->rows < 1 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 128 || weight->block_columns != 128)
+        return -1;
+    size_t rows = (size_t)weight->rows;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_rows = (rows + 127) / 128;
+    size_t scale_columns = columns / 128;
+    if (weight->data_bytes != rows * columns ||
+        weight->scale_bytes != scale_rows * scale_columns * sizeof(float))
+        return -1;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(scale_columns);
+    if (!activation || !activation_scales) {
+        free(activation);
+        free(activation_scales);
+        return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        free(activation);
+        free(activation_scales);
+        return -1;
+    }
+    matmul_fp8(output, activation, weight->data, weight->scales,
+               1, (int)columns, (int)rows);
+    free(activation_scales);
+    free(activation);
+    return 0;
+}
+#endif /* COLI_V4_UNIT_NATIVE_QUANT */
+
+#ifdef COLI_V4_UNIT_NATIVE_QUANT_DUAL
+/* Folded into the DeepSeek V4 engine translation units. */
+#include "native_quant_dual.h"
+
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+static int dual_same_shape(const ColiTensorView *a, const ColiTensorView *b) {
+    return a && b && a->rows == b->rows && a->columns == b->columns &&
+           a->block_rows == b->block_rows &&
+           a->block_columns == b->block_columns;
+}
+
+int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
+                             const ColiTensorView *a,
+                             const ColiTensorView *b,
+                             const float *input) {
+    if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
+        a->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        b->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        a->scale_format != COLI_SCALE_UE8M0 ||
+        b->scale_format != COLI_SCALE_UE8M0 || !a->data || !b->data ||
+        !a->scales || !b->scales || a->rows < 1 || a->columns < 1 ||
+        a->columns % 128 || a->block_rows != 1 || a->block_columns != 32)
+        return -1;
+    size_t rows = (size_t)a->rows, columns = (size_t)a->columns;
+    size_t packed_stride = columns / 2, scale_stride = columns / 32;
+    if (a->data_bytes != rows * packed_stride ||
+        b->data_bytes != rows * packed_stride ||
+        a->scale_bytes != rows * scale_stride ||
+        b->scale_bytes != rows * scale_stride) return -1;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        free(activation_scales); free(activation); return -1;
+    }
+    matmul_mxfp4(output_a, activation, a->data, a->scales,
+                 1, (int)columns, (int)rows);
+    matmul_mxfp4(output_b, activation, b->data, b->scales,
+                 1, (int)columns, (int)rows);
+    free(activation_scales); free(activation); return 0;
+}
+
+int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
+                             const ColiTensorView *a,
+                             const ColiTensorView *b,
+                             const float *input) {
+    if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
+        a->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        b->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        a->scale_format != COLI_SCALE_F32 ||
+        b->scale_format != COLI_SCALE_F32 || !a->data || !b->data ||
+        !a->scales || !b->scales || a->rows < 1 || a->columns < 1 ||
+        a->columns % 128 || a->block_rows != 128 ||
+        a->block_columns != 128) return -1;
+    size_t rows = (size_t)a->rows, columns = (size_t)a->columns;
+    size_t scale_rows = (rows + 127) / 128, scale_columns = columns / 128;
+    if (a->data_bytes != rows * columns || b->data_bytes != rows * columns ||
+        a->scale_bytes != scale_rows * scale_columns * sizeof(float) ||
+        b->scale_bytes != scale_rows * scale_columns * sizeof(float)) return -1;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(scale_columns);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        free(activation_scales); free(activation); return -1;
+    }
+    matmul_fp8(output_a, activation, a->data, a->scales,
+               1, (int)columns, (int)rows);
+    matmul_fp8(output_b, activation, b->data, b->scales,
+               1, (int)columns, (int)rows);
+    free(activation_scales); free(activation); return 0;
+}
+#endif /* COLI_V4_UNIT_NATIVE_QUANT_DUAL */
+
+#ifdef COLI_V4_UNIT_NATIVE_QUANT_BATCH
+/* Folded into the DeepSeek V4 engine translation units. */
+#include "native_quant_batch.h"
+
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "native_quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "quant.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    if (!outputs || !weight || !inputs || batch < 1 || batch > 64 ||
+        weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        weight->scale_format != COLI_SCALE_F32 ||
+        !weight->data || !weight->scales || weight->rows < 1 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 128 || weight->block_columns != 128) return -1;
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    size_t scale_rows = (rows + 127) / 128;
+    size_t scale_columns = columns / 128;
+    if (weight->data_bytes != rows * columns ||
+        weight->scale_bytes != scale_rows * scale_columns * sizeof(float)) return -1;
+    float *activations = malloc((size_t)batch * columns * sizeof(*activations));
+    uint8_t *activation_scales = malloc((size_t)batch * scale_columns);
+    if (!activations || !activation_scales) {
+        free(activation_scales); free(activations); return -1;
+    }
+    for (int item = 0; item < batch; item++)
+        if (coli_fp8_activation_qdq_ref(
+                activations + (size_t)item * columns,
+                activation_scales + (size_t)item * scale_columns,
+                inputs + (size_t)item * columns, columns, 128) != 0) {
+            free(activation_scales); free(activations); return -1;
+        }
+    matmul_fp8(outputs, activations, weight->data, weight->scales,
+               batch, (int)columns, (int)rows);
+    free(activation_scales); free(activations); return 0;
+}
+
+int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    if (!outputs || !weight || !inputs || batch < 1 || batch > 64 ||
+        weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        weight->scale_format != COLI_SCALE_UE8M0 ||
+        !weight->data || !weight->scales || weight->rows < 1 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 1 || weight->block_columns != 32) return -1;
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    size_t packed_stride = columns / 2, scale_stride = columns / 32;
+    if (weight->data_bytes != rows * packed_stride ||
+        weight->scale_bytes != rows * scale_stride) return -1;
+    float *activations = malloc((size_t)batch * columns * sizeof(*activations));
+    uint8_t *activation_scales = malloc((size_t)batch * columns / 128);
+    if (!activations || !activation_scales) {
+        free(activation_scales); free(activations); return -1;
+    }
+    for (int item = 0; item < batch; item++)
+        if (coli_fp8_activation_qdq_ref(
+                activations + (size_t)item * columns,
+                activation_scales + (size_t)item * columns / 128,
+                inputs + (size_t)item * columns, columns, 128) != 0) {
+            free(activation_scales); free(activations); return -1;
+        }
+    matmul_mxfp4(outputs, activations, weight->data, weight->scales,
+                 batch, (int)columns, (int)rows);
+    free(activation_scales); free(activations); return 0;
+}
+#endif /* COLI_V4_UNIT_NATIVE_QUANT_BATCH */
+
+#ifdef COLI_V4_UNIT_NATIVE_QUANT_ROWS16
+/* Folded into the DeepSeek V4 engine translation units. */
+#include "native_quant_fp4_rows16.h"
+
+/* TODO(upstream-fmt7-rows16): quant.h now owns the canonical fmt=7 MXFP4
+ * decoder. This private rows16 repack/fused kernel remains only because the
+ * shared layer has no resident-cache rows16 layout yet. Migrate and delete it
+ * when that performance API lands upstream. */
+
+#ifdef __AVX512F__
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#include <stdint.h>
+#include <stdlib.h>
+
+static int source_valid(const ColiTensorView *weight) {
+    if (!weight || weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        weight->scale_format != COLI_SCALE_UE8M0 || !weight->data ||
+        !weight->scales || weight->rows < 1 || weight->rows % 16 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 1 || weight->block_columns != 32) return 0;
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    return weight->data_bytes == rows * columns / 2 &&
+           weight->scale_bytes == rows * columns / 32;
+}
+
+static int packed_valid(const ColiTensorView *weight) {
+    if (!weight || weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        weight->scale_format != COLI_SCALE_UE8M0 || !weight->data ||
+        !weight->scales || weight->rows < 1 || weight->rows % 16 ||
+        weight->columns < 1 || weight->columns % 128 ||
+        weight->block_rows != 16 || weight->block_columns != 32) return 0;
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    return weight->data_bytes == rows * columns / 2 &&
+           weight->scale_bytes == rows * columns / 32;
+}
+
+int coli_fp4_pack_rows16_v10(unsigned char *packed_data,
+                             unsigned char *packed_scales,
+                             const ColiTensorView *source) {
+    if (!packed_data || !packed_scales || !source_valid(source)) return -1;
+    const unsigned char *data = source->data;
+    const unsigned char *scales = source->scales;
+    size_t rows = (size_t)source->rows, columns = (size_t)source->columns;
+    size_t data_stride = columns / 2, scale_stride = columns / 32;
+    for (size_t row = 0; row < rows; row++) {
+        size_t tile = row / 16, lane = row % 16;
+        for (size_t column = 0; column < data_stride; column++)
+            packed_data[(tile * data_stride + column) * 16 + lane] =
+                data[row * data_stride + column];
+        for (size_t column = 0; column < scale_stride; column++)
+            packed_scales[(tile * scale_stride + column) * 16 + lane] =
+                scales[row * scale_stride + column];
+    }
+    return 0;
+}
+
+#ifdef __AVX512F__
+static void decode_tables(__m512 *fp4_table, float e8[256]) {
+    float fp4[16];
+    for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
+    for (int i = 0; i < 256; i++) e8[i] = coli_e8m0_decode((uint8_t)i);
+    *fp4_table = _mm512_loadu_ps(fp4);
+}
+
+static __m512 decode_fp4_rows16(const unsigned char *data, int high,
+                                __m512 fp4_table) {
+    __m512i codes = _mm512_cvtepu8_epi32(
+        _mm_loadu_si128((const __m128i *)data));
+    codes = high ? _mm512_srli_epi32(codes, 4)
+                 : _mm512_and_si512(codes, _mm512_set1_epi32(15));
+    return _mm512_permutexvar_ps(codes, fp4_table);
+}
+
+static __m512 decode_scales_rows16(const unsigned char *scales,
+                                   const float e8[256]) {
+    __m512i codes = _mm512_cvtepu8_epi32(
+        _mm_loadu_si128((const __m128i *)scales));
+    return _mm512_i32gather_ps(codes, e8, 4);
+}
+#elif defined(__aarch64__)
+/* The 16 packed rows map onto four float32x4 accumulators. Per-row work is
+ * (activation * value) * scale added once per column, columns ascending —
+ * the exact operation sequence of the scalar reference and of the AVX-512
+ * kernel, so all three produce bit-identical rows. No fused multiply-add. */
+
+typedef struct NeonRows16Tables {
+    /* The 16-value E2M1 table is exactly 64 bytes, so one four-register TBL
+     * can gather whole floats: spread[group] replicates each of four code
+     * lanes into four byte positions and byte_offsets walks float bytes. */
+    uint8x16x4_t fp4_bytes;
+    uint8x16_t spread[4];
+    uint8x16_t byte_offsets;
+    float e8[256];
+} NeonRows16Tables;
+
+static void neon_rows16_tables(NeonRows16Tables *tables) {
+    float fp4[16];
+    for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
+    for (int i = 0; i < 256; i++) tables->e8[i] = coli_e8m0_decode((uint8_t)i);
+    const unsigned char *bytes = (const unsigned char *)fp4;
+    for (int group = 0; group < 4; group++)
+        tables->fp4_bytes.val[group] = vld1q_u8(bytes + 16 * group);
+    for (int group = 0; group < 4; group++) {
+        uint8_t lanes[16];
+        for (int byte = 0; byte < 16; byte++)
+            lanes[byte] = (uint8_t)(4 * group + byte / 4);
+        tables->spread[group] = vld1q_u8(lanes);
+    }
+    uint8_t offsets[16];
+    for (int byte = 0; byte < 16; byte++) offsets[byte] = (uint8_t)(byte % 4);
+    tables->byte_offsets = vld1q_u8(offsets);
+}
+
+static inline void neon_rows16_block_scales(float32x4_t scales[4],
+                                            const unsigned char *codes,
+                                            const NeonRows16Tables *tables) {
+    float decoded[16];
+    for (int lane = 0; lane < 16; lane++)
+        decoded[lane] = tables->e8[codes[lane]];
+    for (int group = 0; group < 4; group++)
+        scales[group] = vld1q_f32(decoded + 4 * group);
+}
+
+static inline void neon_rows16_accumulate(float32x4_t sums[4],
+                                          uint8x16_t codes, float activation,
+                                          const float32x4_t scales[4],
+                                          const NeonRows16Tables *tables) {
+    uint8x16_t byte_base = vshlq_n_u8(codes, 2);
+    float32x4_t x = vdupq_n_f32(activation);
+    for (int group = 0; group < 4; group++) {
+        uint8x16_t gather = vaddq_u8(
+            vqtbl1q_u8(byte_base, tables->spread[group]),
+            tables->byte_offsets);
+        float32x4_t values =
+            vreinterpretq_f32_u8(vqtbl4q_u8(tables->fp4_bytes, gather));
+        sums[group] = vaddq_f32(
+            sums[group], vmulq_f32(vmulq_f32(x, values), scales[group]));
+    }
+}
+#endif
+
+int coli_fp4_matvec_rows16_v10(float *output,
+                               const ColiTensorView *weight,
+                               const float *input) {
+#if !defined(COLI_FP4_ROWS16_KERNEL)
+    (void)output; (void)weight; (void)input; return -1;
+#elif defined(__AVX512F__)
+    if (!output || !input || !packed_valid(weight)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t data_stride = columns / 2, scale_stride = columns / 32;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128)) {
+        free(activation_scales); free(activation); return -1;
+    }
+    __m512 fp4_table; float e8[256]; decode_tables(&fp4_table, e8);
+    const unsigned char *data = weight->data, *scales = weight->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+        __m512 sum = _mm512_setzero_ps();
+        for (size_t base = 0; base < columns; base += 32) {
+            __m512 scale = decode_scales_rows16(
+                scales + ((size_t)tile * scale_stride + base / 32) * 16, e8);
+            for (size_t offset = 0; offset < 32; offset++) {
+                size_t column = base + offset;
+                const unsigned char *codes = data +
+                    ((size_t)tile * data_stride + column / 2) * 16;
+                __m512 values = decode_fp4_rows16(codes, column & 1, fp4_table);
+                __m512 product = _mm512_mul_ps(
+                    _mm512_mul_ps(_mm512_set1_ps(activation[column]), values),
+                    scale);
+                sum = _mm512_add_ps(sum, product);
+            }
+        }
+        _mm512_storeu_ps(output + (size_t)tile * 16, sum);
+    }
+    free(activation_scales); free(activation); return 0;
+#else /* __aarch64__ */
+    if (!output || !input || !packed_valid(weight)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t data_stride = columns / 2, scale_stride = columns / 32;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128)) {
+        free(activation_scales); free(activation); return -1;
+    }
+    NeonRows16Tables tables;
+    neon_rows16_tables(&tables);
+    const unsigned char *data = weight->data, *scales = weight->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+        float32x4_t sums[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                               vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+        for (size_t base = 0; base < columns; base += 32) {
+            float32x4_t block_scales[4];
+            neon_rows16_block_scales(
+                block_scales,
+                scales + ((size_t)tile * scale_stride + base / 32) * 16,
+                &tables);
+            for (size_t offset = 0; offset < 32; offset += 2) {
+                const unsigned char *codes = data +
+                    ((size_t)tile * data_stride + (base + offset) / 2) * 16;
+                uint8x16_t bytes = vld1q_u8(codes);
+                neon_rows16_accumulate(
+                    sums, vandq_u8(bytes, vdupq_n_u8(15)),
+                    activation[base + offset], block_scales, &tables);
+                neon_rows16_accumulate(
+                    sums, vshrq_n_u8(bytes, 4),
+                    activation[base + offset + 1], block_scales, &tables);
+            }
+        }
+        for (int group = 0; group < 4; group++)
+            vst1q_f32(output + (size_t)tile * 16 + 4 * group, sums[group]);
+    }
+    free(activation_scales); free(activation); return 0;
+#endif
+}
+
+int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
+                                    const ColiTensorView *a,
+                                    const ColiTensorView *b,
+                                    const float *input) {
+#if !defined(COLI_FP4_ROWS16_KERNEL)
+    (void)output_a; (void)output_b; (void)a; (void)b; (void)input; return -1;
+#elif defined(__AVX512F__)
+    if (!output_a || !output_b || !input || !packed_valid(a) ||
+        !packed_valid(b) || a->rows != b->rows ||
+        a->columns != b->columns) return -1;
+    size_t columns = (size_t)a->columns;
+    size_t data_stride = columns / 2, scale_stride = columns / 32;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128)) {
+        free(activation_scales); free(activation); return -1;
+    }
+    __m512 fp4_table; float e8[256]; decode_tables(&fp4_table, e8);
+    const unsigned char *data_a = a->data, *data_b = b->data;
+    const unsigned char *scales_a = a->scales, *scales_b = b->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < a->rows / 16; tile++) {
+        __m512 sum_a = _mm512_setzero_ps(), sum_b = _mm512_setzero_ps();
+        for (size_t base = 0; base < columns; base += 32) {
+            const unsigned char *scale_offset_a = scales_a +
+                ((size_t)tile * scale_stride + base / 32) * 16;
+            const unsigned char *scale_offset_b = scales_b +
+                ((size_t)tile * scale_stride + base / 32) * 16;
+            __m512 scale_a = decode_scales_rows16(scale_offset_a, e8);
+            __m512 scale_b = decode_scales_rows16(scale_offset_b, e8);
+            for (size_t offset = 0; offset < 32; offset++) {
+                size_t column = base + offset;
+                size_t packed_offset =
+                    ((size_t)tile * data_stride + column / 2) * 16;
+                __m512 values_a = decode_fp4_rows16(
+                    data_a + packed_offset, column & 1, fp4_table);
+                __m512 values_b = decode_fp4_rows16(
+                    data_b + packed_offset, column & 1, fp4_table);
+                __m512 x = _mm512_set1_ps(activation[column]);
+                sum_a = _mm512_add_ps(sum_a, _mm512_mul_ps(
+                    _mm512_mul_ps(x, values_a), scale_a));
+                sum_b = _mm512_add_ps(sum_b, _mm512_mul_ps(
+                    _mm512_mul_ps(x, values_b), scale_b));
+            }
+        }
+        _mm512_storeu_ps(output_a + (size_t)tile * 16, sum_a);
+        _mm512_storeu_ps(output_b + (size_t)tile * 16, sum_b);
+    }
+    free(activation_scales); free(activation); return 0;
+#else /* __aarch64__ */
+    if (!output_a || !output_b || !input || !packed_valid(a) ||
+        !packed_valid(b) || a->rows != b->rows ||
+        a->columns != b->columns) return -1;
+    size_t columns = (size_t)a->columns;
+    size_t data_stride = columns / 2, scale_stride = columns / 32;
+    float *activation = malloc(columns * sizeof(*activation));
+    uint8_t *activation_scales = malloc(columns / 128);
+    if (!activation || !activation_scales) {
+        free(activation_scales); free(activation); return -1;
+    }
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128)) {
+        free(activation_scales); free(activation); return -1;
+    }
+    NeonRows16Tables tables;
+    neon_rows16_tables(&tables);
+    const unsigned char *data_a = a->data, *data_b = b->data;
+    const unsigned char *scales_a = a->scales, *scales_b = b->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < a->rows / 16; tile++) {
+        float32x4_t sums_a[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                                 vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+        float32x4_t sums_b[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                                 vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+        for (size_t base = 0; base < columns; base += 32) {
+            size_t scale_offset =
+                ((size_t)tile * scale_stride + base / 32) * 16;
+            float32x4_t block_scales_a[4], block_scales_b[4];
+            neon_rows16_block_scales(block_scales_a, scales_a + scale_offset,
+                                     &tables);
+            neon_rows16_block_scales(block_scales_b, scales_b + scale_offset,
+                                     &tables);
+            for (size_t offset = 0; offset < 32; offset += 2) {
+                size_t packed_offset =
+                    ((size_t)tile * data_stride + (base + offset) / 2) * 16;
+                uint8x16_t bytes_a = vld1q_u8(data_a + packed_offset);
+                uint8x16_t bytes_b = vld1q_u8(data_b + packed_offset);
+                neon_rows16_accumulate(
+                    sums_a, vandq_u8(bytes_a, vdupq_n_u8(15)),
+                    activation[base + offset], block_scales_a, &tables);
+                neon_rows16_accumulate(
+                    sums_b, vandq_u8(bytes_b, vdupq_n_u8(15)),
+                    activation[base + offset], block_scales_b, &tables);
+                neon_rows16_accumulate(
+                    sums_a, vshrq_n_u8(bytes_a, 4),
+                    activation[base + offset + 1], block_scales_a, &tables);
+                neon_rows16_accumulate(
+                    sums_b, vshrq_n_u8(bytes_b, 4),
+                    activation[base + offset + 1], block_scales_b, &tables);
+            }
+        }
+        for (int group = 0; group < 4; group++) {
+            vst1q_f32(output_a + (size_t)tile * 16 + 4 * group,
+                      sums_a[group]);
+            vst1q_f32(output_b + (size_t)tile * 16 + 4 * group,
+                      sums_b[group]);
+        }
+    }
+    free(activation_scales); free(activation); return 0;
+#endif
+}
+#endif /* COLI_V4_UNIT_NATIVE_QUANT_ROWS16 */

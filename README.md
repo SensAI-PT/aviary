@@ -15,8 +15,8 @@
 
 **Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
 parameters** — on consumer and heterogeneous hardware, in pure C with zero
-engine dependencies, by treating storage, RAM, and VRAM as one inference
-hierarchy.
+engine dependencies, by treating storage, RAM, and VRAM as a single inference
+hierarchy (AI memory multitiering).
 
 Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 (2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
@@ -28,7 +28,7 @@ Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
 > storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
 > overlap — so large models depend less on scarce hardware and cost less to run.
 
-Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
+Colibrì treats VRAM, RAM, and storage as a single multitier hierarchy, and it is
 deliberately a place to test aggressive systems ideas — so there is **no SLA on
 speed, and a hard guarantee on semantics**: experiments must earn their place
 through reproducible end-to-end measurements, and the default policy **never
@@ -68,12 +68,12 @@ as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists c
 
 ## The research mission
 
-Frontier inference should not require datacenter-class hardware by default.
-Colibrì's research target is simple: **reduce the hardware dependency and total
-cost of inference by optimizing every part of the inference path that evidence
-shows is limiting it**.
+With Colibrì, private frontier model access is not limited by availability of hyperscaler-class hardware.
 
-That includes changing how weights are represented and moved, deciding what
+With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively 
+optimizing functional inference engine pipelines**.
+
+Our operational mission includes changing how weights are represented and moved, deciding what
 lives in VRAM, RAM, or storage, overlapping heterogeneous compute, reducing
 launch and synchronization overhead, exploiting sparsity and reuse, and testing
 new decoding algorithms. Nothing is protected merely because it is conventional;
@@ -81,7 +81,7 @@ nothing is adopted merely because a microbenchmark looks fast. The deciding
 result is end-to-end inference on real machines, with correctness and quality
 measured alongside throughput, latency, memory, and cost.
 
-The practical consequence is accessibility: run a 744B-parameter model on
+The practical consequence is **accessibility**: run a 744B-parameter model on
 hardware you already own, watch every expert fire in real time, and change the
 code that does it. Not renting intelligence behind an API — *holding* it:
 probing it, measuring it, improving it. The engine is deliberately small enough
@@ -89,7 +89,7 @@ that the next useful optimization can come from anyone willing to measure it.
 
 ## Core techniques and measured findings
 
-- **One hierarchy, not one memory threshold.** VRAM, RAM, and NVMe are placement
+- **One hierarchy, not limited by tier capacity.** VRAM, RAM, and NVMe are placement
   tiers for the same weights; limited fast memory changes speed, not model semantics.
 - **A JIT for weights.** Measured routing heat drives a per-layer LRU, a learned
   pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
@@ -400,8 +400,8 @@ COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk pl
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --deep  # strict tensors/shards/index/mirror preflight
 COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fastest safe execution profile
-./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
-./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
+./coli web  --model /nvme/glm52_i4        # API + dashboard, and opens a browser
+./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
 On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
@@ -424,9 +424,9 @@ COLI_MODEL=/nvme/glm52_i4      ./coli chat        # TUI
 COLI_MODEL=/nvme/inkling_i4    ./coli chat
 COLI_MODEL=/nvme/kimi_k3       ./coli chat
 
-./coli web --model /nvme/inkling_i4               # API + dashboard, same port
+./coli web --model /nvme/inkling_i4               # API + dashboard, opens a browser
 ./coli web --model /nvme/kimi_k3
-./coli serve --model /nvme/inkling_i4             # API only
+./coli serve --model /nvme/inkling_i4             # API + dashboard, no browser
 ```
 
 For the non-GLM engines `coli chat` starts the gateway locally and attaches the

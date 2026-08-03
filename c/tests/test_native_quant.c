@@ -85,10 +85,10 @@ int main(void) {
         !close_enough(output, 128.0f)) return 1;
 
     uint8_t fp8_weights[128 * 128];
-    uint8_t fp8_scales[1] = {0x7f};
+    float fp8_scales[1] = {1.0f};
     memset(fp8_weights, 0x38, sizeof(fp8_weights)); /* E4M3 1.0 */
     ColiTensorView fp8_view = {
-        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_UE8M0,
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
         fp8_weights, fp8_scales, sizeof(fp8_weights), sizeof(fp8_scales),
         128, 128, 128, 128
     };

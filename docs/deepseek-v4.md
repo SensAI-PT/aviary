@@ -27,11 +27,11 @@ Destroy every session before destroying its engine.
 | Safetensors index/range reads | shared `st.h` | done |
 | fmt7 standard MXFP4 matmul | shared `quant.h` | done |
 | fmt7 resident rows16 expert cache | temporary V4-private layout | **TODO:** migrate after upstream exposes a resident rows16 API |
-| fmt8 E4M3 + UE8M0 128x128 scales | temporary V4-private decoder | **TODO:** replace after upstream shared fmt8 UE8M0 decode exists |
+| fmt8 E4M3 + UE8M0 128x128 scales | shared `st_read_scale_f32` + `quant.h` `matmul_fp8` | done |
 
-The last two paths remain so the engine is usable. Source markers
-`TODO(upstream-fmt7-rows16)` and `TODO(upstream-fmt8-ue8m0)` make the required
-migration explicit.
+Only the rows16 resident-cache layout remains V4-private. Its
+`TODO(upstream-fmt7-rows16)` marker names the shared API still needed before
+that specialized cache layout can be removed.
 
 ## Memory policy
 
@@ -47,6 +47,17 @@ including with the legacy `--no-dspark` option.
 
 `--ram GiB` is a planner budget, not an OS-enforced limit. Without it, the
 budget is derived from currently available OS memory.
+
+## Download
+
+```bash
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --local-dir /path/to/DeepSeek-V4-Flash
+```
+
+A download can finish with a truncated shard even when the client reports
+success. If `st.h` rejects a shard as out of bounds, compare every local shard
+size with the Hugging Face repository before treating it as an engine failure.
 
 ## Build and use
 

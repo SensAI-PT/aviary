@@ -455,7 +455,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -561,8 +561,24 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
+# ENGINES WITHOUT A CUDA BACKEND (#783).
+# kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
+# CUDA=1 appends -DCOLI_CUDA to the global CFLAGS and the cudart libs to
+# LDFLAGS, so `make kimi_k3 CUDA=1` used to compile a define that matches
+# nothing, link a runtime it never calls, and emit no warning: every
+# observable signal said "CUDA build" and the GPUs stayed idle. Strip the
+# flags for these targets and say so once, loudly.
+comma := ,
+NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+                   -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
+
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+ifeq ($(CUDA),1)
+	@echo "*** kimi_k3 has no CUDA backend (#783): building without it."
+	@echo "*** On NVIDIA, Kimi K3 runs on the Vulkan path — build VULKAN=1 and set COLI_VULKAN=1."
+endif
+	$(CC) $(NOCUDA_CFLAGS) kimi_k3.c $(VK_OBJ) -o kimi_k3$(EXE) $(NOCUDA_LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -587,6 +603,9 @@ iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
@@ -696,8 +715,8 @@ tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h tensor.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h quant.h
-	$(CC) $(CFLAGS) native_quant.c $< -o $@ $(LDFLAGS)
+tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
@@ -709,14 +728,13 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	native_quant.o
+	COLI_V4_UNIT_NATIVE_QUANT.o
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o
-	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
 V4_OWN_DIR = build/ownership
@@ -725,7 +743,7 @@ V4_OWNERSHIP_OBJS = \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
-	native_quant.o
+	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o
 
 $(V4_OWN_DIR):
 	mkdir -p $(V4_OWN_DIR)
@@ -738,6 +756,9 @@ $(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c deepseek_v4.h deepseek_v4_int
 
 $(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
@@ -781,6 +802,9 @@ tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
@@ -860,3 +884,6 @@ bench: iobench$(EXE)
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable \
 	test-c test-python test check clean install uninstall bench
+
+tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
+	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

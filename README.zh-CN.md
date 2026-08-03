@@ -285,19 +285,21 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 
 ## DeepSeek V4
 
-实验性的 **DeepSeek V4 Flash + DSpark** CPU 路径使用原生 FP4 专家、
-自动 RAM 规划和无损推测验证。目前支持 x86-64 Linux 与 Windows／MSYS2；
-其他平台仍通过 `make check` 验证 colibri 主引擎。
+实验性的 **DeepSeek V4 Flash** CPU 路径使用原生 FP4 专家、自动 RAM
+规划、共享的 `st.h`／`quant.h` 基础设施，以及常驻 target engine。
+DSpark 有意保留给紧随其后的独立 stacked PR。本 target engine 支持
+x86-64／aarch64 Linux 与 Windows／MSYS2。
 
 ```bash
 cd c
 make deepseek-v4
-python ./v4 run --model /path/to/DeepSeek-V4-Flash-DSpark --ram 32 \
-  --stop-sentence "What is the capital of France?"
+python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
+  "法国的首都是哪里？"
+# 同一模型也支持：coli chat / coli serve / coli web
 ```
 
-状态、benchmark、checkpoint 验证和已提交的 tiny 独立 oracle 说明，
-请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.md)；
+状态、checkpoint 验证、统一 CLI／server 用法和动态生成的 tiny 独立
+oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.md)；
 英文原文见 [docs/deepseek-v4.md](docs/deepseek-v4.md)。
 
 ## 下一步
