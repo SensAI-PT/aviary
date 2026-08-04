@@ -22,6 +22,39 @@ jobs:
   # that inkling and kimi_k3 did not compile under msys2/UCRT64 at all was invisible
   # for months, and binary releases silently shipped the GLM engine alone (#720).
   # Each engine is built separately so one failure does not mask the others.
+  # The container image. Nothing built docker/Dockerfile.slim in CI before, so a
+  # rename or a moved file under c/ could break the image and only a user would
+  # find out -- the same gap the .mm and fuzz-rans paths had.
+  #
+  # Only Dockerfile.slim is built here, on purpose. docker/Dockerfile does
+  # `git clone` of the upstream repo (that is its point -- README's zero-setup
+  # path downloads that one file and needs no checkout), so building it in CI
+  # would test upstream/main rather than this PR. Its Dockerfile is linted for
+  # syntax instead.
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the slim image
+        run: docker build -t colibri:ci -f docker/Dockerfile.slim .
+      - name: The image actually runs
+        # Building is not the same as working: a missing COPY only shows up when
+        # the entrypoint tries to import what is not there. --version needs no
+        # model, so it exercises the launcher end to end without a 372 GB mount.
+        run: |
+          docker run --rm colibri:ci --version
+          docker run --rm colibri:ci --help > /dev/null
+      - name: The engine binary is in the image and is executable
+        run: docker run --rm --entrypoint /app/colibri colibri:ci --help 2>&1 | head -5 || true
+      - name: Lint both Dockerfiles
+        # docker/Dockerfile is not built here (see above) but it is still shipped
+        # and followed by users, so it gets checked for syntax at least.
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+          failure-threshold: error
+
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
     strategy:
