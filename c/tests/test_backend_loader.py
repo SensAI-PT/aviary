@@ -874,13 +874,26 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """46 mandatory + 2 optional, parsed from backend_loader.c."""
+        """47 mandatory + 3 optional, parsed from backend_loader.c.
+
+        The counts are a deliberate tripwire: adding a RESOLVE to the loader
+        widens the ABI every Windows DLL must satisfy, and that should be a
+        conscious act rather than something noticed by a user. Updating them is
+        the intended response, not a nuisance -- but name the symbol you added
+        below, so the next person reading a failure gets the reason and not
+        just a different integer.
+        """
         f = self.fixture
-        self.assertEqual(len(f.mandatory), 46)
-        self.assertEqual(len(f.optional), 2)
-        self.assertEqual(len(f.exports), 48)
+        self.assertEqual(len(f.mandatory), 47)
+        self.assertEqual(len(f.optional), 3)
+        self.assertEqual(len(f.exports), 50)
+        self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
+        # attention_project_ragged: paged ragged KV runtime (#795).
+        self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
+        # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).
+        self.assertIn("coli_cuda_fp8_set_lut", f.optional)
 
     def test_both_runtimes_exist_with_the_production_basename(self):
         """Same basename, different directories — the conflict precondition."""
