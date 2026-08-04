@@ -639,6 +639,7 @@ void coli_v4_engine_attach_session(ColiV4Engine *engine);
 void coli_v4_engine_detach_session(ColiV4Engine *engine);
 
 #include "tok.h"
+#include "kv_prefix.h"
 
 struct ColiV4Session {
     ColiV4Engine *engine;
@@ -657,6 +658,12 @@ struct ColiV4Session {
     int tokenizer_ready;
     char *text;
     int text_length;
+    /* Token ids this session's attention state already holds, prompt and
+     * generated alike, in the shared format colibri.c/inkling.c/kimi_k3.c use.
+     * A follow-up request whose prompt starts with exactly these ids continues
+     * from that position instead of re-prefilling it. */
+    kv_prefix fed;
+    int prefix_reused;   /* reuse length of the request in flight, for stats */
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap). */
