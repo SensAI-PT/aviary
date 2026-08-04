@@ -216,8 +216,46 @@ endif
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
 # machine; set an explicit arch (e.g. HIP_ARCH=gfx1201) when distributing.
 HIP       ?= 0
+# HIP_DLL=1 is the AMD sibling of CUDA_DLL=1 (Windows only): MinGW gcc cannot
+# compile .cu and hipcc on Windows targets the MSVC ABI, so the backend goes
+# into a standalone coli_hip.dll and the host loads it at runtime — exactly the
+# split the CUDA path already uses. The host never links amdhip64. Same single
+# source and same coli_cuda_* ABI the Linux HIP path reuses, so the host keeps
+# -DCOLI_CUDA; -DCOLI_HIP_DLL only records WHICH DLL it will look for.
+HIP_DLL   ?= 0
+ifneq ($(IS_WIN),)
+# One runtime DLL per host binary: the loader resolves a single hardcoded DLL
+# name, so a host built for both would silently be a host built for whichever
+# arm ran last. Checked FIRST, before the arch and flag guards below, so the
+# contradiction is reported instead of whichever downstream check trips.
+ifeq ($(CUDA_DLL)$(HIP_DLL),11)
+$(error choose CUDA_DLL=1 or HIP_DLL=1, not both)
+endif
+endif
 ROCM_HOME ?= /opt/rocm
+ifneq ($(IS_WIN),)
+# --- Windows HIP SDK contract (HIP_DLL only; the Linux ROCM_HOME contract
+# above is untouched) ---
+# NOTHING here may hardcode an install location: HIP_PATH is the variable the
+# official Windows HIP SDK installer sets, and a source-built or relocated SDK
+# is selected with HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`).
+# Backslashes become forward slashes so the value survives the shell.
+#
+# Every component is separately overridable because packaged ROCm layouts do
+# not all keep runtime, development and device files under one root:
+#   HIP_SDK_ROOT         SDK root                  (--hip-path)
+#   HIP_INCLUDE_DIR      headers                   (-I)
+#   HIP_LIB_DIR          amdhip64.lib import lib   (-L)
+#   HIP_DEVICE_LIB_PATH  amdgcn device bitcode     (--rocm-device-lib-path)
+HIP_SDK_ROOT        ?= $(subst \,/,$(HIP_PATH))
+HIP_BIN_DIR         ?= $(HIP_SDK_ROOT)/bin
+HIP_INCLUDE_DIR     ?= $(HIP_SDK_ROOT)/include
+HIP_LIB_DIR         ?= $(HIP_SDK_ROOT)/lib
+HIP_DEVICE_LIB_PATH ?= $(HIP_SDK_ROOT)/lib/llvm/amdgcn/bitcode
+HIPCC               ?= $(HIP_BIN_DIR)/hipcc.exe
+else
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+endif
 HIP_ARCH  ?= native
 # HIP_ARCH accepts a list (space- or comma-separated, e.g. "gfx906 gfx1030")
 # to fat-bundle several targets into one binary; COLI_GPUS picks at runtime.
@@ -234,7 +272,48 @@ $(error HIP_ARCH=native but rocm_agent_enumerator found no GPUs; set HIP_ARCH=gf
 endif
 endif
 endif
+# Guards for the Windows HIP path, active ONLY when the hip-dll TARGET is
+# requested — never for HIP_DLL=1 alone. HIP_DLL=1 selects the host arm, which
+# compiles backend_loader.c and links colibri.exe against no HIP library and no
+# SDK header: demanding an SDK there blocks a build that needs nothing from one
+# (and HIP_PATH is not visible in every shell, e.g. an MSYS2 login shell).
+# The default CPU build must never depend on a HIP path either.
+#
+# Only the string checks live here. Existence checks (hipcc, headers, import
+# library, device bitcode) run in the hip-dll recipe instead. The stock Windows
+# HIP SDK location may contain spaces, and $(wildcard) splits its argument on
+# them, so a parse-time $(wildcard) check can incorrectly report a valid
+# installation as missing. The recipe's shell tests are quoted and handle
+# spaces correctly.
+ifneq ($(IS_WIN),)
+HIP_DLL_TARGET_REQUESTED := $(filter hip-dll,$(MAKECMDGOALS))
+ifneq ($(HIP_DLL_TARGET_REQUESTED),)
+ifeq ($(strip $(HIP_SDK_ROOT)),)
+$(error Windows HIP build: no HIP SDK selected. Set HIP_PATH, or pass HIP_SDK_ROOT=<path> (e.g. from `rocm-sdk path --root`))
+endif
+# Windows has no rocm_agent_enumerator to resolve `native` against, and the
+# enumerator branch above is HIP=1-only, so an unset HIP_ARCH would reach hipcc
+# as --offload-arch=native and fail deep inside the compiler. Demand the arch
+# here, where the cause is still visible.
+ifeq ($(strip $(HIP_ARCH)),native)
+$(error Windows HIP build: set an explicit HIP_ARCH=gfxNNNN (rocm_agent_enumerator is not available here), e.g. HIP_ARCH=gfx1151)
+endif
+ifeq ($(strip $(HIP_ARCH)),)
+$(error Windows HIP build: HIP_ARCH is empty; set HIP_ARCH=gfxNNNN, e.g. HIP_ARCH=gfx1151)
+endif
+endif
+endif
+ifneq ($(IS_WIN),)
+# No -fPIE on Windows: it is there for the Linux PIE link of backend_cuda.o into
+# the gcc engine (the readelf guard in ci.yml exists because dropping it made
+# that link fail), and it is meaningless for a PE DLL MinGW never links against.
+# -Wall/-Wextra DO carry over unchanged — hipcc is clang and takes GCC-style
+# warning flags directly. nvcc's -Xcompiler=-W3 workaround above is specific to
+# nvcc driving cl.exe as its host compiler and must NOT be copied here.
+HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra
+else
 HIPCCFLAGS ?= -O3 -std=c++17 -x hip $(foreach a,$(HIP_ARCH),--offload-arch=$(a)) -Wall -Wextra -fPIE
+endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
@@ -290,10 +369,19 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
 endif
 
-# Windows CUDA DLL path: host links the loader, NOT cudart.
+# Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
+# (CUDA_DLL/HIP_DLL mutual exclusion is enforced at the HIP_DLL declaration.)
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
+CUDA_OBJ = backend_loader.o
+endif
+ifeq ($(HIP_DLL),1)
+# -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
+# coli_cuda_* surface); -DCOLI_HIP_DLL is only the build discriminator, so a
+# later phase can point the loader at coli_hip.dll. No LDFLAGS change: linking
+# amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
+CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
 CUDA_OBJ = backend_loader.o
 endif
 endif
@@ -442,7 +530,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -480,6 +568,42 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
+
+# Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
+# backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
+# the same coli_cuda_* surface — which is why COLI_CUDA_BUILDING_DLL, and not a
+# new HIP-specific export macro, is the correct switch here. No cl.exe guard
+# like cuda-dll's: hipcc brings its own clang host pass, but it still needs the
+# MSVC linker and Windows SDK, so run this from a vcvars64 shell.
+#
+# --hip-path pins the SDK: a machine can carry BOTH a driver-installed HIP SDK
+# and a source-built one, and clang injects the driver install via -idirafter on
+# its own. Without --hip-path the headers came from one tree while -L/-lamdhip64
+# and the device bitcode came from the other — the mismatch that made
+# <rocwmma/rocwmma.hpp> unfindable even though the selected SDK ships it.
+# --hip-path alone resolves both hip/ and rocwmma/ from the selected root;
+# -I"$(HIP_INCLUDE_DIR)" is kept because it takes precedence (verified) and is
+# the override point for layouts that split headers off the SDK root.
+# --rocm-device-lib-path is kept for determinism: clang can otherwise find the
+# bitcode relative to its own resource dir, which is a guess, not a contract.
+# Every SDK-derived path is quoted so an install under "C:\Program Files\..."
+# survives. No path is hardcoded — see the HIP SDK contract above.
+#
+#   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
+hip-dll: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
+	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
+	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
+	@case "$(HIPCCFLAGS)" in *COLI_HIP_NO_WMMA*) ;; *) test -f "$(HIP_INCLUDE_DIR)/rocwmma/rocwmma.hpp" || { echo "rocwmma/rocwmma.hpp missing under \"$(HIP_INCLUDE_DIR)\": install the rocWMMA component, or set HIP_INCLUDE_DIR=<path>" >&2; exit 1; } ;; esac
+	@test -d "$(HIP_LIB_DIR)" || { echo "HIP lib dir not found: \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -f "$(HIP_LIB_DIR)/amdhip64.lib" || { echo "amdhip64.lib missing under \"$(HIP_LIB_DIR)\" — set HIP_LIB_DIR=<path>" >&2; exit 1; }
+	@test -d "$(HIP_DEVICE_LIB_PATH)" || { echo "device bitcode dir not found: \"$(HIP_DEVICE_LIB_PATH)\" — set HIP_DEVICE_LIB_PATH=<path>" >&2; exit 1; }
+	"$(HIPCC)" $(HIPCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		--hip-path="$(HIP_SDK_ROOT)" \
+		-I"$(HIP_INCLUDE_DIR)" \
+		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
+		-L"$(HIP_LIB_DIR)" -lamdhip64 \
+		backend_cuda.cu -o coli_hip.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -903,7 +1027,7 @@ bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
