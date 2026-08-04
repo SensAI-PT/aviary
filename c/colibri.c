@@ -540,6 +540,7 @@ static void cuda_disabled_note(void){
         CUDA_DISABLED_LOUD_AT);
 }
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
+static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boot) */
 #endif
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
@@ -569,16 +570,11 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
-    if(t->fmt==8) return 0;   /* fp8-e4m3 passthrough: no CUDA kernel yet either (matches the
-                               * fmt=5/6 idiom above; matmul_qt_ex's own caller-side fmt exclusion
-                               * already keeps this from being reached with cuda_eligible tensors
-                               * in the exact-kernel path, but row_bytes()/weight_at() in
-                               * backend_cuda.cu have no fmt=8 case either -- explicit early-
-                               * return here so a future caller doesn't have to rediscover that by
-                               * tracing through to the CUDA source. UNVERIFIED at runtime: no CUDA
-                               * toolchain on this macOS build host to compile-check. */
+    if(t->fmt==8 && !g_cuda_fp8_ready) return 0;  /* same idiom: fp8 without its e4m3 LUT stays
+                                                   * CPU-side (an old DLL without the symbol
+                                                   * leaves the flag 0, exactly like fmt=6) */
     const void *weights = t->fmt==0 ? (const void*)t->qf
-                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+                        : (t->fmt==1||t->fmt==8) ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
                      * upload would truncate them to O floats and the group kernels
                      * would read garbage. An old DLL without the _g symbol returns 0
@@ -594,7 +590,7 @@ static int qt_cuda_upload_compressed(QT *t){
 #endif
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
-                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+                        (t->fmt==1||t->fmt==8)?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
@@ -871,17 +867,15 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    /* fmt=8 excluded exactly like fmt=5/6: the CUDA backend's row_bytes()/weight_at()
-     * (backend_cuda.cu) have no case for it and fall through to `return 0` / undefined
-     * weight_at() behavior. row_bytes()==0 already makes coli_cuda_tensor_upload_g
-     * refuse (defensive fail-closed), but that path is reached only after paying an
-     * upload attempt and printing a "disabled after an error" message every load;
-     * excluding it here up front is the same fmt=5/6 idiom, silent and immediate.
-     * UNVERIFIED on this build (no CUDA toolchain on macOS to compile-check; traced
-     * from backend_cuda.cu source only). */
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=8 && !omp_in_parallel()){
+    /* fmt=5 excluded like fmt=6-without-codebook: the CUDA backend has no int3
+     * kernel. fmt=8 flows once its e4m3 LUT is published (g_cuda_fp8_ready,
+     * cuda_boot): quant_matmul dispatches it by format, deriving the 128x128
+     * block-scale geometry from the dims alone. Without the LUT (old DLL) it is
+     * excluded up front — same silent-and-immediate idiom as fmt=5. */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 &&
+       (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
-                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+                            : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
         if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
@@ -9106,6 +9100,8 @@ int main(int argc, char **argv){
          * the backend never keeps a second copy that could drift (#452). An older
          * DLL without the symbol leaves this 0 and fmt=6 tensors stay CPU-side. */
         g_cuda_e8_ready=coli_cuda_e8_set_grid(e8_grid);
+        /* fmt=8 decodes against quant.h's E4M3_LUT — same arrangement. */
+        g_cuda_fp8_ready=coli_cuda_fp8_set_lut(E4M3_LUT);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
 #endif
