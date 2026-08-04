@@ -1722,7 +1722,22 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
-        super().handle_one_request()
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up mid-response. That is not an error here, it is
+            # how HTTP clients behave: `coli chat` polls /health while the model
+            # loads and drops each connection as soon as it has its answer, and
+            # Ctrl-C during a stream closes the socket by design -- the banner
+            # tells the user to do exactly that. Without this, socketserver's
+            # handler prints a full traceback per occurrence, so a normal start
+            # buried the loading spinner under BrokenPipeError stack traces and
+            # every cancelled answer looked like a crash.
+            #
+            # Caught here rather than in send_json() so it also covers the SSE
+            # writes in the streaming path, which is where Ctrl-C lands.
+            self.close_connection = True
+            return
         if not self.close_connection:
             self._drain_request_body()
 
