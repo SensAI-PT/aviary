@@ -6733,6 +6733,7 @@ static void session_free_attention(ColiV4Session *session) {
 
 void coli_v4_session_destroy(ColiV4Session *session) {
     if (!session) return;
+    kv_prefix_free(&session->fed);
     session_free_attention(session);
     session_free_buffers(session);
     if (session->tokenizer_ready) {
@@ -6819,6 +6820,14 @@ int coli_v4_session_create(ColiV4Session **output, ColiV4Engine *engine,
             snprintf(error, error_size, "out of memory allocating session buffers");
         return -1;
     }
+    /* Holds prompt and generated ids together: the next request's prompt
+     * contains both, so both have to match for the state to be reusable.
+     * A failure here is not an error — kv_prefix_alloc leaves the record empty,
+     * kv_prefix_reuse then returns 0, and every request prefills in full, which
+     * is exactly the behaviour before this change. */
+    (void)kv_prefix_alloc(&session->fed,
+                          session->max_prompt_tokens +
+                          session->max_new_tokens_cap + 64);
     *output = session;
     return 0;
 }
@@ -6871,8 +6880,7 @@ int coli_v4_session_generate(ColiV4Session *session,
     session->text_length = 0;
     session->prompt_count = 0;
     session->generated_count = 0;
-    for (int layer = 0; layer < session->config.num_hidden_layers; layer++)
-        coli_v4_window_attention_reset(session->attention[layer]);
+    session->prefix_reused = 0;
 
     int max_new = options->max_new_tokens;
     if (max_new > session->max_new_tokens_cap)
@@ -6900,9 +6908,38 @@ int coli_v4_session_generate(ColiV4Session *session,
     int *generated = session->generated;
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
 
-    for (int item = 0; item < prompt_count; item++)
+    /* ---------------------------------------------------------------------
+     * KV PREFIX REUSE.
+     *
+     * The window attention state is not truncatable to an arbitrary position:
+     * the sliding window is a ring and the compressor carries recurrent
+     * kv_state/score_state rather than per-position rows. What it *can* do is
+     * keep going. So the reusable case is the exact one a conversation
+     * produces: turn N+1's prompt begins with every id turn N fed, prompt and
+     * reply alike, and only the tail is new.
+     *
+     * kv_prefix_reuse returns 0 unless the recorded ids are a strict prefix of
+     * this prompt, so a divergent or shorter prompt falls back to a full reset
+     * and prefill, and the reuse path always has at least one token left to
+     * feed. Nothing about the math changes: positions stay absolute and the
+     * tail is prefilled at start=reuse, so the logits are the ones a cold run
+     * would have produced.
+     * ------------------------------------------------------------------- */
+    int reuse = kv_prefix_reuse(&session->fed, session->prompt_ids, prompt_count);
+    if (!reuse)
+        for (int layer = 0; layer < config->num_hidden_layers; layer++)
+            coli_v4_window_attention_reset(session->attention[layer]);
+    session->prefix_reused = reuse;
+    if (reuse && getenv("V4_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens\n",
+                reuse, prompt_count);
+
+    int fresh = prompt_count - reuse;
+    for (int item = 0; item < fresh; item++)
         if (load_embedding(state + (size_t)item * hd, index, config,
-                           session->prompt_ids[item])) {
+                           session->prompt_ids[reuse + item])) {
+            /* The state now matches neither the old ids nor the new ones. */
+            kv_prefix_taint(&session->fed);
             if (error && error_size)
                 snprintf(error, error_size, "cannot load embedding");
             return -1;
@@ -6910,16 +6947,28 @@ int coli_v4_session_generate(ColiV4Session *session,
 
     double setup_done = spec_now();
     if (target_batch(engine, &state, &next, attention, index, config, experts,
-                     session->prompt_ids, 0, prompt_count, error, error_size))
+                     session->prompt_ids + reuse, reuse, fresh,
+                     error, error_size)) {
+        kv_prefix_taint(&session->fed);
         return -1;
+    }
     session->state = state;
     session->next = next;
-    const float *last = state + (size_t)(prompt_count - 1) * hd;
+    /* The batch holds only the fresh tail, so the final row is at fresh-1
+     * even though its absolute position is prompt_count-1. */
+    const float *last = state + (size_t)(fresh - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
     if (final_hidden(hidden, last, index, config, error, error_size) ||
-        head_argmax(engine, hidden, index, config, &current, &current_logit))
+        head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+        kv_prefix_taint(&session->fed);
         return -1;
+    }
+    /* The prompt is in the attention state from here on; record it before the
+     * decode loop so a failure mid-generation still leaves fed describing what
+     * was actually fed. */
+    kv_prefix_record(&session->fed, session->prompt_ids + reuse, reuse, fresh);
+    session->fed.len = prompt_count;
     int generated_count = 0;
     int last_processed = prompt_count - 1;
     generated[generated_count++] = current;
@@ -6931,13 +6980,21 @@ int coli_v4_session_generate(ColiV4Session *session,
     while (!done && generated_count < max_new) {
         int position = last_processed + 1;
         if (target_token(engine, &state, &next, attention, index, config, experts,
-                         current, position, error, error_size))
+                         current, position, error, error_size)) {
+            kv_prefix_taint(&session->fed);
             return -1;
+        }
+        /* `current` is now in the attention state at `position`. Record it here,
+         * before head_argmax overwrites it: the token generated last is never
+         * fed, so recording after the loop would claim one token too many. */
+        kv_prefix_record(&session->fed, &current, position, 1);
         session->state = state;
         session->next = next;
         if (final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(engine, hidden, index, config, &current, &current_logit))
+            head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+            kv_prefix_taint(&session->fed);
             return -1;
+        }
         last_processed = position;
         generated[generated_count++] = current;
         done = session_emit_token(session, on_token, user_data, current,
@@ -7304,10 +7361,15 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     int length_limited = !stream.cancelled && !stats.eos_stopped &&
                          stats.generated_tokens >= request->max_tokens;
     double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",
+    /* Trailing field: prompt tokens served from the previous turn's attention
+     * state instead of being prefilled again. Appended rather than inserted --
+     * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
+     * it and a newer one can report it. */
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n",
            request->id, completion,
            decode > 0.0 ? completion / decode : 0.0,
-           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited);
+           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
+           session->prefix_reused);
     fflush(stdout);
 }
 
