@@ -157,11 +157,14 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_GPU` / `COLI_GPUS` | unset | Device selection (`auto`, `none`, or a list like `0,1`). Requires `COLI_CUDA=1`. |
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. Off by default the engine reports `routed experts only (resident dense on CPU)`: on a host where the CPU is the limiter this leaves the dense path of every layer on the CPU while the VRAM tier serves experts only. Measured x2.8 on a 4x A6000 / 24-core host (1.53 -> 4.26 tok/s). |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
+| `CUDA_EXPERT_LOAD_BALANCE` | `0` (off) | Experimental multi-GPU expert assignment: keep the same frequency-ranked GPU prefix, but greedily distribute it by accumulated profile weight instead of resident bytes alone. On one 6×RTX 5090 fixed replay its three-run median was +2.9%, with large variance; leave off unless validated on the target workload. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
+| `COLI_MTP_GUARD_PCT` | `70` | Pause MTP after the guard window when recent acceptance falls below this percentage. |
+| `COLI_MTP_GUARD_WINDOW` | `24` | Number of MTP proposals used by the soft acceptance guard. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
 | `COLI_CUDA_PIPE_SHARD` | off | `=1` runs the multi-device P2P head-shard attention path (opt-in for NVLink topologies; serializes ~95 MB/layer over a star PCIe topology). |
 | `COLI_CUDA_PIPE_S_MIN` | `1` single-GPU, `8` multi-GPU | Minimum prefill batch S to engage the pipe2 CUDA path. |

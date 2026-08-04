@@ -27,9 +27,24 @@
 struct RaggedKVEntry {
     const void *key;
     const float *host_l,*host_r;
-    float *latent,*rope;
-    int length,capacity,K,R;
+    float **latent_pages,**rope_pages;
+    int length,page_count,K,R;
 };
+
+#ifndef COLI_KV_PAGE_TOKENS
+#define COLI_KV_PAGE_TOKENS 64
+#endif
+
+static void ragged_kv_clear(RaggedKVEntry *e) {
+    for (int i=0;i<e->page_count;i++) {
+        if (e->latent_pages[i]) cudaFree(e->latent_pages[i]);
+        if (e->rope_pages[i]) cudaFree(e->rope_pages[i]);
+    }
+    std::free(e->latent_pages);
+    std::free(e->rope_pages);
+    e->latent_pages=e->rope_pages=nullptr;
+    e->length=e->page_count=0;
+}
 
 struct ColiCudaTensor {
     void *weights;
@@ -86,6 +101,12 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
+static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
+static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_h2d_ms[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_kernel_ms[COLI_CUDA_MAX_DEVICES];
+static double g_device_group_d2h_ms[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_group_stats_mu;
 #ifdef COLI_ANS
 static FILE *g_ans_sidecar;
@@ -691,18 +712,18 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
 __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
         const float *const *latent,const float *const *rope,const int *lengths,
         const void *weights,const float *wscale,int fmt,int S,int H,int Q,int R,
-        int V,int K,int T,float scale,int gs,int ng){
+        int V,int K,int T,int page_stride,float scale,int gs,int ng){
     int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=lengths[s],rbase=h*(Q+V);
     if(s>=S||nt<1||nt>T)return;
     extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
     const float *qs=q+((size_t)s*H+h)*(Q+R);
-    const float *ls=latent[s],*rs=rope[s];
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
           absorb_scale(wscale,fmt,gs,ng,rbase+d,k);qa[k]=a;}
     __syncthreads();
-    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=ls+(size_t)t*K;
-        const float *rt=rs+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0;int pg=t/COLI_KV_PAGE_TOKENS,pt=t%COLI_KV_PAGE_TOKENS;
+        const float *lt=latent[(size_t)s*page_stride+pg]+(size_t)pt*K;
+        const float *rt=rope[(size_t)s*page_stride+pg]+(size_t)pt*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
         for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[t]=a*scale;}
     __syncthreads();
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
@@ -713,7 +734,10 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
     __syncthreads();
-    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)a+=scores[t]*ls[(size_t)t*K+k];cl[k]=a;}
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++){
+        const float *lt=latent[(size_t)s*page_stride+t/COLI_KV_PAGE_TOKENS]+
+                        (size_t)(t%COLI_KV_PAGE_TOKENS)*K;
+        a+=scores[t]*lt[k];}cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k)*
@@ -722,11 +746,15 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
 }
 
 __global__ static void ragged_kv_append(float *const *latent,float *const *rope,
-        const float *packed,const int *old_len,const int *add,const int *offset,int K,int R){
+        const float *packed,const int *old_len,const int *add,const int *offset,
+        int K,int R,int page_stride){
     int s=blockIdx.x,n=add[s],base=offset[s];
-    for(int i=threadIdx.x;i<n*(K+R);i+=blockDim.x){
-        if(i<n*K)latent[s][(size_t)old_len[s]*K+i]=packed[base+i];
-        else rope[s][(size_t)old_len[s]*R+i-n*K]=packed[base+i];
+    for(int t=0;t<n;t++){
+        int pos=old_len[s]+t,pg=pos/COLI_KV_PAGE_TOKENS,pt=pos%COLI_KV_PAGE_TOKENS;
+        float *lp=latent[(size_t)s*page_stride+pg]+(size_t)pt*K;
+        float *rp=rope[(size_t)s*page_stride+pg]+(size_t)pt*R;
+        for(int k=threadIdx.x;k<K;k+=blockDim.x)lp[k]=packed[base+(size_t)t*K+k];
+        for(int r=threadIdx.x;r<R;r+=blockDim.x)rp[r]=packed[base+(size_t)n*K+(size_t)t*R+r];
     }
 }
 
@@ -975,6 +1003,20 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(calls) *calls=g_group_calls; if(experts) *experts=g_group_experts; if(rows) *rows=g_group_rows;
     if(h2d_ms) *h2d_ms=g_group_h2d_ms; if(kernel_ms) *kernel_ms=g_group_kernel_ms;
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
+}
+
+extern "C" void coli_cuda_group_stats_device(
+    int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
+    double *h2d_ms, double *kernel_ms, double *d2h_ms) {
+    std::lock_guard<std::mutex> lock(g_group_stats_mu);
+    int index=-1;
+    for(int i=0;i<g_nctx;i++) if(g_ctx[i].device==device){ index=i; break; }
+    if(calls) *calls=index<0?0:g_device_group_calls[index];
+    if(experts) *experts=index<0?0:g_device_group_experts[index];
+    if(rows) *rows=index<0?0:g_device_group_rows[index];
+    if(h2d_ms) *h2d_ms=index<0?0:g_device_group_h2d_ms[index];
+    if(kernel_ms) *kernel_ms=index<0?0:g_device_group_kernel_ms[index];
+    if(d2h_ms) *d2h_ms=index<0?0:g_device_group_d2h_ms[index];
 }
 
 /* group size for the NEXT upload on this thread (fmt=4): routed through a
@@ -1508,11 +1550,18 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
         cudaEventElapsedTime(&c,ev[2],ev[3]);
         { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c; }
+          int index=(int)(ctx-g_ctx);
+          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c;
+          g_device_group_h2d_ms[index]+=a;
+          g_device_group_kernel_ms[index]+=b;
+          g_device_group_d2h_ms[index]+=c; }
         for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
     }
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
 }
 
@@ -1637,7 +1686,10 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 "expert group issue download")) return 0;
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+      int index=(int)(ctx-g_ctx);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+      g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
 }
 
@@ -1736,50 +1788,66 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);
     if(!select_ctx(dc))return 0;
-    float **dl=(float**)std::malloc((size_t)S*sizeof(*dl));
-    float **dr=(float**)std::malloc((size_t)S*sizeof(*dr));
     int *old=(int*)std::malloc((size_t)S*sizeof(*old));
     int *add=(int*)std::malloc((size_t)S*sizeof(*add));
     int *off=(int*)std::malloc((size_t)S*sizeof(*off));int packed_n=0;
-    if(!dl||!dr||!old||!add||!off){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+    if(!old||!add||!off){std::free(old);std::free(add);std::free(off);return 0;}
+    int page_stride=0;
     for(int s=0;s<S;s++){
-        if(!keys[s]||lengths[s]<1||lengths[s]>T){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+        if(!keys[s]||lengths[s]<1||lengths[s]>T){std::free(old);std::free(add);std::free(off);return 0;}
         RaggedKVEntry *e=nullptr;
         for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){e=&w->ragged[i];break;}
         if(!e){
-            if(w->ragged_count>=512){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+            if(w->ragged_count>=512){std::free(old);std::free(add);std::free(off);return 0;}
             e=&w->ragged[w->ragged_count++];std::memset(e,0,sizeof(*e));e->key=keys[s];
         }
         if(e->K!=K||e->R!=R||e->host_l!=latent[s]||e->host_r!=rope[s]||lengths[s]<e->length){
-            if(e->latent)cudaFree(e->latent);if(e->rope)cudaFree(e->rope);
-            e->latent=e->rope=nullptr;e->length=e->capacity=0;
+            ragged_kv_clear(e);
             e->K=K;e->R=R;e->host_l=latent[s];e->host_r=rope[s];
         }
-        if(lengths[s]>e->capacity){
-            int cap=(lengths[s]+63)&~63;float *nl=nullptr,*nr=nullptr;
-            if(!cuda_ok(cudaMalloc(&nl,(size_t)cap*K*sizeof(float)),"ragged KV latent page")||
-               !cuda_ok(cudaMalloc(&nr,(size_t)cap*R*sizeof(float)),"ragged KV rope page")){
-                if(nl)cudaFree(nl);if(nr)cudaFree(nr);std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;
+        int need=(lengths[s]+COLI_KV_PAGE_TOKENS-1)/COLI_KV_PAGE_TOKENS;
+        if(need>e->page_count){
+            float **nl=(float**)std::calloc((size_t)need,sizeof(*nl));
+            float **nr=(float**)std::calloc((size_t)need,sizeof(*nr));
+            if(!nl||!nr){std::free(nl);std::free(nr);std::free(old);std::free(add);std::free(off);return 0;}
+            for(int i=0;i<e->page_count;i++){nl[i]=e->latent_pages[i];nr[i]=e->rope_pages[i];}
+            int made=e->page_count;
+            for(;made<need;made++){
+                if(!cuda_ok(cudaMalloc(&nl[made],(size_t)COLI_KV_PAGE_TOKENS*K*sizeof(float)),"ragged KV latent page")||
+                   !cuda_ok(cudaMalloc(&nr[made],(size_t)COLI_KV_PAGE_TOKENS*R*sizeof(float)),"ragged KV rope page"))break;
             }
-            if(e->length){
-                cudaMemcpyAsync(nl,e->latent,(size_t)e->length*K*sizeof(float),cudaMemcpyDeviceToDevice,dc->stream);
-                cudaMemcpyAsync(nr,e->rope,(size_t)e->length*R*sizeof(float),cudaMemcpyDeviceToDevice,dc->stream);
+            if(made<need){
+                if(nl[made])cudaFree(nl[made]);if(nr[made])cudaFree(nr[made]);
+                for(int i=e->page_count;i<made;i++){cudaFree(nl[i]);cudaFree(nr[i]);}
+                std::free(nl);std::free(nr);std::free(old);std::free(add);std::free(off);return 0;
             }
-            if(e->latent)cudaFree(e->latent);if(e->rope)cudaFree(e->rope);
-            e->latent=nl;e->rope=nr;e->capacity=cap;
+            std::free(e->latent_pages);std::free(e->rope_pages);
+            e->latent_pages=nl;e->rope_pages=nr;e->page_count=need;
         }
-        dl[s]=e->latent;dr[s]=e->rope;old[s]=e->length;add[s]=lengths[s]-e->length;
+        if(e->page_count>page_stride)page_stride=e->page_count;
+        old[s]=e->length;add[s]=lengths[s]-e->length;
         off[s]=packed_n;packed_n+=add[s]*(K+R);
+    }
+    size_t table_n=(size_t)S*page_stride;
+    float **dl=(float**)std::calloc(table_n,sizeof(*dl));
+    float **dr=(float**)std::calloc(table_n,sizeof(*dr));
+    if(!dl||!dr){std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);return 0;}
+    for(int s=0;s<S;s++)for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){
+        for(int p=0;p<w->ragged[i].page_count;p++){
+            dl[(size_t)s*page_stride+p]=w->ragged[i].latent_pages[p];
+            dr[(size_t)s*page_stride+p]=w->ragged[i].rope_pages[p];
+        }
+        break;
     }
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float);
     size_t cb=(size_t)S*H*V*sizeof(float),ob=(size_t)S*proj->O*sizeof(float);
     size_t pb=(size_t)packed_n*sizeof(float);
-    size_t desc=(size_t)S*(2*sizeof(float*)+4*sizeof(int));
+    size_t desc=2*table_n*sizeof(float*)+(size_t)S*4*sizeof(int);
     int ok=reserve(&dc->aq,&dc->aq_cap,qb)&&reserve(&dc->ac,&dc->ac_cap,cb)&&
            reserve(&dc->y,&dc->y_cap,ob)&&reserve_bytes(&dc->group_desc,&dc->group_desc_cap,desc)&&
            (!pb||(reserve(&dc->al,&dc->al_cap,pb)&&reserve_pinned(&dc->host_kv,&dc->host_kv_cap,pb)));
-    char *db=(char*)dc->group_desc;float **ddl=(float**)db,**ddr=ddl+S;
-    int *dn=(int*)(ddr+S),*dold=dn+S,*dadd=dold+S,*doff=dadd+S;
+    char *db=(char*)dc->group_desc;float **ddl=(float**)db,**ddr=ddl+table_n;
+    int *dn=(int*)(ddr+table_n),*dold=dn+S,*dadd=dold+S,*doff=dadd+S;
     if(ok&&pb){
         for(int s=0;s<S;s++)if(add[s]){
             float *p=dc->host_kv+off[s];
@@ -1789,20 +1857,20 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
         ok=cuda_ok(cudaMemcpyAsync(dc->al,dc->host_kv,pb,cudaMemcpyHostToDevice,dc->stream),"ragged KV append upload");
     }
     if(ok)ok=cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"ragged q upload")&&
-             cuda_ok(cudaMemcpyAsync(ddl,dl,(size_t)S*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged latent pointers")&&
-             cuda_ok(cudaMemcpyAsync(ddr,dr,(size_t)S*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged rope pointers")&&
+             cuda_ok(cudaMemcpyAsync(ddl,dl,table_n*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged latent page table")&&
+             cuda_ok(cudaMemcpyAsync(ddr,dr,table_n*sizeof(float*),cudaMemcpyHostToDevice,dc->stream),"ragged rope page table")&&
              cuda_ok(cudaMemcpyAsync(dn,lengths,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged lengths upload")&&
              cuda_ok(cudaMemcpyAsync(dold,old,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged old lengths")&&
              cuda_ok(cudaMemcpyAsync(dadd,add,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged append lengths")&&
              cuda_ok(cudaMemcpyAsync(doff,off,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged append offsets");
-    if(ok&&pb)ragged_kv_append<<<S,256,0,dc->stream>>>(ddl,ddr,dc->al,dold,dadd,doff,K,R);
+    if(ok&&pb)ragged_kv_append<<<S,256,0,dc->stream>>>(ddl,ddr,dc->al,dold,dadd,doff,K,R,page_stride);
     if(ok)for(int s=0;s<S;s++){
         for(int i=0;i<w->ragged_count;i++)if(w->ragged[i].key==keys[s]){w->ragged[i].length=lengths[s];break;}
     }
     std::free(dl);std::free(dr);std::free(old);std::free(add);std::free(off);if(!ok)return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_ragged_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,ddl,ddr,
-        dn,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale,w->gs,w->ng);
+        dn,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,page_stride,scale,w->gs,w->ng);
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->gs,proj->ng);
     return cuda_ok(cudaGetLastError(),"ragged attention launch")&&
@@ -1831,10 +1899,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     }
     if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
-    for(int i=0;i<tensor->ragged_count;i++){
-        if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
-        if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);
-    }
+    for(int i=0;i<tensor->ragged_count;i++)ragged_kv_clear(&tensor->ragged[i]);
     std::free(tensor);
 }
 
