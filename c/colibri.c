@@ -66,8 +66,15 @@
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
+/* Shims for a build without an OpenMP runtime (Apple clang without Homebrew
+ * libomp is the common case; the Makefile warns and carries on). Every omp_*
+ * the engine calls needs one, or the fallback only appears to work: the CPU
+ * build compiled because it happens not to reach omp_in_parallel(), while
+ * METAL=1 does and failed. */
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
+static inline int omp_in_parallel(void){ return 0; }     /* no runtime: never inside a team */
+static inline void omp_set_num_threads(int n){ (void)n; }
 #endif
 #include "omp_tune.h"
 #ifdef COLI_CUDA
@@ -78,7 +85,12 @@ static inline int omp_get_thread_num(void){ return 0; }
 #endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
-#include <omp.h>
+/* No <omp.h> here: the guarded include above already provides it under _OPENMP
+ * and shims omp_get_max_threads/omp_get_thread_num without it. Including it
+ * unconditionally defeated that fallback and made METAL=1 unbuildable on a
+ * stock macOS -- exactly the platform this backend targets -- even though the
+ * Makefile advertises the single-threaded path ("libomp not found: building
+ * single-threaded"). */
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
