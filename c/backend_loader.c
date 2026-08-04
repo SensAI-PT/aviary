@@ -37,6 +37,10 @@ typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
+typedef void           (*fn_group_stats_device)(int device, uint64_t *calls,
+                                                uint64_t *experts, uint64_t *rows,
+                                                double *h2d_ms, double *kernel_ms,
+                                                double *d2h_ms);
 typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up,
                                         ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
@@ -54,6 +58,7 @@ typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
 typedef int            (*fn_e8_set_grid)(const void *grid);
+typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
@@ -110,6 +115,7 @@ static struct {
     fn_device_integrated device_integrated;
     fn_stats           stats;
     fn_group_stats     group_stats;
+    fn_group_stats_device group_stats_device;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
     fn_expert_group_issue expert_group_issue;
@@ -118,6 +124,7 @@ static struct {
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
     fn_e8_set_grid     e8_set_grid;
+    fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -224,6 +231,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(device_integrated, fn_device_integrated)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
+    RESOLVE(group_stats_device, fn_group_stats_device)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
@@ -232,6 +240,7 @@ static int coli_cuda_load(void){
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
+    RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -320,6 +329,17 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
     g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
 }
 
+void coli_cuda_group_stats_device(int device, uint64_t *calls, uint64_t *experts,
+                                  uint64_t *rows, double *h2d_ms,
+                                  double *kernel_ms, double *d2h_ms){
+    if(!g_cuda.available){
+        if(calls)*calls=0; if(experts)*experts=0; if(rows)*rows=0;
+        if(h2d_ms)*h2d_ms=0; if(kernel_ms)*kernel_ms=0; if(d2h_ms)*d2h_ms=0;
+        return;
+    }
+    g_cuda.group_stats_device(device, calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
+}
+
 int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S){
     if(!g_cuda.available) return 0;
@@ -367,6 +387,11 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, cons
 int coli_cuda_e8_set_grid(const void *grid){
     if(!g_cuda.available || !g_cuda.e8_set_grid) return 0;   /* fmt=6 stays CPU-side */
     return g_cuda.e8_set_grid(grid);
+}
+
+int coli_cuda_fp8_set_lut(const float *lut){
+    if(!g_cuda.available || !g_cuda.fp8_set_lut) return 0;   /* fmt=8 stays CPU-side */
+    return g_cuda.fp8_set_lut(lut);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,

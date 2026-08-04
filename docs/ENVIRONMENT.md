@@ -86,7 +86,7 @@ Format: `VAR` — default — effect.
 | `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
-| `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
+| `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. Automatic pinning is capped so it cannot reduce the adaptive LRU capacity that fits before pinning; explicit `PIN`/`PIN_GB` settings remain authoritative. |
 | `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
@@ -206,6 +206,7 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. Off by default the engine reports `routed experts only (resident dense on CPU)`: on a host where the CPU is the limiter this leaves the dense path of every layer on the CPU while the VRAM tier serves experts only. Measured x2.8 on a 4x A6000 / 24-core host (1.53 -> 4.26 tok/s). |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. Also accepts `auto`. |
 | `CUDA_RESERVE_GB` | `2.0` | VRAM (GB) held back from the expert tier for activations, scratch and the KV cache. |
+| `CUDA_EXPERT_LOAD_BALANCE` | `0` (off) | Experimental multi-GPU expert assignment: keep the same frequency-ranked GPU prefix, but greedily distribute it by accumulated profile weight instead of resident bytes alone. On one 6×RTX 5090 fixed replay its three-run median was +2.9%, with large variance; leave off unless validated on the target workload. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
 | `COLI_CUDA_ROUTER` | `0` (off) | `=1` runs the MoE router (logits + top-k select) on the GPU at S=1. Skipped while a routing trace is being recorded, under `CACHE_ROUTE`, and above 4096 experts / topk 64. |
 | `COLI_CUDA_RESID` | `0` (off) | `=1` keeps the residual stream on the device between layers instead of copying it back to the host each time. |
@@ -214,6 +215,8 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
+| `COLI_MTP_GUARD_PCT` | `70` | Pause MTP after the guard window when recent acceptance falls below this percentage. |
+| `COLI_MTP_GUARD_WINDOW` | `24` | Number of MTP proposals used by the soft acceptance guard. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
 | `COLI_CUDA_PIPE_SHARD` | off | `=1` runs the multi-device P2P head-shard attention path (opt-in for NVLink topologies; serializes ~95 MB/layer over a star PCIe topology). |
 | `COLI_CUDA_PIPE_S_MIN` | `1` single-GPU, `8` multi-GPU | Minimum prefill batch S to engage the pipe2 CUDA path. |
