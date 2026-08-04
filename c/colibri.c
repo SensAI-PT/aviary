@@ -3382,7 +3382,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                 m->dsa_nsel=malloc((size_t)S*sizeof(int));
             }
-            #pragma omp parallel for schedule(dynamic,1)
+            /* if(S>1): at decode S is 1, so this region has exactly ONE iteration --
+             * and OpenMP still forks and joins the whole team to run it. That is
+             * pure overhead on the hottest path there is: once per layer, per
+             * token, whether or not the body does any work (both early `continue`
+             * branches below are taken on short contexts, and the fork happens
+             * anyway). The clause makes the single-iteration case run inline;
+             * S>1 prefill is untouched, and the results are identical either way. */
+            #pragma omp parallel for schedule(dynamic,1) if(S > 1)
             for(int s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
                 int pos=positions?positions[s]:pos_base+s, nk=pos+1;

@@ -730,6 +730,18 @@ efficiency-cuda:
 efficiency-report:
 	$(PYTHON) tests/test_efficiency_report.py
 
+
+# What a parallel region costs before its body runs. Backs the `if(S > 1)`
+# clause in the DSA indexer: at decode that region has one iteration, and the
+# fork/join is paid anyway. Not a gate -- a measurement, run it when changing
+# how the engine parallelises.
+#   make -C c bench-omp-grain
+# Honours OMP_NUM_THREADS/OMP_WAIT_POLICY, so measure with the settings the
+# engine actually runs under (omp_tune.h sizes the team to physical cores).
+bench-omp-grain: tests/bench_omp_grain.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
+	./tests/bench_omp_grain
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
@@ -765,6 +777,9 @@ clean:
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all colibri glm iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+
+# Own line: see the TEST_RULES note above on shared .PHONY lines.
+.PHONY: bench-omp-grain
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
