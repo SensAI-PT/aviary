@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -154,12 +155,25 @@ class BannerModelLineTest(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
         (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
         if shard_bytes:
-            with open(directory / "model-00001.safetensors", "wb") as shard:
-                shard.truncate(shard_bytes)   # sparse: costs no disk
+            # An empty file: the size is reported by the getsize patch in
+            # line(). truncate() to the real size would be sparse on ext4 and
+            # APFS but NOT on NTFS, where it allocates -- the first revision of
+            # this test asked a Windows runner for 372 GB and got
+            # "OSError: [Errno 28] No space left on device".
+            (directory / "model-00001.safetensors").write_bytes(b"")
         return directory
 
     def line(self, config, shard_bytes=0):
-        return self.coli.model_banner_line(str(self.make_model(config, shard_bytes)))
+        directory = self.make_model(config, shard_bytes)
+        if not shard_bytes:
+            return self.coli.model_banner_line(str(directory))
+        real_getsize = os.path.getsize
+
+        def fake_getsize(path):
+            return shard_bytes if str(path).endswith(".safetensors") else real_getsize(path)
+
+        with mock.patch.object(self.coli.os.path, "getsize", fake_getsize):
+            return self.coli.model_banner_line(str(directory))
 
     def test_each_engine_names_itself(self):
         for model_type, expected in (
