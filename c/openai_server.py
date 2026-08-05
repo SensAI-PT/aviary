@@ -1415,6 +1415,35 @@ def cap_for_arch(arch, cap):
     return 0 if arch == "glm" else 8
 
 
+def tune_child_env(env, arch):
+    """Apply the engine-local defaults that a direct server launch otherwise misses.
+
+    ``coli chat`` already supplies these values, but users also launch this file
+    directly.  Keep setdefault semantics so every explicit operator setting wins.
+    """
+    if arch != "deepseek_v4":
+        return env
+    if not env.get("COLI_NO_OMP_TUNE"):
+        from resource_plan import physical_cpu_count
+        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        env.setdefault("OMP_WAIT_POLICY", "active")
+        env.setdefault("GOMP_SPINCOUNT", "200000")
+        env.setdefault("OMP_DYNAMIC", "FALSE")
+        if sys.platform != "win32":
+            env.setdefault("OMP_PROC_BIND", "close")
+            env.setdefault("OMP_PLACES", "cores")
+    # All speculative paths stay opt-in: partial acceptance requires expensive
+    # recurrent-attention replay on this engine.
+    env.setdefault("V4_DRAFT", "0")
+    env.setdefault("V4_MTP", "0")
+    env.setdefault("V4_MTP_DRAFT", "3")
+    env.setdefault("V4_MTP_GB", "0.45")
+    env.setdefault("V4_MTP_MISS", "96")
+    env.setdefault("V4_MTP_MIN", "3")
+    env.setdefault("V4_MTP_CONF", "0.55")
+    return env
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -1423,10 +1452,12 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
+        arch = model_arch(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        tune_child_env(child_env, arch)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(model_arch(model), cap))], env=child_env,
+            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
