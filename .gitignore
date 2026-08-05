@@ -37,6 +37,18 @@ c/tests/test_*
 !c/tests/test_*.cu
 !c/tests/test_*.mm
 !c/tests/test_*.py
+# bench_* and fuzz_* build to extensionless binaries in the same directory and
+# were not covered here, which is how c/tests/bench_omp_grain reached the tree.
+c/tests/bench_*
+!c/tests/bench_*.c
+!c/tests/bench_*.cu
+!c/tests/bench_*.mm
+!c/tests/bench_*.py
+c/tests/fuzz_*
+!c/tests/fuzz_*.c
+!c/tests/fuzz_*.cu
+!c/tests/fuzz_*.mm
+!c/tests/fuzz_*.py
 result
 c/tests/test_cap_precedence
 c/tests/test_cap_precedence.exe
