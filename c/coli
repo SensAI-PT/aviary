@@ -267,11 +267,50 @@ def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
+    # OMP_NUM_THREADS for the sister engines too.
+    #
+    # #805 set this from physical cores "on every platform" -- but only inside
+    # env_for(), which this function calls only for glm. inkling, kimi_k3,
+    # olmoe and deepseek_v4 all took the branch below and got libgomp's
+    # default, nproc, i.e. LOGICAL cores. On any SMT host that is a 2x
+    # over-subscription of a memory-bound int4 GEMV, which is the collapse
+    # measured in #718 (2.3x on Zen3) and again here: an i7-1355U reports 6
+    # physical and 12 logical, and DeepSeek V4 was running the 12.
+    #
+    # Same defect shape as the one #805 fixed, one level out: a mechanism that
+    # reaches one engine and not its siblings.
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins -- which is also
+    # how to A/B it: OMP_NUM_THREADS=12 reproduces the old behaviour.
+    if not env.get("COLI_NO_OMP_TUNE"):
+        from resource_plan import physical_cpu_count
+        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        if arch == "deepseek_v4":
+            env.setdefault("OMP_WAIT_POLICY", "active")
+            env.setdefault("GOMP_SPINCOUNT", "200000")
+            env.setdefault("OMP_DYNAMIC", "FALSE")
+            if sys.platform != "win32":
+                env.setdefault("OMP_PROC_BIND", "close")
+                env.setdefault("OMP_PLACES", "cores")
     if a.ngen: env["NGEN"] = str(a.ngen)
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
     if arch == "deepseek_v4":
         if a.ram: env["RAM_GB"] = str(a.ram)
         if a.ctx: env["CTX"] = str(a.ctx)
+        # Speculation stays opt-in. Real multi-turn chat measured only 1/15
+        # accepted prompt-lookup candidates; recurrent-state replay dominated
+        # the visible decode. V4_DRAFT=5 remains available for repeated code.
+        env.setdefault("V4_DRAFT", "0")
+        # Full three-stage DSpark remains opt-in.  In a real multi-turn chat it
+        # accepted only 10/24 candidates and rejected-suffix replay turned a
+        # 14-token answer into 495 seconds.  V4_MTP=1 still enables A/B runs;
+        # exact zero-I/O prompt lookup above remains enabled by default.
+        env.setdefault("V4_MTP", "0")
+        env.setdefault("V4_MTP_DRAFT", "3")
+        env.setdefault("V4_MTP_GB", "0.45")
+        env.setdefault("V4_MTP_MISS", "96")
+        env.setdefault("V4_MTP_MIN", "3")
+        env.setdefault("V4_MTP_CONF", "0.55")
     return env
 
 def cuda_binary():

@@ -20,7 +20,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
                            render_chat, render_chat_kimi, serve,
-                           split_thinking_reply, stop_policy)
+                           split_thinking_reply, stop_policy, tune_child_env)
 
 
 class FakeEngine:
@@ -670,7 +670,21 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
+        self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch("/nonexistent"), "glm")
+
+    def test_direct_v4_server_gets_bounded_dspark_defaults(self):
+        env = {"V4_MTP_CONF": "0.7"}
+        with patch("resource_plan.physical_cpu_count", return_value=6), \
+             patch("openai_server.sys.platform", "linux"):
+            tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertEqual(env["OMP_PROC_BIND"], "close")
+        self.assertEqual(env["V4_DRAFT"], "0")
+        self.assertEqual(env["V4_MTP"], "0")
+        self.assertEqual(env["V4_MTP_DRAFT"], "3")
+        self.assertEqual(env["V4_MTP_GB"], "0.45")
+        self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
 
 
 class HTTPTest(unittest.TestCase):
