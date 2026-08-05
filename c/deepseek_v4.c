@@ -134,6 +134,12 @@ int coli_st_read_at_streaming(const ColiSafetensorsIndex *index, int shard,
         needed + alignment - 1 > SIZE_MAX) return -1;
     size_t allocation_bytes = (size_t)((needed + alignment - 1) &
                                        ~(alignment - 1));
+    /* PORTABILITY: on Windows compat.h maps posix_memalign onto
+     * _aligned_malloc, whose blocks MUST be released with compat_aligned_free
+     * -- passing one to free() corrupts the CRT heap. compat.h says so at its
+     * own definition. Every release below therefore goes through
+     * compat_aligned_free, which is plain free() on POSIX. Getting this wrong
+     * killed tests/test_deepseek_v4.exe before it printed its first line. */
     unsigned char *bounce = NULL;
     if (posix_memalign((void **)&bounce, (size_t)alignment,
                        allocation_bytes) != 0)
@@ -155,7 +161,7 @@ int coli_st_read_at_streaming(const ColiSafetensorsIndex *index, int shard,
         done += (size_t)count;
     }
     if (failed) {
-        free(bounce);
+        compat_aligned_free(bounce);
         return coli_st_read_at(index, shard, offset, length, destination);
     }
     while ((uint64_t)done < needed) {
@@ -163,11 +169,11 @@ int coli_st_read_at_streaming(const ColiSafetensorsIndex *index, int shard,
                               (size_t)(needed - done),
                               (off_t)(base + done));
         if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) { free(bounce); return -1; }
+        if (count <= 0) { compat_aligned_free(bounce); return -1; }
         done += (size_t)count;
     }
     memcpy(destination, bounce + pad, length);
-    free(bounce);
+    compat_aligned_free(bounce);
     return 0;
 }
 
@@ -5332,7 +5338,12 @@ static void destroy(ColiExpertStore *store) {
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
         for (int i = 0; i < state->layers * state->slots_per_layer; i++)
-            free(state->slots[i].slab);
+            /* aligned_slab means posix_memalign, which on Windows is
+             * _aligned_malloc and must not reach free(). */
+            if (state->slots[i].aligned_slab)
+                compat_aligned_free(state->slots[i].slab);
+            else
+                free(state->slots[i].slab);
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -9379,7 +9390,10 @@ static void destroy(ColiExpertStore *store) {
     if (state) {
         assert(state->active_leases == 0 && "destroy with active expert leases");
         for (int i = 0; i < state->layers * state->slots_per_layer; i++)
-            free(state->slots[i].slab);
+            free(state->slots[i].slab);   /* this store allocates slabs with
+                                           * malloc only; the aligned path and
+                                           * its compat_aligned_free live in the
+                                           * hot rows16 store above. */
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
