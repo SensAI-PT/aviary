@@ -1708,8 +1708,37 @@ def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
 
+def _positive_env(name, default):
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    # SEC: ThreadingHTTPServer spawns one thread per TCP connection with no
+    # ceiling, and each carries a default 8 MiB stack. Opening connections and
+    # never completing a request therefore grows thread count -- and memory --
+    # without bound, before any Host check or auth runs. max_queue bounds the
+    # inference queue, not the accept loop.
+    #
+    # 64 is deliberately small: the engine serves one request at a time
+    # (kv_slots) behind a queue of 8, so hundreds of concurrent connections buy
+    # nothing a dashboard plus a handful of clients does not already have. Over
+    # the cap we close immediately rather than queue, so the cost of a flood is
+    # paid by the attacker's socket and not by our address space.
+    MAX_CONNECTIONS = _positive_env("COLI_MAX_CONNECTIONS", 64)
+
+    # A global cap alone turns memory exhaustion into connection starvation: one
+    # attacker holding all 64 slots still locks every real client out. Measured
+    # exactly that while testing the cap. So also bound what a single source may
+    # hold, and keep it well under the global cap: a browser opens a handful of
+    # parallel connections, an SDK fewer, so 8 is generous for any one client and
+    # leaves 56 slots that one address cannot touch.
+    MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
@@ -1728,15 +1757,105 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        self._conn_lock = threading.Lock()
+        self._conn_live = 0
+        self._conn_by_ip = {}
+        self._conn_owner = {}
+
+    def process_request(self, request, client_address):
+        """Refuse past the caps instead of spawning an unbounded thread."""
+        peer = client_address[0] if client_address else "?"
+        with self._conn_lock:
+            mine = self._conn_by_ip.get(peer, 0)
+            if self._conn_live >= self.MAX_CONNECTIONS:
+                reason = "server cap %d" % self.MAX_CONNECTIONS
+            elif mine >= self.MAX_CONNECTIONS_PER_IP:
+                reason = "per-address cap %d" % self.MAX_CONNECTIONS_PER_IP
+            else:
+                reason = None
+                self._conn_live += 1
+                self._conn_by_ip[peer] = mine + 1
+                self._conn_owner[id(request)] = peer
+        if reason:
+            sys.stderr.write("[api] %s - refused: %s\n" % (peer, reason))
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(request)
+            raise
+
+    def _release(self, request):
+        with self._conn_lock:
+            peer = self._conn_owner.pop(id(request), None)
+            if peer is None:
+                return                      # never counted, or already released
+            if self._conn_live > 0:
+                self._conn_live -= 1
+            left = self._conn_by_ip.get(peer, 1) - 1
+            if left > 0:
+                self._conn_by_ip[peer] = left
+            else:
+                self._conn_by_ip.pop(peer, None)   # do not grow a map per peer
+
+    def close_request(self, request):
+        self._release(request)
+        super().close_request(request)
+
+
+class _DeadlineReader:
+    """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
+
+    SEC: `timeout` below is per socket operation, so it restarts on every byte.
+    A client dripping one byte every 29 s renews it forever and holds a thread
+    and a connection slot indefinitely -- the code's own comment claimed the
+    opposite. The deadline here is absolute: every read shrinks the socket
+    timeout to the time left, so a drip runs the clock down instead of resetting
+    it.
+
+    It covers the request-read phase only. Generation is not on this clock: a
+    600-second answer is normal and must not be cut off, so send_response()
+    hands the socket back to the ordinary timeout once the status line is out.
+    """
+
+    def __init__(self, raw, sock, per_read, budget):
+        self._raw, self._sock, self._per_read = raw, sock, per_read
+        self._expires = time.monotonic() + budget
+
+    def _arm(self):
+        left = self._expires - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request read deadline exceeded")
+        self._sock.settimeout(min(self._per_read, left))
+
+    def readline(self, *args):
+        self._arm()
+        return self._raw.readline(*args)
+
+    def read(self, *args):
+        self._arm()
+        return self._raw.read(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
-                   # request line/body can't pin a worker thread (and a slot) forever
+    timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
+                   # it restarts on every byte received, so a drip renews it forever.
+                   # READ_DEADLINE below is the cumulative bound that actually does.
+    READ_DEADLINE = _positive_env("COLI_READ_DEADLINE", 30)  # accept -> request read
     server_version = "colibri"
     _committed = False    # status line already on the wire; reset per request below
     _body_read = False    # request body fully consumed, so nothing is left to drain
+
+    def setup(self):
+        super().setup()
+        # Keep the socket-backed reader; handle_one_request re-wraps it with a
+        # fresh deadline per request rather than wrapping a wrapper each time.
+        self._raw_rfile = self.rfile
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
@@ -1753,8 +1872,19 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
+        # Fresh budget per request: a keep-alive connection may serve many, and
+        # each is entitled to its own read window -- but none may drip forever.
+        self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
+                                     self.timeout, self.READ_DEADLINE)
         try:
             super().handle_one_request()
+        except TimeoutError:
+            # The read budget ran out. Say so and close; do not answer, because
+            # we never received a complete request to answer.
+            sys.stderr.write("[api] %s - request read deadline exceeded\n"
+                             % self.address_string())
+            self.close_connection = True
+            return
         except (BrokenPipeError, ConnectionResetError):
             # The client hung up mid-response. That is not an error here, it is
             # how HTTP clients behave: `coli chat` polls /health while the model
@@ -1776,6 +1906,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """Single choke point for "the status line is out". Overriding here rather than
         tracking it at each call site means no responder can forget (#597 item 3)."""
         self._committed = True
+        # The request is fully read by the time anything answers, so the read
+        # deadline has done its job. Restore the plain per-operation timeout:
+        # generation legitimately takes minutes and must not inherit a clock
+        # sized for reading a request header.
+        try:
+            self.connection.settimeout(self.timeout)
+        except OSError:
+            pass
         super().send_response(code, message)
 
     def _drain_request_body(self):
@@ -1964,9 +2102,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                # (#SEC-8) same gate as /health and /experts above: this endpoint
+                # is served before require_auth(), so an unauthenticated caller
+                # reached it even with --api-key set. It carries per-turn
+                # telemetry -- prompt and completion token counts, per-phase
+                # timings, up to 120 turns -- which describes what the operator
+                # is running and how much. The pass that added _is_authed() to
+                # the two endpoints above did not reach this one.
                 eng = self.server.engine
-                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
-                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
+                payload = {"seq": 0, "turns": []}
+                if self._is_authed() and eng:
+                    payload["seq"] = getattr(eng, "profile_seq", 0)
+                    payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):

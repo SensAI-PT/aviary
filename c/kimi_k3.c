@@ -1156,6 +1156,9 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 float sv=st[e]+o->rbias[e];
                 if(!taken&&sv>bv){ bv=sv; best=e; }
             }
+            /* SEC: all-NaN scores leave best at -1, and st[-1] is read on the
+             * very next expression. See rt_router_pick in route_trace.h. */
+            best = rt_router_pick(best, kk, E, li);
             idx[kk]=best; wsel[kk]=st[best];          /* weight = RAW sigmoid score */
         }
         { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];

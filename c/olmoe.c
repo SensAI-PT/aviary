@@ -657,7 +657,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
                 if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
             }
-            idx[kk] = best; val[kk] = bv;
+            /* SEC: all-NaN probabilities leave best at -1, which reaches
+             * expert_get() and then last_access[layer*E - 1] -- a heap write at
+             * a negative index. See rt_router_pick in route_trace.h. */
+            best = rt_router_pick(best, kk, E, layer);
+            idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */

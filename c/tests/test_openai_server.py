@@ -726,9 +726,17 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
-            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+    def test_profile_requires_auth(self):
+        """/profile is served before require_auth(), so it needs its own gate.
+
+        This test previously asserted the opposite -- that the telemetry was
+        readable without a key. That was not a client requirement: the web
+        dashboard sends `Authorization: Bearer` to /profile exactly as it does
+        to /health and /experts (web/src/lib/api.ts). The turns carry prompt and
+        completion token counts and per-phase timings for the last 120 requests,
+        which describes what the operator is running and how much of it, so an
+        anonymous caller now gets the same empty shape those two endpoints give.
+        """
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
                 "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
@@ -736,7 +744,11 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile_seq = 1
         try:
             with urlopen(self.base + "/profile", timeout=2) as response:
-                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+                self.assertEqual(json.load(response), {"seq": 0, "turns": []},
+                                 "unauthenticated caller received telemetry")
+            with self.request("/profile") as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]},
+                                 "authenticated caller lost access")
         finally:
             del self.engine.profile, self.engine.profile_seq
 
@@ -1667,6 +1679,73 @@ class ConversationCacheSlotTest(unittest.TestCase):
     def test_deterministic(self):
         conv = self._conv("same question", "same answer", "again")
         self.assertEqual(conversation_cache_slot(conv, 8), conversation_cache_slot(conv, 8))
+
+
+class ConnectionLimitTest(unittest.TestCase):
+    """Bounds on the accept loop, which nothing bounded before.
+
+    ThreadingHTTPServer spawns a thread per connection with no ceiling, and
+    `timeout` is per socket operation, so it restarts on every byte: a client
+    dripping one byte kept a thread and a slot forever. Threads at 8 MiB of
+    stack each made that a memory-exhaustion DoS, reachable before any Host
+    check or auth.
+    """
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        APIServer.MAX_CONNECTIONS = 6
+        APIServer.MAX_CONNECTIONS_PER_IP = 3
+        APIHandler.READ_DEADLINE = 2
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS", 64)
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS_PER_IP", 8)
+        self.addCleanup(setattr, APIHandler, "READ_DEADLINE", 30)
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "m", None, 16, kv_slots=1)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.scheduler.close)
+        self.port = self.server.server_port
+        self.held = []
+        self.addCleanup(self._drop_all)
+
+    def _drop_all(self):
+        for sock in self.held:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _dribble(self, count):
+        """Open connections that send a partial request line and never finish."""
+        for _ in range(count):
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), 2)
+                sock.settimeout(2)
+                sock.sendall(b"GET /health HTTP/1.1\r\n")
+                self.held.append(sock)
+            except OSError:
+                pass
+        time.sleep(0.4)
+
+    def test_slowloris_cannot_grow_threads_without_bound(self):
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live, APIServer.MAX_CONNECTIONS)
+
+    def test_one_address_cannot_take_every_slot(self):
+        """A global cap alone only turns exhaustion into starvation."""
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live,
+                             APIServer.MAX_CONNECTIONS_PER_IP)
+        self.assertLess(self.server._conn_live, APIServer.MAX_CONNECTIONS,
+                        "one source filled the server cap")
+
+    def test_dripping_connections_are_reclaimed(self):
+        """The cumulative deadline, which the per-operation timeout is not."""
+        self._dribble(10)
+        self.assertGreater(self.server._conn_live, 0)
+        time.sleep(APIHandler.READ_DEADLINE + 1.5)
+        self.assertEqual(self.server._conn_live, 0,
+                         "dripping connections were never reclaimed")
 
 
 if __name__ == "__main__":
