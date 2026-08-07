@@ -8,6 +8,61 @@ try:
 except ImportError as e:
     raise SystemExit("pip install 'transformers>=5.6.0' torch safetensors") from e
 
+
+def gpt2_bytes_to_unicode():
+    """Same mapping as tok.h tk_build_bytemap / GPT-2 ByteLevel."""
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+def write_byte_tokenizer(path, vocab_size=256):
+    """Minimal tokenizer.json so coli agent / hy3 SERVE can load the tiny snap.
+
+    Vocab is identity byte→id (0..255) with GPT-2 ByteLevel spellings.
+    Empty merges → tok.h rankbpe mode. Enough for cluster smoke tests; not a
+    real Hy3 chat tokenizer.
+    """
+    if vocab_size != 256:
+        raise ValueError("hy3_tiny vocab_size must stay 256 to match this stub")
+    byte_enc = gpt2_bytes_to_unicode()
+    vocab = {byte_enc[i]: i for i in range(256)}
+    tok = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [],
+        "normalizer": None,
+        "pre_tokenizer": {
+            "type": "ByteLevel",
+            "add_prefix_space": False,
+            "trim_offsets": True,
+            "use_regex": True,
+        },
+        "post_processor": None,
+        "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "ignore_merges": True,
+            "vocab": vocab,
+            "merges": [],
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tok, f, ensure_ascii=False, separators=(",", ":"))
+
 torch.manual_seed(5678)
 
 cfg = HYV3Config(
@@ -66,5 +121,10 @@ print("tf_pred:", tf_pred)
 out_dir = "hy3_tiny"
 model.save_pretrained(out_dir, safe_serialization=True)
 json.dump(cfg.to_dict(), open(f"{out_dir}/config.json", "w"))
+write_byte_tokenizer(f"{out_dir}/tokenizer.json", vocab_size=cfg.vocab_size)
+json.dump(
+    {"model_max_length": 4096},
+    open(f"{out_dir}/tokenizer_config.json", "w"),
+)
 json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred}, open("ref_hy3.json", "w"))
-print(f"\nsaved: {out_dir}/ and ref_hy3.json")
+print(f"\nsaved: {out_dir}/ (incl. tokenizer.json) and ref_hy3.json")

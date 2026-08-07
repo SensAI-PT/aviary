@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from aviary.protocol import DEFAULT_RPC_TIMEOUT_MS, ProtocolError, read_frame, write_line
+from aviary.protocol import ProtocolError, read_frame, write_line
 from aviary.registry import DEFAULT_HEARTBEAT_SEC, NodeRegistry
 
 try:
@@ -40,11 +40,13 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
         registry: NodeRegistry = self.server.registry  # type: ignore[attr-defined]
         conn = self.request
         peer_host = self.client_address[0]
-        timeout_ms = DEFAULT_RPC_TIMEOUT_MS
+        # Idle waits must cover the heartbeat lease window. AVIARY_RPC_TIMEOUT_MS is for
+        # short request/response RPCs (e.g. PING→PONG), not silence between heartbeats.
+        idle_timeout_ms = int((DEFAULT_HEARTBEAT_SEC * max(registry.heartbeat_miss, 1) + 1.0) * 1000)
         node_id = None
         try:
             while True:
-                kind, fields, payload = read_frame(conn, timeout_ms)
+                kind, fields, payload = read_frame(conn, idle_timeout_ms)
                 if kind == "EOF":
                     break
                 if kind == "REGISTER" and len(fields) >= 5 and payload is not None:
@@ -181,6 +183,10 @@ class MasterHTTPHandler(APIHandler):
                 self.server.registry.increment_inflight(node.node_id, -1)  # type: ignore[attr-defined]
 
     def serve_static(self, path):
+        # Never SPA-fallback API routes (same guard as openai_server.APIHandler).
+        if path.startswith("/v1/") or path.startswith("/cluster/") or path in (
+                "/health", "/experts", "/profile"):
+            return False
         if not WEB_DIST.is_dir():
             return False
         if path in ("", "/"):
@@ -239,7 +245,8 @@ def run_master(host="0.0.0.0", port=9000, control_port=None, api_key=None, cors_
         target=control.serve_forever, name="aviary-control-plane", daemon=True)
     control_thread.start()
 
-    http = MasterHTTPServer((host, port), registry, api_key, cors_origins)
+    origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
+    http = MasterHTTPServer((host, port), registry, api_key, origins)
     print(f"Aviary master HTTP http://{host}:{port}  control :{control_port}", file=sys.stderr)
 
     previous = signal.getsignal(signal.SIGTERM)
