@@ -12,6 +12,16 @@ from typing import Any
 DEFAULT_HEARTBEAT_SEC = float(os.environ.get("AVIARY_HEARTBEAT_SEC", "2"))
 DEFAULT_HEARTBEAT_MISS = int(os.environ.get("AVIARY_HEARTBEAT_MISS", "3"))
 
+# Idle-read timeout for a control connection between heartbeats. Deliberately generous
+# (a few heartbeat intervals beyond the miss threshold that already decides liveness in
+# tick_leases()) so a socket read timeout never preempts that policy -- this is a "is the
+# connection hung" backstop, not the liveness mechanism itself. Must NOT reuse
+# AVIARY_RPC_TIMEOUT_MS (protocol.DEFAULT_RPC_TIMEOUT_MS): that constant is a per-expert-RPC
+# latency budget (Phase 2 cluster_rpc, ~150ms) with nothing to do with the ~2s heartbeat
+# cadence -- reusing it here made every control connection read-timeout, and get marked
+# dead, within one heartbeat interval of registering (#AVIARY-1).
+CONTROL_IDLE_TIMEOUT_MS = int(DEFAULT_HEARTBEAT_SEC * 1000 * (DEFAULT_HEARTBEAT_MISS + 2))
+
 
 @dataclass
 class NodeRecord:

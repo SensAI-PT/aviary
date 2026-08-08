@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aviary.protocol import ProtocolError, read_frame, write_line
-from aviary.registry import DEFAULT_HEARTBEAT_SEC, NodeRegistry
+from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC, NodeRegistry
 
 try:
     from openai_server import APIHandler, DEFAULT_CORS_ORIGINS, model_object
@@ -40,13 +40,13 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
         registry: NodeRegistry = self.server.registry  # type: ignore[attr-defined]
         conn = self.request
         peer_host = self.client_address[0]
-        # Idle waits must cover the heartbeat lease window. AVIARY_RPC_TIMEOUT_MS is for
-        # short request/response RPCs (e.g. PING→PONG), not silence between heartbeats.
-        idle_timeout_ms = int((DEFAULT_HEARTBEAT_SEC * max(registry.heartbeat_miss, 1) + 1.0) * 1000)
+        # See CONTROL_IDLE_TIMEOUT_MS: this must stay well above the ~2s heartbeat
+        # cadence, not the ~150ms expert-RPC latency budget (#AVIARY-1).
+        timeout_ms = CONTROL_IDLE_TIMEOUT_MS
         node_id = None
         try:
             while True:
-                kind, fields, payload = read_frame(conn, idle_timeout_ms)
+                kind, fields, payload = read_frame(conn, timeout_ms)
                 if kind == "EOF":
                     break
                 if kind == "REGISTER" and len(fields) >= 5 and payload is not None:

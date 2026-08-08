@@ -1060,7 +1060,8 @@ def cmd_agent(a):
     from aviary.agent import run_agent
     run_agent(a.model, a.master, a.host, a.port, model_id, a.api_key,
               a.control_port, a.advertise_host, a.cap, a.ngen, env_for_engine(a,arch),
-              a.max_queue, a.queue_timeout, a.kv_slots, engine)
+              a.max_queue, a.queue_timeout, a.kv_slots, engine,
+              allowed_hosts=a.allowed_host)
 
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.

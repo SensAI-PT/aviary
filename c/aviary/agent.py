@@ -15,14 +15,13 @@ from urllib.parse import urlparse
 
 from aviary.identity import load_or_create_node_id
 from aviary.protocol import (
-    DEFAULT_RPC_TIMEOUT_MS,
     ProtocolError,
     heartbeat_frame,
     read_frame,
     register_frame,
     write_line,
 )
-from aviary.registry import DEFAULT_HEARTBEAT_SEC
+from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC
 
 try:
     from openai_server import (
@@ -156,7 +155,7 @@ class ControlConnection:
                 reg = register_frame(self.node_id, self.http_port, self.model_id,
                                      self._register_payload())
                 sock.sendall(reg.encode("utf-8"))
-                kind, fields, _ = read_frame(sock, DEFAULT_RPC_TIMEOUT_MS)
+                kind, fields, _ = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
                 if kind != "REGISTERED" or len(fields) < 2 or fields[1] != self.node_id:
                     time.sleep(2)
                     continue
@@ -168,7 +167,7 @@ class ControlConnection:
                         frame = heartbeat_frame(self.node_id, inflight, self._telemetry_payload())
                         sock.sendall(frame.encode("utf-8"))
                         try:
-                            kind, _, _ = read_frame(sock, DEFAULT_RPC_TIMEOUT_MS)
+                            kind, _, _ = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
                             if kind == "PING":
                                 write_line(sock, "PONG")
                             elif kind == "DRAIN":
@@ -200,9 +199,23 @@ class ControlConnection:
                 time.sleep(2)
 
 
+def _agent_allowed_hosts(advertise, allowed_hosts):
+    """DNS-rebinding guard extras: master proxies with Host=<advertise>:port."""
+    hosts = [h.strip().lower() for h in (allowed_hosts or []) if h and h.strip()]
+    for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(","):
+        h = h.strip().lower()
+        if h and h not in hosts:
+            hosts.append(h)
+    if advertise:
+        ah = advertise.strip().lower()
+        if ah not in hosts:
+            hosts.append(ah)
+    return tuple(hosts)
+
+
 def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api_key=None,
               control_port=None, advertise_host=None, cap=None, max_tokens=1024, env=None,
-              max_queue=8, queue_timeout=300, kv_slots=1, engine_path=None):
+              max_queue=8, queue_timeout=300, kv_slots=1, engine_path=None, allowed_hosts=None):
     import openai_server
 
     parsed = urlparse(master_url if "://" in master_url else f"http://{master_url}")
@@ -213,12 +226,15 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     openai_server.ARCH = arch
     model_id = model_id or os.environ.get("COLI_MODEL_ID") or _default_model_id(arch)
     advertise = advertise_host or (host if host not in ("0.0.0.0", "::") else None)
+    if not advertise and host in ("0.0.0.0", "::"):
+        advertise = _local_ip_for((master_host, control_port))
     engine_bin = engine_path or str(default_engine())
 
     server = APIServer((host, port), None, model_id, api_key, max_tokens,
                        cors_origins=DEFAULT_CORS_ORIGINS,
                        max_queue=max_queue, queue_timeout=queue_timeout,
-                       kv_slots=kv_slots)
+                       kv_slots=kv_slots,
+                       allowed_hosts=_agent_allowed_hosts(advertise, allowed_hosts))
     runtime = Engine(engine_bin, model, cap, max_tokens, env, kv_slots, arch)
     server.engine = runtime
 
