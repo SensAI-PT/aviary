@@ -1,3 +1,4 @@
+import http.client
 import json
 import socket
 import threading
@@ -95,6 +96,64 @@ class MasterHttpRoutingTest(unittest.TestCase):
             self.assertIn("error", err)
         finally:
             http.shutdown()
+            agent.shutdown()
+
+
+class _FakeStreamingAgentHandler(BaseHTTPRequestHandler):
+    """Mimics the engine's real SSE framing: no Content-Length, Connection: close
+    (see openai_server.py's start_stream) — the shape that exposed #cluster-1."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        for chunk in (b"data: {\"delta\":\"hel\"}\n\n", b"data: {\"delta\":\"lo\"}\n\n",
+                      b"data: [DONE]\n\n"):
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class MasterStreamingProxyTest(unittest.TestCase):
+    def test_post_proxy_is_close_framed_like_the_agent(self):
+        """Regression for #cluster-1: master used to strip Connection AND
+        Content-Length from the proxied response, leaving the HTTP/1.1 client with
+        no way to detect end-of-body — the browser UI hung forever ('stuck
+        loading') even though the agent had already finished and returned 200."""
+        registry = NodeRegistry()
+        agent = HTTPServer(("127.0.0.1", 0), _FakeStreamingAgentHandler)
+        agent_port = agent.server_address[1]
+        agent_thread = threading.Thread(target=agent.serve_forever, daemon=True)
+        agent_thread.start()
+        registry.register("node-a", "127.0.0.1", agent_port, "hy3-colibri",
+                          {"host": "127.0.0.1"})
+        http_srv = MasterHTTPServer(("127.0.0.1", 0), registry)
+        http_port = http_srv.server_address[1]
+        http_thread = threading.Thread(target=http_srv.serve_forever, daemon=True)
+        http_thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", http_port, timeout=2)
+            body = json.dumps({"model": "hy3-colibri", "stream": True}).encode()
+            conn.request("POST", "/v1/chat/completions", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            # The bug: without Connection: close (and no Content-Length/chunked
+            # framing), this read() blocks forever waiting for a length that never
+            # comes. A passing test here means the fix landed; a hang means it didn't.
+            data = resp.read()
+            self.assertIn(b"[DONE]", data)
+            self.assertEqual(resp.getheader("Connection"), "close")
+            conn.close()
+        finally:
+            http_srv.shutdown()
             agent.shutdown()
 
 

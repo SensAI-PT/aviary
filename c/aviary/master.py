@@ -163,11 +163,22 @@ class MasterHTTPHandler(APIHandler):
                 headers={"Content-Type": self.headers.get("Content-Type", "application/json"),
                          "Accept": self.headers.get("Accept", "*/*")})
             self.send_response(status)
+            has_length = False
             for key, value in resp_headers.items():
                 lower = key.lower()
-                if lower in ("transfer-encoding", "connection", "content-length"):
+                if lower in ("transfer-encoding", "connection"):
                     continue
+                if lower == "content-length":
+                    has_length = True
                 self.send_header(key, value)
+            if not has_length:
+                # Agent's own response was close-framed (streaming SSE: no Content-Length,
+                # no chunked Transfer-Encoding — http.client already de-chunked it for us).
+                # We must say the same to the browser or it hangs forever waiting for a
+                # length/close signal that never comes on our (otherwise HTTP/1.1 keep-alive)
+                # connection to it. This is the fix for the UI stuck-loading bug (#cluster-1).
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             while True:
                 chunk = resp.read(65536)
