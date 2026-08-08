@@ -1,9 +1,18 @@
 _Leggi il leggimi in [Italiano](README.IT.md)._
 
 
-# Colibrì Guide - Local Inference Engine
+# Aviary / Colibrì Guide — Local Inference Engine
 
-A simple guide to running **Colibrì**, a local inference engine based on GLM 5.2, without needing programming knowledge. If you already have Docker installed, you are well on your way.
+> **This is the [Aviary](https://github.com/SensAI-PT/aviary-hy3) repository** — a
+> cluster overlay on [Colibri](https://github.com/JustVugg/colibri). For **multi-node
+> cluster** setup, use `coli master` and `coli agent` directly (see
+> [`docs/AVIARY.md`](../docs/AVIARY.md)); this Docker guide covers **single-node**
+> Colibri inference only. Upstream Colibri Docker docs:
+> [JustVugg/colibri/docker](https://github.com/JustVugg/colibri/tree/main/docker).
+
+A simple guide to running **Colibrì** (the engine inside Aviary), a local inference
+engine based on GLM 5.2, without needing programming knowledge. If you already have
+Docker installed, you are well on your way.
 
 ---
 
@@ -31,7 +40,13 @@ A simple guide to running **Colibrì**, a local inference engine based on GLM 5.
 
 ## What is Colibrì?
 
-Colibrì is an application that allows you to run an artificial intelligence model (GLM 5.2) directly on your computer, without connecting to external servers. It is also possible to run it in Docker, which isolates the application from the rest of the system.
+Colibrì is the inference engine that powers Aviary — it runs artificial intelligence
+models directly on your computer, without connecting to external servers. It is also
+possible to run it in Docker, which isolates the application from the rest of the system.
+
+For cluster mode (multiple machines, one dashboard), clone
+[Aviary](https://github.com/SensAI-PT/aviary-hy3) and use `coli master` / `coli agent`
+instead of Docker.
 
 > **Important note**: The model is very large. Expect to wait several minutes for an answer to a simple question, especially with low RAM. At the end of this readme, you will see the result on my PC (without a discrete graphics card), and I reach 0.01 tokens per second.
 

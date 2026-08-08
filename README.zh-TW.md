@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì——小巧引擎，龐大模型">
+  <img src="assets/colibri.svg" width="500" alt="Aviary — 分散式 Colibri 叢集">
 </p>
 
 <p align="center">
@@ -7,16 +7,44 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
 </p>
 
-**小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
-2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
+<p align="center">
+  <strong>Aviary</strong> — 基於 <a href="https://github.com/JustVugg/colibri">Colibri</a>
+  推論引擎的自組織叢集
+</p>
 
-目前可執行四個模型家族：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）與 **OLMoE**（7B）——各自一個 C 檔案，共用同一套 `coli chat` /
-`coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
+**將 N 個 Colibri 節點組成一個叢集。** Aviary 在 [Colibri](https://github.com/JustVugg/colibri)
+推論引擎之上增加 master 排程器、worker agent 與 Spark 風格的叢集儀表板。將 Web UI 或任意
+OpenAI 用戶端指向 master — 每個請求路由到負載最低的健康 agent。每個 agent 仍執行模型的
+完整本地副本（階段 1：全副本負載平衡；跨節點 expert 執行在階段 2）。
 
-> **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在
-> 完整的軟硬體邊界上追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、
-> 推測解碼以及 CPU/GPU 重疊執行——讓大型模型減少對稀缺硬體的依賴，並降低執行成本。
+底層引擎與 Colibri 相同：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
+（2.8T）與 **OLMoE**（7B）——各自一個 C 檔案，共用 `coli chat` / `coli serve` /
+`coli web` 前端。[完整清單](README.md#other-supported-models)
+
+> **Aviary 擁有叢集控制平面；[Colibri](https://github.com/JustVugg/colibri) 擁有引擎。**
+> 詳見 [`docs/AVIARY.md`](docs/AVIARY.md) 與 [`docs/cluster_protocol.md`](docs/cluster_protocol.md)。
+
+## Aviary 叢集（階段 1）
+
+| 元件 | 命令 | 預設埠 | 職責 |
+|---|---|---|---|
+| **master** | `./c/coli master` | HTTP `9000`，控制 `9002` | 註冊表、心跳、請求路由、儀表板 |
+| **agent** | `./c/coli agent --master URL` | HTTP `8001` | 本地 Colibri `Engine` 子行程 + 遙測轉發 |
+
+```bash
+# 機器 A — master + 第一個 agent
+./c/coli master --host 0.0.0.0 --port 9000
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+
+# 機器 B — 第二個 agent
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+  --advertise-host B
+```
+
+開啟 **http://A:9000** — **Cluster** 分頁顯示已註冊節點及每節點 expert 熱力圖。
+階段 2（跨節點 expert RPC）見 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
+
+> **Colibrì**（Aviary 所包裝的引擎）既是今天就能執行的推論引擎，也是一個開放的研究平台。
 
 Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SLA 承諾，對語意則給出硬性保證**：
 實驗必須透過可重現的端到端測量證明價值；預設策略**絕不會在未告知的情況下改變模型精度或
@@ -211,27 +239,20 @@ MTP head 必須是 **int8**（int4 head 的接受率會崩落到 0–4%，見
 你需要兩樣東西：**程式本體**（幾百 KB）與**模型**（372 GB）。各平台的逐步
 指引請見 [Quick Start 指南](docs/quickstart.md)。
 
-### 1. 取得 colibri
+### 1. 取得 Aviary
 
-**下載預先建置的版本**——Linux、macOS 與 Windows 均已提供，不需要編譯器。從
-[Releases](https://github.com/JustVugg/colibri/releases) 下載對應平台的壓縮檔並解壓：
+**克隆本倉庫** — Aviary 不是上游 Colibri 發行版，而是基於同步 Colibri 程式碼的叢集疊加層：
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
+./setup.sh                                # 檢查 gcc/OpenMP，編譯引擎，自測
 python3 coli info                         # engine ready ✓
 ```
 
-裡面包含引擎（`colibri`，Windows 上為 `colibri.exe`）、`coli` 啟動器及其 Python
-輔助腳本。不需重新命名或設定：`coli` 會自動找到同目錄下的引擎。你只需安裝
-[Python 3](https://www.python.org/downloads/)——啟動器與 API gateway 是 Python
-腳本，而引擎本身是零相依的純 C 程式。
-
-**或者從原始碼建置**——需要具備 OpenMP 的 `gcc`（或 clang）：
-
-```bash
-git clone https://github.com/JustVugg/colibri && cd colibri/c
-./setup.sh                                # 檢查 gcc/OpenMP、建置並執行自我測試
-```
+`c/` 目錄包含 Colibri 引擎、`coli` 啟動器（含 `master` / `agent` 子命令）以及
+Aviary 控制平面（`c/aviary/`）。上游
+[Colibri Releases](https://github.com/JustVugg/colibri/releases) 預編譯包**不包含**
+叢集命令 — 請使用本倉庫執行 `coli master` / `coli agent`。
 
 想把 `coli` 加入 PATH？在 checkout 中執行 `pip install -e .` 即可註冊（引擎仍位於
 `c/` 目錄——這是從複製目錄做的可編輯安裝，而非獨立 wheel）。

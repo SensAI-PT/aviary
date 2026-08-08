@@ -1,7 +1,9 @@
 # Tools
 
-These scripts support model preparation and offline engineering work. They are
-not runtime dependencies of the C engine.
+Offline scripts for model preparation and engineering work in the
+[Aviary](https://github.com/SensAI-PT/aviary-hy3) / [Colibri](https://github.com/JustVugg/colibri)
+tree. They are **not** runtime dependencies of the C engine or the Aviary control plane
+(`c/aviary/`).
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
 - `repack_fp8_passthrough.py`: fmt=8 repack (byte-preserved FP8, resident kinds only;
@@ -14,5 +16,5 @@ Run them from `c/`, for example:
 
 ```sh
 python3 tools/convert_fp8_to_int4.py --selftest
-python3 tools/make_glm_bench_model.py --output /tmp/colibri-bench
+python3 tools/make_glm_bench_model.py --output /tmp/aviary-bench
 ```

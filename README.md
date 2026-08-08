@@ -1,37 +1,71 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
+  <img src="assets/colibri.svg" width="500" alt="Aviary — distributed Colibri cluster">
 </p>
 
 <p align="center">
-  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
-  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+  <strong>Aviary</strong> — a self-organizing cluster for
+  <a href="https://github.com/JustVugg/colibri">Colibri</a> inference engines
 </p>
 
 <p align="center">
-  <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
+  <a href="docs/AVIARY.md"><b>Aviary docs</b></a> ·
+  <a href="https://github.com/JustVugg/colibri"><b>Colibri upstream</b></a> ·
   <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
-**Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
-parameters** — on consumer and heterogeneous hardware, in pure C with zero
-engine dependencies, by treating storage, RAM, and VRAM as one inference
-hierarchy.
+**Turn N Colibri nodes into one cluster.** Aviary adds a master scheduler, worker
+agents, and a Spark-style cluster dashboard on top of the
+[Colibri](https://github.com/JustVugg/colibri) inference engine. Point the web UI
+or any OpenAI client at the master — it routes each request to the least-loaded
+healthy agent. Every agent still runs a complete local copy of the model (Phase 1:
+full-replica load balancing; cross-node expert execution is Phase 2).
 
-Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
-`coli serve` / `coli web` front end. **Hy3** (Tencent, 295B) is also supported
-as a sibling engine. [Full roster ↓](#other-supported-models)
+Under the hood, Aviary ships the same Colibri engines: **GLM-5.2** (744B),
+**Inkling** (975B), **Kimi K3** (2.8T), **OLMoE** (7B), and **Hy3** (295B) —
+one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
+[Full model roster ↓](#other-supported-models)
 
-**Aviary** (this fork’s cluster overlay) runs a fleet of Colibri nodes behind one
-master with Spark-style cluster UI — see [`docs/AVIARY.md`](docs/AVIARY.md).
-Aviary stays model-agnostic: new Colibri engines require no Aviary code changes.
+> **Aviary owns the cluster control plane; [Colibri](https://github.com/JustVugg/colibri)
+> owns the engines.** Aviary must not fork per-model C sources — new Colibri families
+> work in the cluster automatically once `coli` resolves them. See
+> [`docs/AVIARY.md`](docs/AVIARY.md) for the ownership boundary and
+> [`docs/cluster_protocol.md`](docs/cluster_protocol.md) for the wire format.
 
-> **Colibrì is an inference engine you can run today, and an open research
-> platform.** Its primary goal is to pursue inference-side performance across
-> the entire software/hardware boundary — model formats, memory hierarchy,
-> storage I/O, placement, scheduling, kernels, speculation, and CPU/GPU
-> overlap — so large models depend less on scarce hardware and cost less to run.
+## Aviary cluster (Phase 1)
+
+| component | command | default port | role |
+|---|---|---|---|
+| **master** | `./c/coli master` | HTTP `9000`, control `9002` | Registry, heartbeat lease, request routing, dashboard host |
+| **agent** | `./c/coli agent --master URL` | HTTP `8001` | One local Colibri `Engine` subprocess + telemetry relay |
+
+**Quick start** — one master, two agents on different machines (same model path on each):
+
+```bash
+# machine A — master + first agent
+./c/coli master --host 0.0.0.0 --port 9000
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+
+# machine B — second agent
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+  --advertise-host B
+```
+
+Open **http://A:9000** in a browser. Chat goes through the master (`POST /v1/chat/completions`);
+the **Cluster** tab shows registered nodes (hardware, load, uptime) and per-node expert heatmaps.
+Agents heartbeat every 2 s; the master evicts nodes after three missed beats and stops routing
+to them.
+
+Phase 1 routing picks the healthy node with the lowest in-flight request count. Each agent serves
+from its own local disk/RAM/VRAM tiers — the network is never required for correctness. Phase 2
+(cross-node expert RPC during a single forward pass) is planned but not implemented yet; see
+[`aviary-cluster-plan.md`](aviary-cluster-plan.md).
+
+> **Colibrì** (the engine Aviary wraps) is an inference engine you can run today, and an open
+> research platform. Its primary goal is to pursue inference-side performance across the entire
+> software/hardware boundary — model formats, memory hierarchy, storage I/O, placement,
+> scheduling, kernels, speculation, and CPU/GPU overlap — so large models depend less on scarce
+> hardware and cost less to run.
 
 Colibrì treats VRAM, RAM, and storage as one managed memory hierarchy, and it is
 deliberately a place to test aggressive systems ideas — so there is **no SLA on
@@ -308,30 +342,25 @@ You need two things: **the program** (a few hundred KB) and **the model**
 (372 GB). Step-by-step for every platform in the
 [Quick Start guide](docs/quickstart.md).
 
-### 1. Get colibri
+### 1. Get Aviary
 
-**Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
-Take the archive for your platform from
-[Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
+**Clone this repository** — Aviary is not the upstream Colibri release; it is a
+cluster overlay on a synced Colibri base:
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
+./setup.sh                                # checks gcc/OpenMP, builds engines, self-tests
 python3 coli info                         # engine ready ✓
 ```
 
-Inside you get the engine (`colibri`, `colibri.exe` on Windows), the `coli`
-launcher and its Python helpers. Nothing to rename or configure — `coli` finds
-the engine next to itself. You only need
-[Python 3](https://www.python.org/downloads/) installed: the launcher and the
-API gateway are Python scripts, while the engine itself is pure C with zero
-dependencies.
+Inside `c/` you get the Colibri engines (`hy3`, `colibri`, …), the `coli` launcher
+(with `master` and `agent` subcommands), and the Aviary control plane (`c/aviary/`).
+You only need [Python 3](https://www.python.org/downloads/) installed: the launcher
+and API gateway are Python; the engines are pure C with zero dependencies.
 
-**Or build from source** — needs `gcc` (or clang) with OpenMP:
-
-```bash
-git clone https://github.com/JustVugg/colibri && cd colibri/c
-./setup.sh                                # checks gcc/OpenMP, builds, self-tests
-```
+Prebuilt Colibri release archives from
+[JustVugg/colibri Releases](https://github.com/JustVugg/colibri/releases) do **not**
+include Aviary cluster commands — use this repo for `coli master` / `coli agent`.
 
 Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
 engine still lives in `c/` — an editable install from the clone, not a wheel).
@@ -419,6 +448,10 @@ COLI_MODEL=/nvme/hy3_i4        ./coli chat
 ./coli web --model /nvme/inkling_i4               # API + dashboard, same port
 ./coli web --model /nvme/kimi_k3
 ./coli serve --model /nvme/inkling_i4             # API only
+
+# Aviary cluster (any model above — agents must share the same weights)
+./coli master --port 9000
+COLI_MODEL=/nvme/hy3_i4 ./coli agent --master http://127.0.0.1:9000 --port 8001
 ```
 
 For the non-GLM engines `coli chat` starts the gateway locally and attaches the
@@ -439,6 +472,9 @@ Two things that differ per model, both documented in the per-model page:
 
 | topic | doc |
 |---|---|
+| **Aviary cluster** — roles, ownership, sync with Colibri | [docs/AVIARY.md](docs/AVIARY.md) |
+| **Cluster protocol** — agent⇄master wire format | [docs/cluster_protocol.md](docs/cluster_protocol.md) |
+| **Cluster roadmap** — Phase 1–4 plan | [aviary-cluster-plan.md](aviary-cluster-plan.md) |
 | Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
 | Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
@@ -451,23 +487,30 @@ Two things that differ per model, both documented in the per-model page:
 
 ## What's next
 
-- **Inference-systems research is the product.** The current hierarchy is LRU +
-  a learned pin set; active work spans model formats, compression, placement,
-  scheduling, I/O, CPU/GPU kernels, heterogeneous overlap, KV state, and
-  routing-aware speculation. The objective is lower hardware requirements and
-  lower cost per useful token. Everything lands the way this project works:
-  measured end to end, reviewed, and developed in the open.
-- **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+**Aviary cluster roadmap** ([full plan](aviary-cluster-plan.md)):
+
+- **Phase 1 (current):** multi-node registry, heartbeat, dashboard, full-replica
+  request routing — prove topology before cross-node MoE.
+- **Phase 2:** cross-node expert execution (remote placement table, `EXEC_EXPERT`
+  RPC between agents) — validate latency before assuming it wins.
+- **Phase 3:** Spark-style cluster UI — request timelines, replication counts,
+  RPC latency histograms.
+- **Phase 4:** explicit weight hot-swap prefetch across nodes (best-effort,
+  never required for correctness).
+
+**Colibri engine research** (upstream, synced into this tree):
+
+- Inference-systems research remains the engine's core product: LRU + learned pins
+  today; active work on formats, placement, I/O, kernels, and routing-aware speculation.
+- More open models: any MoE with routed experts can use the same tiering. GLM-5.2 and
+  OLMoE run today; **Kimi K2**, **Qwen3 MoE**, **MiniMax** are on the Colibri roadmap.
 
 ## Supporting the project
 
-colibrì started as a one-person project on a 12-core laptop with 25 GB of RAM;
-today its numbers come from a community of real machines. If it's useful to you:
+Aviary builds on the Colibri engine and community. If it's useful to you:
 
-- ⭐ star the repo and share it;
+- ⭐ star [this repo](https://github.com/SensAI-PT/aviary-hy3) and share it;
+- ⭐ star [Colibri upstream](https://github.com/JustVugg/colibri) — Aviary depends on it;
 - 🐛 open issues with benchmark numbers from your hardware — datapoints move
   this project more than anything else;
 - 💬 join the [Discord community](https://discord.gg/fpQxKnRb) to discuss
@@ -479,38 +522,45 @@ today its numbers come from a community of real machines. If it's useful to you:
 ```
 Makefile                  root build/check entry point
 c/
-├── glm.c                 single-file GLM engine
+├── aviary/               Aviary control plane (master, agent, registry, protocol)
+├── hy3.c, colibri.c, …   Colibri per-model engines (synced from upstream)
 ├── st.h, tok.h, json.h   runtime headers
 ├── backend_cuda.*        optional CUDA tier
 ├── Makefile              build and local checks
-├── coli                  user-facing CLI
-├── openai_server.py      OpenAI-compatible HTTP gateway
+├── coli                  user-facing CLI (`master`, `agent`, `serve`, `chat`, …)
+├── openai_server.py      OpenAI-compatible HTTP gateway (used by agents)
 ├── setup.sh              one-command local setup
 ├── tools/                offline conversion, fixtures and benchmarks
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
-web/                      browser UI (pure OpenAI-API client)
+web/                      browser UI — Chat, Brain, Profiling, **Cluster** tabs
 desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media
+docs/                     reference docs, cluster protocol, experiments, media
+aviary-cluster-plan.md    Aviary Phase 1–4 roadmap
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
 headers. From the repository root, `make`, `make check`, and `make clean`
 delegate to the engine Makefile.
 
-## Why "colibrì"
+## Why "Aviary" and "colibrì"
 
-The hummingbird weighs a few grams, hovers in place, and visits a thousand
-flowers a day. This engine keeps a 744-billion-parameter giant alive on
-hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of disk patience.
+**Aviary** — many engines, one flock: each node runs its own Colibri subprocess,
+registered with a master that routes work and aggregates telemetry.
+
+**colibrì** (the hummingbird, upstream engine name) — weighs a few grams, hovers in
+place, and visits a thousand flowers a day. The engine keeps a 744-billion-parameter
+giant alive on hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of
+disk patience.
 
 ## Acknowledgements
 
-colibrì is an engine; the minds it runs are a gift. Thank you to the teams
-releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
-(Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
-contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
-This project is proof of what open weights make possible.
+Aviary builds on [Colibri](https://github.com/JustVugg/colibri) and the Hy3-enabled
+base from [`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3). The
+engines are a gift from open-weight releases — thank you to **Z.ai** (GLM),
+**Moonshot AI** (Kimi), **Alibaba Qwen**, **MiniMax**, **Allen AI** (OLMoE), and
+**Tencent** (Hy3) — and to every Colibri contributor who benchmarked, bisected,
+or sent a patch upstream.
 
 ## License
 

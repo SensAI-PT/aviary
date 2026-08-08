@@ -1,9 +1,16 @@
 _Read the read me in [English](README.md)._
 
 
-# Guida a Colibrì - Motore di Inferenza Locale
+# Guida Aviary / Colibrì — Motore di Inferenza Locale
 
-Una guida semplice per eseguire **Colibrì**, un motore di inferenza locale basato su GLM 5.2, senza conoscenze di programmazione. Se hai già Docker installato, sei a buon punto.
+> **Questo è il repository [Aviary](https://github.com/SensAI-PT/aviary-hy3)** — overlay
+> cluster su [Colibri](https://github.com/JustVugg/colibri). Per il **cluster multi-nodo**
+> usa `coli master` e `coli agent` (vedi [`docs/AVIARY.md`](../docs/AVIARY.md)); questa
+> guida Docker copre solo l'inferenza **single-node** Colibri.
+
+Una guida semplice per eseguire **Colibrì** (il motore dentro Aviary), un motore di
+inferenza locale basato su GLM 5.2, senza conoscenze di programmazione. Se hai già
+Docker installato, sei a buon punto.
 
 ---
 
@@ -31,7 +38,13 @@ Una guida semplice per eseguire **Colibrì**, un motore di inferenza locale basa
 
 ## Cosa è Colibrì?
 
-Colibrì è un'applicazione che ti permette di eseguire un modello di intelligenza artificiale (GLM 5.2) direttamente sul tuo computer, senza connettersi a server esterni. È possbile anche farlo girare in Docker, che isola l'applicazione dal resto del sistema.
+Colibrì è il motore di inferenza che alimenta Aviary — esegue modelli di intelligenza
+artificiale direttamente sul tuo computer, senza connettersi a server esterni. È
+possibile anche farlo girare in Docker, che isola l'applicazione dal resto del sistema.
+
+Per la modalità cluster (più macchine, una dashboard), clona
+[Aviary](https://github.com/SensAI-PT/aviary-hy3) e usa `coli master` / `coli agent`
+invece di Docker.
 
 > **Nota importante**: Il modello è molto grande. Attendi anche diversi minuti per una risposta a una domanda semplice, specialmente con poca RAM. Alla fine di questo readme vedrai il risultato sul mio PC (senza scheda grafica discreta) e arrivo a 0.01 token al secondo.
 

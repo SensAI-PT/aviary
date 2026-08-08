@@ -1,6 +1,6 @@
 # Efficiency suite — regression tests + optimization dossier
 
-Two layers:
+Colibri engine instrumentation tests for the Aviary tree. Two layers:
 
 1. **`test_inefficiency.py`** — tiny-model *asserted* regression tests. Fast
    (~0.15s/run), gate CI, catch breakage. Run as part of `make test`.

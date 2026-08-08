@@ -1,7 +1,11 @@
 # Expert Atlas — what does each of the 19,456 experts actually do?
 
-Probe harness for #175. Runs a set of topic-tagged prompts, dumps each run's expert-routing
-histogram, and turns them into a per-expert topic-affinity vector.
+Probe harness for #175 (Colibri engine). Runs a set of topic-tagged prompts, dumps each
+run's expert-routing histogram, and turns them into a per-expert topic-affinity vector.
+
+In Aviary cluster mode, each agent maintains its own `.coli_usage`; atlas sweeps remain
+**single-node** offline work — run them on one model directory before or beside cluster
+deployment.
 
 ```bash
 cd c

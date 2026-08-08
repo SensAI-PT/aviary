@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — motore piccolo, modello immenso">
+  <img src="assets/colibri.svg" width="500" alt="Aviary — cluster Colibri distribuito">
 </p>
 
 <p align="center">
@@ -7,21 +7,48 @@
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
-**Motore piccolo, modello immenso.** Esegui **modelli MoE di frontiera — da 744
-miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogeneo,
-in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
-un'unica gerarchia di inferenza.
+<p align="center">
+  <strong>Aviary</strong> — cluster auto-organizzato per motori di inferenza
+  <a href="https://github.com/JustVugg/colibri">Colibri</a>
+</p>
 
-Oggi girano quattro famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia `coli chat` /
-`coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+**Trasforma N nodi Colibri in un unico cluster.** Aviary aggiunge uno scheduler
+master, agent worker e una dashboard in stile Spark sopra il motore
+[Colibri](https://github.com/JustVugg/colibri). Punta la UI web o qualsiasi
+client OpenAI al master — ogni richiesta va al nodo sano meno carico. Ogni agent
+esegue ancora una copia completa del modello (Fase 1: bilanciamento a replica
+completa; esecuzione cross-node degli expert in Fase 2).
 
-> **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
-> ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di
-> inferenza lungo l'intero confine software/hardware — formati dei modelli,
-> gerarchia di memoria, I/O dello storage, piazzamento, scheduling, kernel,
-> speculazione e sovrapposizione CPU/GPU — affinché i grandi modelli dipendano
-> meno da hardware raro e costino meno.
+Oggi girano le stesse famiglie Colibri: **GLM-5.2** (744B), **Inkling** (975B),
+**Kimi K3** (2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia
+`coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+
+> **Aviary possiede il piano di controllo del cluster; [Colibri](https://github.com/JustVugg/colibri)
+> possiede i motori.** Vedi [`docs/AVIARY.md`](docs/AVIARY.md) e
+> [`docs/cluster_protocol.md`](docs/cluster_protocol.md).
+
+## Cluster Aviary (Fase 1)
+
+| componente | comando | porta | ruolo |
+|---|---|---|---|
+| **master** | `./c/coli master` | HTTP `9000`, controllo `9002` | Registro, heartbeat, routing, dashboard |
+| **agent** | `./c/coli agent --master URL` | HTTP `8001` | Un subprocess `Engine` Colibri + telemetria |
+
+```bash
+# macchina A — master + primo agent
+./c/coli master --host 0.0.0.0 --port 9000
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+
+# macchina B — secondo agent
+COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+  --advertise-host B
+```
+
+Apri **http://A:9000** — la scheda **Cluster** mostra i nodi e le heatmap EMAP per nodo.
+La Fase 2 (RPC expert cross-node) è pianificata: [`aviary-cluster-plan.md`](aviary-cluster-plan.md).
+
+> **Colibrì** (il motore sottostante) è un motore di inferenza che puoi usare oggi, e una
+> piattaforma di ricerca aperta.
 
 Colibrì è intenzionalmente un luogo dove verificare idee di sistema aggressive —
 quindi **nessuno SLA sulla velocità, e una garanzia dura sulla semantica**: gli
@@ -247,29 +274,21 @@ Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
 (372 GB). Guida passo passo per tutte le piattaforme nella
 [Quick Start](docs/quickstart.md).
 
-### 1. Procurati colibri
+### 1. Procurati Aviary
 
-**Scarica una release già compilata** — Linux, macOS e Windows, nessun
-compilatore necessario. Prendi l'archivio della tua piattaforma dalla pagina
-[Releases](https://github.com/JustVugg/colibri/releases) e scompattalo:
+**Clona questo repository** — Aviary non è la release upstream di Colibri; è un
+overlay cluster sulla base Colibri sincronizzata:
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
+./setup.sh                                # verifica gcc/OpenMP, compila, autotest
 python3 coli info                         # engine ready ✓
 ```
 
-Dentro trovi il motore (`colibri`, `colibri.exe` su Windows), il launcher `coli`
-e i suoi script Python di supporto. Niente da rinominare o configurare: `coli`
-trova il motore accanto a sé. Serve solo avere
-[Python 3](https://www.python.org/downloads/) installato — il launcher e il
-gateway API sono script Python, mentre il motore è C puro senza dipendenze.
-
-**Oppure compila dai sorgenti** — servono `gcc` (o clang) con OpenMP:
-
-```bash
-git clone https://github.com/JustVugg/colibri && cd colibri/c
-./setup.sh                                # verifica gcc/OpenMP, compila, autotest
-```
+In `c/` trovi i motori Colibri, il launcher `coli` (con i sottocomandi `master` e
+`agent`) e il piano di controllo Aviary (`c/aviary/`). Le release precompilate di
+[Colibri](https://github.com/JustVugg/colibri/releases) **non** includono i comandi
+cluster — usa questo repo per `coli master` / `coli agent`.
 
 Vuoi `coli` nel PATH? Da un checkout, `pip install -e .` lo registra (il motore
 resta in `c/` — è un'installazione editabile dal clone, non un wheel).
