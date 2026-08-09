@@ -229,4 +229,4 @@ GET /cluster/shard?name=<safetensors_filename>
 Heartbeats may include `trace_events` (per-request RPC trace) and `rpc_samples` (latency
 measurements) for the Cluster dashboard.
 
-See [`aviary-cluster-plan.md`](../aviary-cluster-plan.md) for the full roadmap.
+See [`AVIARY.md`](AVIARY.md) for the cluster roadmap and feature status.

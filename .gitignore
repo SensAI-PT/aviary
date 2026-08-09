@@ -102,3 +102,6 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# Local-only cluster roadmap (kept on disk, not versioned)
+aviary-cluster-plan.md

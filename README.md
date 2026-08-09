@@ -9,7 +9,7 @@
 <p align="center">
   <a href="docs/AVIARY.md"><b>Aviary docs</b></a> ·
   <a href="docs/qwen3_moe.md"><b>Qwen3 test model</b></a> ·
-  <a href="aviary-cluster-plan.md"><b>Roadmap</b></a> ·
+  <a href="docs/AVIARY.md"><b>Roadmap</b></a> ·
   <a href="https://github.com/JustVugg/colibri"><b>Colibri (engines)</b></a>
 </p>
 
@@ -86,7 +86,7 @@ to the same local path single-node Colibri uses today.
 Phase 2 is enabled with `AVIARY_CLUSTER=1` on agents. The placement scheduler recomputes every
 few seconds from live telemetry — not per token.
 
-Details: [`aviary-cluster-plan.md`](aviary-cluster-plan.md) · [`docs/AVIARY.md`](docs/AVIARY.md)
+Details: [`docs/AVIARY.md`](docs/AVIARY.md)
 
 ## Recommended test model: Qwen3-30B-A3B
 
@@ -190,7 +190,7 @@ Same weights on disk on every agent; same `COLI_MODEL` path (or equivalent copy 
 | Aviary overview, env vars, Phase 2 | [docs/AVIARY.md](docs/AVIARY.md) |
 | Qwen3 test model (convert, oracle, cluster) | [docs/qwen3_moe.md](docs/qwen3_moe.md) |
 | Agent⇄master wire format | [docs/cluster_protocol.md](docs/cluster_protocol.md) |
-| Cluster roadmap | [aviary-cluster-plan.md](aviary-cluster-plan.md) |
+| Cluster roadmap | [docs/AVIARY.md](docs/AVIARY.md) |
 | OpenAI API, web dashboard | [docs/api.md](docs/api.md) |
 | Colibri engines, tuning, benchmarks | [Colibri repository](https://github.com/JustVugg/colibri) |
 
@@ -206,7 +206,6 @@ c/
 └── setup.sh              build + tiny self-test
 web/                      dashboard — Chat, Brain, Profiling, Cluster tabs
 docs/                     Aviary + synced engine docs
-aviary-cluster-plan.md    Phase 1–4 plan
 ```
 
 The Colibri engine tree (`colibri.c`, `hy3.c`, headers, backends, …) lives alongside Aviary

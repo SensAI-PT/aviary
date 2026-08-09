@@ -156,6 +156,5 @@ re-apply the Aviary overlay (`c/aviary/`, `coli master`/`agent`, Cluster tab).
 ## Further reading
 
 - [`cluster_protocol.md`](cluster_protocol.md) — agent⇄master wire format
-- [`aviary-cluster-plan.md`](../aviary-cluster-plan.md) — Phase 1–4 roadmap and checklists
 - [`serve_protocol.md`](serve_protocol.md) — engine⇄server mux protocol (telemetry source)
 - [Colibri upstream](https://github.com/JustVugg/colibri) — engines, benchmarks, model roster

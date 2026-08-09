@@ -40,7 +40,7 @@ export AVIARY_CLUSTER=1
 COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 ```
 
-Apri **http://A:9000** — scheda **Cluster**. Piano completo: [`aviary-cluster-plan.md`](aviary-cluster-plan.md).
+Apri **http://A:9000** — scheda **Cluster**. Piano completo: [`docs/AVIARY.md`](docs/AVIARY.md).
 
 > **Colibrì** (il motore sottostante) è un motore di inferenza che puoi usare oggi, e una
 > piattaforma di ricerca aperta.

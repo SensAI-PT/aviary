@@ -42,7 +42,7 @@ export AVIARY_CLUSTER=1
 COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 ```
 
-開啟 **http://A:9000** — **Cluster** 分頁。詳見 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
+開啟 **http://A:9000** — **Cluster** 分頁。詳見 [`docs/AVIARY.md`](docs/AVIARY.md)。
 
 > **Colibrì**（Aviary 所包裝的引擎）既是今天就能執行的推論引擎，也是一個開放的研究平台。
 

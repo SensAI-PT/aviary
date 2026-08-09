@@ -48,7 +48,7 @@ COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 -
 ```
 
 打开 **http://A:9000** — **Cluster** 标签页显示 Jobs、Executors、Placement 与 RPC 延迟。
-完整路线图见 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
+完整路线图见 [`docs/AVIARY.md`](docs/AVIARY.md)。
 
 > **Colibrì**（Aviary 所包装的引擎）既是今天就能运行的推理引擎，也是一个开放的研究平台。
 
