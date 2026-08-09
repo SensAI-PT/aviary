@@ -82,6 +82,17 @@ export interface ClusterNodesResponse {
   merged_usage?: Array<{ layer: number; expert: number; count: number }>
 }
 
+export interface ClusterJobTrace {
+  ts: number
+  job_id?: string
+  kind: string
+  node_id: string
+  layer: number
+  expert: number
+  local?: boolean
+  rpc_us?: number
+}
+
 export interface ClusterJob {
   job_id: string
   node_id: string
@@ -93,6 +104,7 @@ export interface ClusterJob {
   duration_sec: number
   http_status: number | null
   error: string | null
+  trace?: ClusterJobTrace[]
 }
 
 export interface ClusterJobsResponse {
@@ -103,12 +115,29 @@ export interface ClusterJobsResponse {
   failed_count: number
 }
 
+export interface ClusterLayerBlock {
+  start: number
+  end: number
+}
+
+export interface ClusterRpcHistogram {
+  count: number
+  buckets: Array<{ max_us: number; count: number }>
+  over_max?: number
+  p50_us: number
+  p95_us: number
+  window_sec: number
+}
+
 export interface ClusterPlacementResponse {
   experts: Record<string, string>
   expert_tiers: Record<string, number>
   rpc_matrix_us: Record<string, Record<string, number>>
   computed_at: number
   usage_top: Array<{ layer: number; expert: number; count: number }>
+  blocks?: Record<string, ClusterLayerBlock[]>
+  reassignments?: number
+  rpc_histogram?: ClusterRpcHistogram
 }
 
 export interface ClusterOverviewResponse {

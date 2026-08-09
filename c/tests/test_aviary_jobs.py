@@ -4,12 +4,12 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.request import Request, urlopen
 
 from aviary.jobs import JobTracker
 from aviary.master import MasterHTTPServer
 from aviary.placement import PlacementScheduler
 from aviary.registry import NodeRegistry
-from urllib.request import Request, urlopen
 
 
 class _SlowAgentHandler(BaseHTTPRequestHandler):
@@ -52,6 +52,20 @@ class ClusterJobsTest(unittest.TestCase):
         finally:
             http.shutdown()
             agent.shutdown()
+
+
+class ClusterJobTraceTest(unittest.TestCase):
+    def test_append_trace_to_active_job(self):
+        jobs = JobTracker()
+        job = jobs.start("node-a", "http://127.0.0.1:8001", "/v1/chat/completions")
+        jobs.append_trace(job.job_id, [{
+            "ts": 1.0, "job_id": job.job_id, "kind": "rpc_in", "node_id": "node-a",
+            "layer": 3, "expert": 7, "local": True, "rpc_us": 1200.0,
+        }])
+        jobs.finish(job.job_id, http_status=200)
+        snap = jobs.snapshot()
+        self.assertEqual(len(snap["history"][0]["trace"]), 1)
+        self.assertEqual(snap["history"][0]["trace"][0]["layer"], 3)
 
 
 if __name__ == "__main__":

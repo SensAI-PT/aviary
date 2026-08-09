@@ -17,8 +17,9 @@ from urllib.parse import urlsplit
 
 from aviary.jobs import JobTracker
 from aviary.placement import PlacementScheduler
-from aviary.protocol import ProtocolError, placement_frame, read_frame, write_line
+from aviary.protocol import ProtocolError, evict_frame, load_frame, pin_frame, placement_frame, read_frame, write_line
 from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC, NodeRegistry
+from aviary.rpc_hist import RpcHistogram
 
 try:
     from openai_server import APIHandler, DEFAULT_CORS_ORIGINS, model_object
@@ -33,9 +34,12 @@ class ControlPlaneServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, registry: NodeRegistry):
+    def __init__(self, address, registry: NodeRegistry, jobs: JobTracker | None = None,
+                 scheduler: PlacementScheduler | None = None):
         super().__init__(address, ControlPlaneHandler)
         self.registry = registry
+        self.jobs = jobs
+        self.scheduler = scheduler
 
 
 class ControlPlaneHandler(socketserver.BaseRequestHandler):
@@ -66,7 +70,18 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
                     node_id = fields[1]
                     inflight = int(fields[2])
                     registry.set_control_conn(node_id, conn)
-                    if registry.heartbeat(node_id, inflight, payload):
+                    record = registry.heartbeat(node_id, inflight, payload)
+                    if record:
+                        jobs = getattr(self.server, "jobs", None)  # type: ignore[attr-defined]
+                        scheduler = getattr(self.server, "scheduler", None)  # type: ignore[attr-defined]
+                        if jobs and payload.get("trace_events"):
+                            for ev in payload["trace_events"]:
+                                jid = ev.get("job_id")
+                                if jid:
+                                    jobs.append_trace(jid, [ev])
+                        if scheduler and payload.get("rpc_samples"):
+                            for sample in payload["rpc_samples"]:
+                                scheduler.record_rpc(sample["src"], sample["dst"], float(sample["us"]))
                         write_line(conn, f"HEARTBEAT_ACK {node_id}")
                 elif kind == "DEREGISTER" and len(fields) >= 2:
                     node_id = fields[1]
@@ -144,7 +159,9 @@ class MasterHTTPHandler(APIHandler):
             return
         if path == "/cluster/placement":
             scheduler = self.server.scheduler  # type: ignore[attr-defined]
-            self.send_json(200, scheduler.snapshot())
+            registry = self.server.registry  # type: ignore[attr-defined]
+            node_ids = [n["node_id"] for n in registry.snapshot().get("nodes", [])]
+            self.send_json(200, scheduler.snapshot(node_ids))
             return
         if path == "/cluster/costs":
             scheduler = self.server.scheduler  # type: ignore[attr-defined]
@@ -159,9 +176,10 @@ class MasterHTTPHandler(APIHandler):
             registry = self.server.registry  # type: ignore[attr-defined]
             scheduler = self.server.scheduler  # type: ignore[attr-defined]
             jobs = self.server.jobs  # type: ignore[attr-defined]
+            node_ids = [n["node_id"] for n in registry.snapshot().get("nodes", [])]
             self.send_json(200, {
                 "nodes": registry.snapshot(),
-                "placement": scheduler.snapshot(),
+                "placement": scheduler.snapshot(node_ids),
                 "jobs": jobs.snapshot(),
                 "updated_at": time.time(),
             })
@@ -206,7 +224,8 @@ class MasterHTTPHandler(APIHandler):
             status, resp_headers, resp = self._proxy_raw(
                 node, "POST", path, body=body,
                 headers={"Content-Type": self.headers.get("Content-Type", "application/json"),
-                         "Accept": self.headers.get("Accept", "*/*")})
+                         "Accept": self.headers.get("Accept", "*/*"),
+                         **({"X-Aviary-Job-Id": job.job_id} if job else {})})
             self.send_response(status)
             if job:
                 self.send_header("X-Aviary-Job-Id", job.job_id)
@@ -283,8 +302,11 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
     nodes = snap.get("nodes") or []
     if len(nodes) < 1:
         return
-    scheduler.recompute(nodes)
+    plan = scheduler.recompute(nodes)
     conns = registry.control_connections()
+    from aviary.placement import MAX_PIN_PER_TICK
+
+    sent_pins: set[tuple[str, int, int, int]] = set()
     for node in nodes:
         nid = node["node_id"]
         conn = conns.get(nid)
@@ -293,14 +315,50 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
         try:
             payload = scheduler.build_agent_payload(nid, nodes, int(node.get("expert_port", 9003)))
             conn.sendall(placement_frame(payload).encode("utf-8"))
+            for layer, eid, tier in (plan.pin_commands.get(nid) or [])[:MAX_PIN_PER_TICK]:
+                key = (nid, layer, eid, tier)
+                if key in sent_pins:
+                    continue
+                sent_pins.add(key)
+                conn.sendall(pin_frame(layer, eid, tier).encode("utf-8"))
         except OSError as error:
             print(f"[aviary-master] placement push to {nid} failed: {error}", file=sys.stderr)
+
+
+def _rpc_probe(registry: NodeRegistry, scheduler: PlacementScheduler) -> None:
+    nodes = [n for n in registry.healthy_nodes() if n.status == "healthy"]
+    if len(nodes) < 2:
+        return
+    import socket as sock_mod
+
+    for src in nodes:
+        for dst in nodes:
+            if src.node_id == dst.node_id:
+                continue
+            host, port = dst.host, int(dst.expert_port)
+            try:
+                conn = sock_mod.create_connection((host, port), timeout=0.2)
+                t0 = time.perf_counter()
+                conn.sendall(b"PING\n")
+                buf = b""
+                while b"\n" not in buf and len(buf) < 64:
+                    chunk = conn.recv(64)
+                    if not chunk:
+                        break
+                    buf += chunk
+                us = (time.perf_counter() - t0) * 1e6
+                conn.close()
+                if buf.startswith(b"PONG"):
+                    scheduler.record_rpc(src.node_id, dst.node_id, us)
+            except OSError:
+                pass
 
 
 def _placement_ticker(registry: NodeRegistry, scheduler: PlacementScheduler, stop: threading.Event):
     while not stop.wait(DEFAULT_PLACEMENT_SEC):
         try:
             _push_placement(registry, scheduler)
+            _rpc_probe(registry, scheduler)
         except Exception as error:
             print(f"[aviary-master] placement error: {error}", file=sys.stderr)
 
@@ -329,7 +387,8 @@ def run_master(host="0.0.0.0", port=9000, control_port=None, api_key=None, cors_
         target=_placement_ticker, args=(registry, scheduler, stop), daemon=True)
     placement_thread.start()
 
-    control = ControlPlaneServer((host if host != "0.0.0.0" else "", control_port), registry)
+    control = ControlPlaneServer((host if host != "0.0.0.0" else "", control_port), registry,
+                                 jobs, scheduler)
     control_thread = threading.Thread(
         target=control.serve_forever, name="aviary-control-plane", daemon=True)
     control_thread.start()

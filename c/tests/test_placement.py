@@ -2,7 +2,7 @@
 
 import unittest
 
-from aviary.placement import PlacementScheduler, decode_emap
+from aviary.placement import PlacementScheduler, blocks_from_experts, decode_emap
 
 
 class DecodeEmapTest(unittest.TestCase):
@@ -48,6 +48,11 @@ class PlacementSchedulerTest(unittest.TestCase):
         payload = sched.build_agent_payload("a", nodes, 9003)
         self.assertEqual(payload["node_id"], "a")
         self.assertIn("b", payload["peers"])
+
+    def test_blocks_from_experts(self):
+        blocks = blocks_from_experts({"0:1": "a", "1:2": "a", "3:4": "b"}, ["a", "b"])
+        self.assertEqual(blocks["a"], [{"start": 0, "end": 1}])
+        self.assertEqual(blocks["b"], [{"start": 3, "end": 3}])
 
 
 if __name__ == "__main__":

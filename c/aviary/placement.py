@@ -9,9 +9,42 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from aviary.rpc_hist import RpcHistogram
+
 
 DEFAULT_RECOMPUTE_SEC = float(os.environ.get("AVIARY_PLACEMENT_SEC", "4"))
 EXPLORE_RATE = float(os.environ.get("AVIARY_EXPLORE_RATE", "0.01"))
+MAX_PIN_PER_TICK = int(os.environ.get("AVIARY_PIN_BATCH", "32"))
+
+
+def blocks_from_experts(experts: dict[str, str], node_ids: list[str]) -> dict[str, list[dict[str, int]]]:
+    """Aggregate expert assignments into contiguous layer ranges per node."""
+    by_node: dict[str, set[int]] = {nid: set() for nid in node_ids}
+    for key, nid in experts.items():
+        if ":" not in key:
+            continue
+        layer_s, _ = key.split(":", 1)
+        try:
+            by_node.setdefault(nid, set()).add(int(layer_s))
+        except ValueError:
+            continue
+    out: dict[str, list[dict[str, int]]] = {}
+    for nid, layers in by_node.items():
+        if not layers:
+            out[nid] = []
+            continue
+        sorted_layers = sorted(layers)
+        ranges: list[dict[str, int]] = []
+        start = prev = sorted_layers[0]
+        for layer in sorted_layers[1:]:
+            if layer == prev + 1:
+                prev = layer
+                continue
+            ranges.append({"start": start, "end": prev})
+            start = prev = layer
+        ranges.append({"start": start, "end": prev})
+        out[nid] = ranges
+    return out
 
 
 def decode_emap(emap: dict[str, Any] | None) -> dict[tuple[int, int], dict[str, int]]:
@@ -60,7 +93,10 @@ class PlacementScheduler:
         self._rpc_us: dict[str, dict[str, float]] = {}
         self._usage: dict[tuple[int, int], int] = {}
         self._last_plan: PlacementPlan | None = None
+        self._prev_experts: dict[str, str] = {}
+        self._reassignments: int = 0
         self._median_exec: dict[int, float] = {0: 500_000.0, 1: 50_000.0, 2: 10_000.0}
+        self.rpc_histogram = RpcHistogram()
 
     def ingest_costs(self, node_id: str, samples: list[dict[str, Any]]) -> None:
         bucket = self._costs.setdefault(node_id, {})
@@ -82,6 +118,7 @@ class PlacementScheduler:
 
     def record_rpc(self, src: str, dst: str, us: float) -> None:
         self._rpc_us.setdefault(src, {})[dst] = us
+        self.rpc_histogram.record(us)
 
     def _exec_cost(self, node_id: str, layer: int, expert: int, tier: int) -> float:
         cs = self._costs.get(node_id, {}).get((layer, expert, tier))
@@ -159,6 +196,11 @@ class PlacementScheduler:
                 plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
 
         plan.rpc_matrix_us = {k: dict(v) for k, v in self._rpc_us.items()}
+        if self._prev_experts:
+            self._reassignments += sum(
+                1 for key, nid in plan.experts.items()
+                if self._prev_experts.get(key) != nid)
+        self._prev_experts = dict(plan.experts)
         self._last_plan = plan
         return plan
 
@@ -175,14 +217,19 @@ class PlacementScheduler:
     def last_plan(self) -> PlacementPlan | None:
         return self._last_plan
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, node_ids: list[str] | None = None) -> dict[str, Any]:
         plan = self._last_plan
+        experts = dict(plan.experts) if plan else {}
+        ids = node_ids or sorted({nid for nid in experts.values()})
         return {
-            "experts": dict(plan.experts) if plan else {},
+            "experts": experts,
             "expert_tiers": dict(plan.expert_tiers) if plan else {},
             "rpc_matrix_us": dict(plan.rpc_matrix_us) if plan else {},
             "computed_at": plan.computed_at if plan else 0.0,
             "usage_top": [{"layer": l, "expert": e, "count": c}
                              for (l, e), c in sorted(self._usage.items(),
                                                      key=lambda kv: -kv[1])[:32]],
+            "blocks": blocks_from_experts(experts, ids),
+            "reassignments": self._reassignments,
+            "rpc_histogram": self.rpc_histogram.snapshot(),
         }

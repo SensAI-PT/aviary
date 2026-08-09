@@ -6,7 +6,10 @@ import unittest
 
 from aviary.identity import load_or_create_node_id, node_id_path
 from aviary.protocol import (
+    evict_frame,
     heartbeat_frame,
+    load_frame,
+    pin_frame,
     read_frame,
     register_frame,
     send_frame,
@@ -21,6 +24,11 @@ class ProtocolTest(unittest.TestCase):
         frame = register_frame("abc", 8001, "hy3", payload)
         self.assertIn("REGISTER abc 8001 hy3", frame)
         self.assertIn('"host"', frame)
+
+    def test_pin_frames(self):
+        self.assertEqual(pin_frame(3, 7, 1), "PIN 3 7 1\n")
+        self.assertEqual(load_frame(3, 7, 0), "LOAD 3 7 0\n")
+        self.assertEqual(evict_frame(3, 7), "EVICT 3 7\n")
 
     def test_read_write_frames(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

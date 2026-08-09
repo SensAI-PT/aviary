@@ -40,6 +40,10 @@ from disk/RAM/VRAM based on usage. Aviary adds:
 Point any OpenAI-compatible client (or the built-in web UI) at the master. It routes work
 across the flock while tracking which experts are hot on which machine.
 
+**Phase 1 adds concurrent throughput and availability, not pooled model capacity.** Each node
+holds a full model replica on local disk; N nodes ≈ N× concurrent request capacity, not one
+bigger virtual GPU.
+
 This repository (`SensAI-PT/aviary-hy3`) is **Aviary**, not upstream Colibri. It ships a synced
 Colibri engine base plus the cluster control plane.
 

@@ -167,6 +167,9 @@ const en: Record<string, string> = {
   "cluster.rpcMatrix": "RPC latency",
   "cluster.rpcTable": "Latency matrix",
   "cluster.noRpcData": "No RPC measurements yet. Cross-node expert calls will populate this view.",
+  "cluster.jobTrace": "Request trace",
+  "cluster.layerBlocks": "layer blocks",
+  "cluster.rpcHistogram": "RPC latency histogram",
 
   // error boundary
   "error.title": "colibrì UI hit an error",

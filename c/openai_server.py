@@ -2316,6 +2316,18 @@ class Engine:
                         events = self.rpc_pending.pop(request_id, None)
                     if events is not None:
                         events.put(("miss", None))
+                elif kind == "CLUSTER_OK" and len(fields) >= 2:
+                    request_id = fields[1]
+                    with self.rpc_lock:
+                        events = self.rpc_pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("ok", None))
+                elif kind == "CLUSTER_MISS" and len(fields) >= 2:
+                    request_id = fields[1]
+                    with self.rpc_lock:
+                        events = self.rpc_pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("miss", None))
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -2357,6 +2369,36 @@ class Engine:
             with self.rpc_lock:
                 self.rpc_pending.pop(rid, None)
             return None
+
+    def exec_cluster_cmd(self, cmd: str, layer: int, eid: int, tier: int = 1, timeout: float = 2.0) -> bool:
+        """Run CLUSTER_PIN/LOAD/EVICT via mux (Aviary placement commands)."""
+        import queue as queue_mod
+
+        if self.protocol != "mux" or self.closed:
+            return False
+        cmd = cmd.upper()
+        if cmd not in ("PIN", "LOAD", "EVICT"):
+            return False
+        mux = f"CLUSTER_{cmd}"
+        with self.rpc_lock:
+            self._rpc_seq = getattr(self, "_rpc_seq", 0) + 1
+            rid = f"cmd{self._rpc_seq}"
+            events = queue_mod.Queue()
+            self.rpc_pending[rid] = events
+        if cmd == "EVICT":
+            frame = f"{mux} {rid} {layer} {eid}\n".encode()
+        else:
+            frame = f"{mux} {rid} {layer} {eid} {tier}\n".encode()
+        try:
+            with self.write_lock:
+                self.process.stdin.write(frame)
+                self.process.stdin.flush()
+            kind, _ = events.get(timeout=timeout)
+            return kind == "ok"
+        except (OSError, queue_mod.Empty):
+            with self.rpc_lock:
+                self.rpc_pending.pop(rid, None)
+            return False
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
@@ -2574,6 +2616,11 @@ class APIServer(ThreadingHTTPServer):
         self._conn_live = 0
         self._conn_by_ip = {}
         self._conn_owner = {}
+        self.model_path = ""
+        self.node_id = ""
+        self.trace_buffer = None
+        self.rpc_samples: list[dict] = []
+        self._rpc_samples_lock = threading.Lock()
 
     def process_request(self, request, client_address):
         """Refuse past the caps instead of spawning an unbounded thread."""
@@ -2929,6 +2976,31 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
+            if path == "/cluster/shards":
+                self.require_auth()
+                root = Path(getattr(self.server, "model_path", "") or "").resolve()
+                names = sorted(p.name for p in root.glob("*.safetensors")) if root.is_dir() else []
+                self.send_json(200, {"files": names}, request_id)
+                return
+            if path == "/cluster/shard":
+                self.require_auth()
+                from urllib.parse import parse_qs
+                query = parse_qs(urlsplit(self.path).query)
+                name = (query.get("name") or [""])[0]
+                if not name or "/" in name or ".." in name:
+                    raise APIError(400, "Invalid shard name.", "name")
+                root = Path(getattr(self.server, "model_path", "") or "").resolve()
+                target = (root / name).resolve()
+                if not str(target).startswith(str(root)) or not target.is_file():
+                    raise APIError(404, "Shard not found.", "name")
+                data = target.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.serve_static(path):
                 return
             self.require_auth()
@@ -2957,6 +3029,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
+        job_id = self.headers.get("X-Aviary-Job-Id")
+        trace = getattr(self.server, "trace_buffer", None)
+        if trace:
+            trace.set_job(job_id)
         try:
             self._check_host()
             self.require_auth()

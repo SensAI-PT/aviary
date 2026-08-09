@@ -1033,6 +1033,33 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
+static int cluster_expert_resident(Model *m, int layer, int eid){
+    for(int z=0;z<m->npin[layer];z++) if(m->pin[layer][z].eid==eid) return 1;
+    ESlot *Sl=m->ecache[layer];
+    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    return 0;
+}
+
+static int cluster_pin_expert(Model *m, int layer, int eid, int tier){
+    (void)tier;
+    if(layer<0||layer>=m->c.n_layers||!m->L[layer].sparse) return 0;
+    if(cluster_expert_resident(m,layer,eid)) return 1;
+    ESlot slot; expert_load(m,layer,eid,&slot);
+    ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
+    if(*nn<m->ecap){ Sl[(*nn)++]=slot; Sl[*nn-1].used=++m->eclock; return 1; }
+    int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z;
+    Sl[lru]=slot; Sl[lru].used=++m->eclock; return 1;
+}
+
+static int cluster_evict_expert(Model *m, int layer, int eid){
+    if(layer<0||layer>=m->c.n_layers) return 0;
+    ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
+    for(int z=0;z<*nn;z++){
+        if(Sl[z].eid==eid){ Sl[z]=Sl[*nn-1]; (*nn)--; return 1; }
+    }
+    return cluster_expert_resident(m,layer,eid)?0:1;
+}
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap); st_init(&m->S,snap);
@@ -2064,6 +2091,35 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"CLUSTER_LOAD ",13)){
+        char req_id[64]; int layer, eid, tier;
+        if(sscanf(line,"CLUSTER_LOAD %63s %d %d %d",req_id,&layer,&eid,&tier)==4){
+            free(line);
+            if(layer>=0&&layer<m->c.n_layers&&m->L[layer].sparse){
+                expert_prefetch(m,layer,eid);
+                printf("CLUSTER_OK %s\n",req_id); fflush(stdout);
+            } else printf("CLUSTER_MISS %s\n",req_id);
+            fflush(stdout); return 0;
+        }
+    }
+    if(!strncmp(line,"CLUSTER_PIN ",12)){
+        char req_id[64]; int layer, eid, tier;
+        if(sscanf(line,"CLUSTER_PIN %63s %d %d %d",req_id,&layer,&eid,&tier)==4){
+            free(line);
+            if(cluster_pin_expert(m,layer,eid,tier)) printf("CLUSTER_OK %s\n",req_id);
+            else printf("CLUSTER_MISS %s\n",req_id);
+            fflush(stdout); return 0;
+        }
+    }
+    if(!strncmp(line,"CLUSTER_EVICT ",14)){
+        char req_id[64]; int layer, eid;
+        if(sscanf(line,"CLUSTER_EVICT %63s %d %d",req_id,&layer,&eid)==3){
+            free(line);
+            if(cluster_evict_expert(m,layer,eid)) printf("CLUSTER_OK %s\n",req_id);
+            else printf("CLUSTER_MISS %s\n",req_id);
+            fflush(stdout); return 0;
+        }
+    }
     if(!strncmp(line,"EXEC_EXPERT ",12)){
         char req_id[64]; int layer, eid; size_t bytes;
         if(sscanf(line,"EXEC_EXPERT %63s %d %d %zu",req_id,&layer,&eid,&bytes)==4){

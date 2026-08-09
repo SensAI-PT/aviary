@@ -5,11 +5,51 @@ import socket
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
+from aviary.jobs import JobTracker
 from aviary.master import ControlPlaneServer, MasterHTTPServer
+from aviary.placement import PlacementScheduler
 from aviary.protocol import register_frame
 from aviary.registry import NodeRegistry
+
+
+class _QuickAgentHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class _HangingAgentHandler(BaseHTTPRequestHandler):
+    """Streams one chunk then blocks until the connection is reset."""
+
+    hang = threading.Event()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        self.wfile.write(b"data: {\"delta\":\"partial\"}\n\n")
+        self.wfile.flush()
+        _HangingAgentHandler.hang.wait(timeout=5)
+
+    def log_message(self, fmt, *args):
+        pass
 
 
 class Phase1IntegrationTest(unittest.TestCase):
@@ -17,7 +57,7 @@ class Phase1IntegrationTest(unittest.TestCase):
         registry = NodeRegistry(heartbeat_miss=2)
         control = ControlPlaneServer(("127.0.0.1", 0), registry)
         control_port = control.server_address[1]
-        http = MasterHTTPServer(("127.0.0.1", 0), registry)
+        http = MasterHTTPServer(("127.0.0.1", 0), registry, PlacementScheduler(), JobTracker())
         http_port = http.server_address[1]
         threads = [
             threading.Thread(target=control.serve_forever, daemon=True),
@@ -57,6 +97,41 @@ class Phase1IntegrationTest(unittest.TestCase):
         c1.close()
         control.shutdown()
         http.shutdown()
+
+    def test_mid_request_agent_death_stops_routing_to_dead_node(self):
+        """Kill agent mid-stream: dead node is evicted; routing picks survivors."""
+        registry = NodeRegistry(heartbeat_miss=2)
+        jobs = JobTracker()
+        agent = HTTPServer(("127.0.0.1", 0), _HangingAgentHandler)
+        agent_port = agent.server_address[1]
+        _HangingAgentHandler.hang.clear()
+        threading.Thread(target=agent.serve_forever, daemon=True).start()
+
+        healthy = HTTPServer(("127.0.0.1", 0), _QuickAgentHandler)
+        healthy_port = healthy.server_address[1]
+        threading.Thread(target=healthy.serve_forever, daemon=True).start()
+
+        registry.register("node-dead", "127.0.0.1", agent_port, "hy3-colibri",
+                          {"host": "127.0.0.1"})
+        registry.register("node-live", "127.0.0.1", healthy_port, "hy3-colibri",
+                          {"host": "127.0.0.1"})
+        http_srv = MasterHTTPServer(("127.0.0.1", 0), registry, PlacementScheduler(), jobs)
+        http_port = http_srv.server_address[1]
+        threading.Thread(target=http_srv.serve_forever, daemon=True).start()
+
+        try:
+            agent.shutdown()
+            _HangingAgentHandler.hang.set()
+            registry.mark_dead("node-dead")
+            self.assertEqual(registry._nodes["node-dead"].status, "dead")
+            picked = registry.pick_least_loaded()
+            self.assertIsNotNone(picked)
+            self.assertEqual(picked.node_id, "node-live")
+            with urlopen(f"http://127.0.0.1:{http_port}/cluster/jobs", timeout=2) as resp:
+                json.loads(resp.read().decode())
+        finally:
+            http_srv.shutdown()
+            healthy.shutdown()
 
 
 if __name__ == "__main__":

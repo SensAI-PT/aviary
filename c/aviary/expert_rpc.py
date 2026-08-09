@@ -31,6 +31,9 @@ class ExpertRPCHandler(socketserver.BaseRequestHandler):
                 buf += chunk
             line, rest = buf.split(b"\n", 1)
             fields = line.decode("utf-8", "replace").strip().split()
+            if fields and fields[0] == "PING":
+                conn.sendall(b"PONG\n")
+                return
             if len(fields) < 5 or fields[0] != "EXEC_EXPERT":
                 return
             req_id, layer, eid, nbytes = fields[1], int(fields[2]), int(fields[3]), int(fields[4])
@@ -96,9 +99,19 @@ def tier_check_from_emap(engine, layer: int, eid: int) -> bool:
     return (byte >> 6) >= 1 or True  # allow disk-tier serve via local load in engine
 
 
-def start_expert_rpc_server(host: str, port: int, engine, stop_event: threading.Event | None = None):
+def start_expert_rpc_server(host: str, port: int, engine, stop_event: threading.Event | None = None,
+                            trace_buffer=None, node_id: str = ""):
     bridge = EngineExpertBridge(engine)
-    server = ExpertRPCServer((host if host != "0.0.0.0" else "", port), bridge,
+
+    def _exec(layer, eid, x_in):
+        t0 = time.perf_counter()
+        out = bridge(layer, eid, x_in)
+        if trace_buffer and out is not None:
+            trace_buffer.record("rpc_in", node_id, layer, eid,
+                                rpc_us=(time.perf_counter() - t0) * 1e6, local=True)
+        return out
+
+    server = ExpertRPCServer((host if host != "0.0.0.0" else "", port), _exec,
                              tier_check=lambda l, e: tier_check_from_emap(engine, l, e))
     thread = threading.Thread(target=server.serve_forever, name="aviary-expert-rpc", daemon=True)
     thread.start()

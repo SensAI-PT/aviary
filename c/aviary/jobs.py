@@ -21,6 +21,7 @@ class ClusterJob:
     ended_at: float | None = None
     http_status: int | None = None
     error: str | None = None
+    trace: list[dict[str, Any]] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -36,6 +37,7 @@ class ClusterJob:
             "duration_sec": round(duration, 3),
             "http_status": self.http_status,
             "error": self.error,
+            "trace": list(self.trace),
         }
 
 
@@ -51,6 +53,20 @@ class JobTracker:
         with self._lock:
             self._active[job.job_id] = job
         return job
+
+    def append_trace(self, job_id: str, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        with self._lock:
+            job = self._active.get(job_id)
+            if job is None:
+                for past in self._history:
+                    if past.job_id == job_id:
+                        job = past
+                        break
+            if job is None:
+                return
+            job.trace.extend(events)
 
     def finish(self, job_id: str, http_status: int | None = None, error: str | None = None) -> None:
         with self._lock:

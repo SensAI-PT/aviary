@@ -44,6 +44,10 @@ function statusClass(status: string) {
   return ""
 }
 
+function layerBlocksForNode(placement: ClusterPlacementResponse | null, nodeId: string) {
+  return placement?.blocks?.[nodeId] || []
+}
+
 function expertsForNode(placement: ClusterPlacementResponse | null, nodeId: string) {
   if (!placement?.experts) return []
   return Object.entries(placement.experts)
@@ -306,6 +310,12 @@ function JobsPanel({ jobs, nodes, selectedJobId, onSelectJob, onSelectNode, t }:
             {selected.http_status != null ? <><dt>HTTP</dt><dd>{selected.http_status}</dd></> : null}
             {selected.error ? <><dt>{t("cluster.col.error")}</dt><dd className="cluster-error-text">{selected.error}</dd></> : null}
             {nodeMap[selected.node_id]?.arch ? <><dt>{t("cluster.col.arch")}</dt><dd>{nodeMap[selected.node_id].arch}</dd></> : null}
+            {selected.trace?.length ? (
+              <>
+                <dt>{t("cluster.jobTrace")}</dt>
+                <dd><JobTraceGantt job={selected} /></dd>
+              </>
+            ) : null}
           </dl>
         ) : (
           <p className="cluster-empty">{t("cluster.selectJob")}</p>
@@ -440,6 +450,14 @@ function PlacementPanel({ nodes, placement, selectedNodeId, onSelectNode, t }: {
             <div className="cluster-placement-stats">
               <span>{inbound} {t("cluster.assignedExperts")}</span>
               <span>{experts.filter((e) => e.tier >= 1).length} {t("cluster.residentExperts")}</span>
+              {layerBlocksForNode(placement, node.node_id).length ? (
+                <span>{layerBlocksForNode(placement, node.node_id).length} {t("cluster.layerBlocks")}</span>
+              ) : null}
+            </div>
+            <div className="cluster-layer-blocks">
+              {layerBlocksForNode(placement, node.node_id).map((b) => (
+                <span key={`${b.start}-${b.end}`} className="cluster-layer-block">L{b.start}–{b.end}</span>
+              ))}
             </div>
             <div className="cluster-expert-chips compact">
               {experts.slice(0, 24).map((e) => (
@@ -461,12 +479,35 @@ function RpcPanel({ nodes, placement, t }: {
 }) {
   const ids = nodes.map((n) => n.node_id)
   const matrix = placement?.rpc_matrix_us || {}
+  const hist = placement?.rpc_histogram
   const pairs = ids.flatMap((src) => ids.filter((dst) => src !== dst).map((dst) => ({
     src, dst, us: matrix[src]?.[dst] ?? null,
   }))).filter((p) => p.us != null) as Array<{ src: string; dst: string; us: number }>
   const maxUs = pairs.length ? Math.max(...pairs.map((p) => p.us)) : 1
+  const maxBucket = hist?.buckets?.length ? Math.max(...hist.buckets.map((b) => b.count), 1) : 1
   return (
     <div className="cluster-spark-body">
+      {hist && hist.count > 0 ? (
+        <section className="cluster-panel">
+          <header className="cluster-panel-head">
+            <h3><Timer className="size-4" /> {t("cluster.rpcHistogram")}</h3>
+          </header>
+          <p className="cluster-hist-meta">
+            {hist.count} samples · p50 {Math.round(hist.p50_us)}µs · p95 {Math.round(hist.p95_us)}µs
+          </p>
+          <div className="cluster-rpc-bars">
+            {hist.buckets.map((b) => (
+              <div key={b.max_us} className="cluster-rpc-row">
+                <code>≤{b.max_us}µs</code>
+                <div className="cluster-rpc-bar-wrap">
+                  <div className="cluster-rpc-bar hist" style={{ width: `${Math.max(4, (b.count / maxBucket) * 100)}%` }} />
+                </div>
+                <span>{b.count}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
       <section className="cluster-panel">
         <header className="cluster-panel-head"><h3><Network className="size-4" /> {t("cluster.rpcMatrix")}</h3></header>
         {pairs.length ? (
@@ -503,6 +544,31 @@ function RpcPanel({ nodes, placement, t }: {
           </div>
         </section>
       ) : null}
+    </div>
+  )
+}
+
+function JobTraceGantt({ job }: { job: ClusterJob }) {
+  const trace = job.trace || []
+  if (!trace.length) return null
+  const t0 = job.started_at
+  const t1 = job.ended_at || trace[trace.length - 1]?.ts || t0 + job.duration_sec
+  const span = Math.max(0.001, t1 - t0)
+  return (
+    <div className="cluster-gantt">
+      <div className="cluster-gantt-primary">
+        <span>{shortId(job.node_id)} · primary</span>
+      </div>
+      {trace.map((ev, i) => (
+        <div
+          key={`${ev.ts}-${i}`}
+          className={cn("cluster-gantt-seg", ev.local ? "local" : "remote")}
+          style={{ marginLeft: `${Math.max(0, Math.min(92, ((ev.ts - t0) / span) * 100))}%` }}
+          title={`L${ev.layer} E${ev.expert}${ev.rpc_us ? ` · ${Math.round(ev.rpc_us)}µs` : ""}`}
+        >
+          <code>{ev.local ? "local" : shortId(ev.node_id)} L{ev.layer}:E{ev.expert}</code>
+        </div>
+      ))}
     </div>
   )
 }

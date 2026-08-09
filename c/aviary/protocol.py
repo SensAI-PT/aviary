@@ -103,3 +103,15 @@ def heartbeat_frame(node_id: str, inflight: int, payload: dict[str, Any]) -> str
 
 def placement_frame(payload: dict[str, Any]) -> str:
     return encode_payload_frame("PLACEMENT", payload)
+
+
+def pin_frame(layer: int, eid: int, tier: int) -> str:
+    return f"PIN {layer} {eid} {tier}\n"
+
+
+def load_frame(layer: int, eid: int, tier: int) -> str:
+    return f"LOAD {layer} {eid} {tier}\n"
+
+
+def evict_frame(layer: int, eid: int) -> str:
+    return f"EVICT {layer} {eid}\n"

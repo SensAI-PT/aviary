@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from aviary.expert_rpc import DEFAULT_EXPERT_PORT, start_expert_rpc_server
 from aviary.identity import load_or_create_node_id
+from aviary.prefetch import PrefetchDaemon
 from aviary.protocol import (
     ProtocolError,
     heartbeat_frame,
@@ -25,6 +26,7 @@ from aviary.protocol import (
     write_line,
 )
 from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC
+from aviary.trace import TraceBuffer
 from aviary.usage import arch_engine_id, read_coli_usage, usage_delta
 
 try:
@@ -62,7 +64,8 @@ def _local_ip_for(peer: tuple[str, int]) -> str:
 
 class ControlConnection:
     def __init__(self, node_id, master_host, control_port, http_port, model_id, model_path,
-                 advertise_host, engine, scheduler, arch, expert_port, placement_path):
+                 advertise_host, engine, scheduler, arch, expert_port, placement_path,
+                 trace_buffer: TraceBuffer | None = None):
         self.node_id = node_id
         self.master_host = master_host
         self.control_port = control_port
@@ -75,6 +78,7 @@ class ControlConnection:
         self.arch = arch
         self.expert_port = expert_port
         self.placement_path = placement_path
+        self.trace_buffer = trace_buffer
         self._usage_snapshot: list[dict] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="aviary-control", daemon=True)
@@ -96,9 +100,26 @@ class ControlConnection:
         if kind == "PLACEMENT" and payload is not None:
             self._write_placement(payload)
         elif kind == "PIN" and len(fields) >= 4:
-            pass  # Phase 2: forward PIN to engine when stdin hook exists
-        elif kind in ("LOAD", "EVICT") and len(fields) >= 3:
-            pass
+            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
+            if exec_fn:
+                try:
+                    exec_fn("PIN", int(fields[1]), int(fields[2]), int(fields[3]))
+                except (ValueError, TypeError) as error:
+                    print(f"[aviary-agent] PIN failed: {error}", file=sys.stderr)
+        elif kind == "LOAD" and len(fields) >= 4:
+            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
+            if exec_fn:
+                try:
+                    exec_fn("LOAD", int(fields[1]), int(fields[2]), int(fields[3]))
+                except (ValueError, TypeError) as error:
+                    print(f"[aviary-agent] LOAD failed: {error}", file=sys.stderr)
+        elif kind == "EVICT" and len(fields) >= 3:
+            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
+            if exec_fn:
+                try:
+                    exec_fn("EVICT", int(fields[1]), int(fields[2]))
+                except (ValueError, TypeError) as error:
+                    print(f"[aviary-agent] EVICT failed: {error}", file=sys.stderr)
 
     def _register_payload(self) -> dict:
         payload = {
@@ -166,6 +187,13 @@ class ControlConnection:
         if getattr(eng, "emap", None):
             payload["emap"] = eng.emap
         payload["scheduler"] = snap
+        if self.trace_buffer:
+            payload["trace_events"] = self.trace_buffer.drain()
+        server = getattr(self.scheduler, "server", None)
+        if server and hasattr(server, "rpc_samples"):
+            with server._rpc_samples_lock:
+                payload["rpc_samples"] = list(server.rpc_samples)
+                server.rpc_samples.clear()
         return payload
 
     def _run(self):
@@ -272,16 +300,28 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
                        allowed_hosts=_agent_allowed_hosts(advertise, allowed_hosts))
     runtime = Engine(engine_bin, model, cap, max_tokens, child_env, kv_slots, arch)
     server.engine = runtime
+    server.model_path = model
+    server.node_id = node_id
+    server.trace_buffer = TraceBuffer()
+    server.scheduler.server = server
 
     rpc_host = advertise or host
     if rpc_host in ("0.0.0.0", "::"):
         rpc_host = "0.0.0.0"
-    rpc_server, _, _ = start_expert_rpc_server(rpc_host, expert_port, runtime)
+    rpc_server, _, _ = start_expert_rpc_server(rpc_host, expert_port, runtime,
+                                              trace_buffer=server.trace_buffer,
+                                              node_id=node_id)
 
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
                                 advertise, runtime, server.scheduler, arch, expert_port,
-                                placement_path)
+                                placement_path, server.trace_buffer)
     control.start()
+
+    prefetch = None
+    if os.environ.get("AVIARY_PREFETCH", "0") not in ("0", ""):
+        master_http = master_url if "://" in master_url else f"http://{master_url}"
+        prefetch = PrefetchDaemon(model, placement_path, master_http, node_id, api_key or "")
+        prefetch.start()
 
     print(f"Aviary agent {node_id} arch={arch} listening on http://{host}:{port}/v1 "
           f"(master control {master_host}:{control_port}, expert RPC :{expert_port})",
@@ -298,6 +338,8 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     finally:
         signal.signal(signal.SIGTERM, previous)
         control.stop()
+        if prefetch:
+            prefetch.stop()
         rpc_server.shutdown()
         server.scheduler.close()
         server.server_close()

@@ -194,7 +194,11 @@ agent → master: DEREGISTER 550e8400-e29b-41d4-a716-446655440000\n
 master → agent: DEREGISTERED 550e8400-e29b-41d4-a716-446655440000\n
 ```
 
-## Phase 2 preview (not implemented in Phase 1)
+## Phase 2 — expert RPC and placement (implemented)
+
+**Design note:** the shipped implementation uses **expert-level** cost-aware placement
+(`EXEC_EXPERT`, per-expert routing table), not depth-wise block pipeline placement from the
+original roadmap. This keeps hop count bounded by hot-expert count rather than layer count.
 
 Expert execution RPC between agents uses the same line+byte-count philosophy:
 
@@ -203,5 +207,26 @@ EXEC_EXPERT <req_id> <layer> <eid> <bytes>\n<hidden_dim floats>\n
 EXPERT_RESULT <req_id> <bytes>\n<hidden_dim floats>\n
 EXPERT_MISS <req_id>\n
 ```
+
+The master pushes `PIN`/`LOAD`/`EVICT` control lines after each `PLACEMENT` update. Agents
+forward these to the engine mux as:
+
+```
+CLUSTER_PIN <req_id> <layer> <eid> <tier>\n
+CLUSTER_LOAD <req_id> <layer> <eid> <tier>\n
+CLUSTER_EVICT <req_id> <layer> <eid>\n
+CLUSTER_OK <req_id>\n
+CLUSTER_MISS <req_id>\n
+```
+
+Agents expose peer shard fetch for Phase 4 prefetch:
+
+```
+GET /cluster/shards
+GET /cluster/shard?name=<safetensors_filename>
+```
+
+Heartbeats may include `trace_events` (per-request RPC trace) and `rpc_samples` (latency
+measurements) for the Cluster dashboard.
 
 See [`aviary-cluster-plan.md`](../aviary-cluster-plan.md) for the full roadmap.

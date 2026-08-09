@@ -45,6 +45,10 @@ A single chat request lands on one **primary** agent. Inside `moe()`, the engine
 individual expert forwards to whichever node currently holds that expert hottest. Remote
 miss/timeout always falls through to local disk load.
 
+**Phase 1 capacity model:** each agent runs a **full local replica** of the model. Adding
+nodes increases **concurrent throughput and availability**, not pooled model memory — N modest
+boxes add up to N× throughput, not one virtual GPU with the sum of their VRAM.
+
 ## Feature status
 
 | feature | status | description |
@@ -58,7 +62,7 @@ miss/timeout always falls through to local disk load.
 | Per-model usage isolation | ✓ | Stats keyed by `engine_id`; never merged across architectures |
 | Request job tracking | ✓ | `GET /cluster/jobs`, `GET /cluster/overview` |
 | MTP / dense layer placement | planned | Phase 2.4 — after expert RPC gates proven |
-| Cross-node weight prefetch | planned | Phase 4 |
+| Cross-node weight prefetch | ✓ | Phase 4 — best-effort shard fetch from peers (`AVIARY_PREFETCH=1`) |
 
 Enable Phase 2 on agents:
 
@@ -104,6 +108,10 @@ Point the web UI's server URL at the master, not an individual agent.
 | `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |
 | `AVIARY_PLACEMENT_SEC` | `4` | Placement scheduler recompute interval |
 | `AVIARY_ROUTE_BOOTSTRAP_RATIO` | `0.1` | Route chat to cold executors when their hot-expert residents are below this fraction of the cluster leader (collects usage/ECOST) |
+| `AVIARY_PREFETCH` | `0` | Enable Phase 4 best-effort shard prefetch daemon on agents |
+| `AVIARY_PREFETCH_SEC` | `10` | Prefetch poll interval (seconds) |
+| `AVIARY_PREFETCH_MAX` | `2` | Max concurrent shard downloads per agent |
+| `AVIARY_PIN_BATCH` | `32` | Max PIN commands pushed per placement tick |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
@@ -118,6 +126,8 @@ Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
 | `/cluster/jobs` | GET | Active and recent proxied requests |
 | `/cluster/placement` | GET | Current scheduler output |
 | `/cluster/costs` | GET | Cost matrix snapshot |
+| `/cluster/shards` | GET | Agent-only: list local safetensors shard files (prefetch peer) |
+| `/cluster/shard?name=…` | GET | Agent-only: download one shard file from model dir |
 | `/v1/chat/completions` | POST | Proxied to chosen agent (streaming preserved) |
 | `/v1/models` | GET | From first healthy agent |
 | `/health` | GET | Master liveness + scheduler snapshot |
