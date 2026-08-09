@@ -351,11 +351,40 @@ def env_for_engine(a, arch):
                 env.setdefault("OMP_PLACES", "cores")
     if arch == "hy3" or arch == "qwen3_moe":
         env.setdefault("IDOT", "0")
-    if a.ngen: env["NGEN"] = str(a.ngen)
-    if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
+    # Shared resource knobs for every sister engine (chat/serve/agent).
+    # Previously only deepseek_v4 got --ram; hy3/qwen3_moe silently ignored it
+    # and auto-sized to ~88% of free RAM ([RAM_GB=… auto] cap raised …).
+    if getattr(a, "ram", 0): env["RAM_GB"] = str(a.ram)
+    if getattr(a, "ngen", 0): env["NGEN"] = str(a.ngen)
+    if getattr(a, "temp", None) is not None: env["COLI_TEMP"] = str(a.temp)
+    if getattr(a, "ctx", 0): env["CTX"] = str(a.ctx)
+    if getattr(a, "repin", 0): env["REPIN"] = str(a.repin)
+    if getattr(a, "topp", 0): env["TOPP"] = str(a.topp)
+    if getattr(a, "topk", 0): env["TOPK"] = str(a.topk)
+    if arch in ("hy3", "qwen3_moe"):
+        gpu = getattr(a, "gpu", None)
+        vram = getattr(a, "vram", 0) or 0
+        if gpu is not None or vram:
+            eng = engine_for(a.model) if getattr(a, "model", None) else \
+                os.path.join(HERE, _ENGINE_NAMES.get(arch, "colibri") + _EXE)
+            if gpu == "none":
+                env["COLI_CUDA"] = "0"
+                env.pop("CUDA_EXPERT_GB", None); env.pop("CUDA_DENSE", None)
+                env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
+            else:
+                if not cuda_binary(eng):
+                    sys.exit(f"{C.yel}--gpu/--vram needs a CUDA build of {os.path.basename(eng)}:{C.r} "
+                             f"make -C c {_ENGINE_NAMES.get(arch, arch)} CUDA=1")
+                env["COLI_CUDA"] = "1"
+                env.pop("COLI_GPU", None)
+                if gpu and gpu != "auto":
+                    env["COLI_GPUS"] = gpu
+                else:
+                    env.pop("COLI_GPUS", None)
+                if vram:
+                    env["CUDA_EXPERT_GB"] = str(vram)
+                env.setdefault("CUDA_DENSE", "1")
     if arch == "deepseek_v4":
-        if a.ram: env["RAM_GB"] = str(a.ram)
-        if a.ctx: env["CTX"] = str(a.ctx)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
         # the visible decode. V4_DRAFT=5 remains available for repeated code.
@@ -372,11 +401,12 @@ def env_for_engine(a, arch):
         env.setdefault("V4_MTP_CONF", "0.55")
     return env
 
-def cuda_binary():
-    if not os.path.exists(GLM): return False
+def cuda_binary(path=None):
+    binary = path or GLM
+    if not os.path.exists(binary): return False
     if sys.platform == "linux":
         try:
-            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            linked=subprocess.run(["ldd",binary],capture_output=True,text=True,timeout=3)
             # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
             return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                        for line in linked.stdout.splitlines())
@@ -388,9 +418,9 @@ def cuda_binary():
         # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
         # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
         try:
-            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+            with open(binary,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
         except OSError: return False
-        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+        return built and os.path.exists(os.path.join(os.path.dirname(binary),"coli_cuda.dll"))
     return False
 
 def resource_request(a, env):

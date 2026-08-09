@@ -39,9 +39,23 @@ Each agent needs the same int4 weights on fast local storage:
 # master
 ./coli master --host 0.0.0.0 --port 9000
 
-# agent(s)
-COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://MASTER:9000 --host 0.0.0.0 --port 8001
+# agent — lean RAM budget (expert LRU sized from RAM_GB)
+COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://MASTER:9000 \
+  --host 0.0.0.0 --port 8001 --ram 10
+
+# agent — with GPU expert tier (requires: make qwen3_moe CUDA=1)
+COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://MASTER:9000 \
+  --host 0.0.0.0 --port 8001 --ram 10 --gpu 0 --vram 8
 ```
+
+| Flag / env | Effect |
+|---|---|
+| `--ram N` / `RAM_GB` | Expert-cache budget (GB). Without it the engine uses ~88% of free RAM and may raise `cap` aggressively. |
+| `--cap N` | Initial LRU slots/layer (default 8 for Qwen). `RAM_GB` can still raise/lower this. |
+| `--gpu 0` / `--vram N` | CUDA hot-expert tier (`COLI_CUDA=1`, `CUDA_EXPERT_GB=N`). Needs a CUDA build of `qwen3_moe`. |
+| `--gpu none` | Force CPU-only. |
+
+Expect `[RAM_GB=10.0] …` (no `auto`) on stderr when `--ram` is set.
 
 See [AVIARY.md](AVIARY.md) for the full cluster protocol.
 

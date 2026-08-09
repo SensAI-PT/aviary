@@ -250,16 +250,26 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         cls.coli = importlib.util.module_from_spec(spec)
         loader.exec_module(cls.coli)
 
-    def args(self):
-        return types.SimpleNamespace(model="/x", ram=None, ctx=None, ngen=None,
-                                     temp=None, cap=None)
+    def args(self, **kw):
+        base = dict(model="/x", ram=None, ctx=None, ngen=None, temp=None, cap=None,
+                    repin=None, topp=None, topk=None, gpu=None, vram=0)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
 
     def test_every_engine_gets_physical_cores(self):
         with mock.patch("resource_plan.physical_cpu_count", return_value=6):
-            for arch in ("inkling", "kimi", "olmoe", "deepseek_v4"):
+            for arch in ("inkling", "kimi", "olmoe", "deepseek_v4", "hy3", "qwen3_moe"):
                 with self.subTest(arch=arch):
                     env = self.coli.env_for_engine(self.args(), arch)
                     self.assertEqual(env.get("OMP_NUM_THREADS"), "6")
+
+    def test_ram_flag_reaches_hy3_and_qwen3(self):
+        """coli agent/chat --ram N must set RAM_GB for streaming MoE sisters."""
+        with mock.patch("resource_plan.physical_cpu_count", return_value=6):
+            for arch in ("hy3", "qwen3_moe", "deepseek_v4"):
+                with self.subTest(arch=arch):
+                    env = self.coli.env_for_engine(self.args(ram=10), arch)
+                    self.assertEqual(env.get("RAM_GB"), "10")
 
     def test_v4_gets_memory_bound_affinity_defaults(self):
         with mock.patch.object(self.coli.sys, "platform", "linux"), \
