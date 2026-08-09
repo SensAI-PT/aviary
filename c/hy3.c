@@ -117,18 +117,31 @@ typedef struct {
 } Cfg;
 
 typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
     int cuda_eligible, cuda_failed, cuda_device;
 } QT;
 
+/* Derive fmt=4 group size from scale-array byte count (same probe as colibri.c). */
+static int detect_group_size(int O, int I, int64_t ns){
+    if(O<=0||ns<=(int64_t)O*4||I<=0) return 0;
+    static const int cands[]={16,32,48,64,96,128,192,256};
+    for(int ci=0;ci<(int)(sizeof(cands)/sizeof(cands[0]));ci++){
+        int gs=cands[ci]; if(gs>I) break;
+        int ng=(I+gs-1)/gs;
+        if(ns==(int64_t)O*ng*4) return gs;
+    }
+    return 0;
+}
+
 static int64_t qt_bytes(const QT *t){
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n+(int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4)+(int64_t)t->O*4;
+    if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*((t->I+1)/2)+(int64_t)t->O*ng*4; }
     return (int64_t)t->O*((t->I+1)/2)+(int64_t)t->O*4;
 }
 
@@ -195,6 +208,8 @@ static void qt_cuda_reset(QT *t){
 static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    if(t->fmt==4)
+        return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static void cuda_stats_print(void){
@@ -301,6 +316,43 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 a+=xs[i]*(float)lo+xs[i+1]*(float)hi; }
             if(i<I){ uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8); }
             y[(int64_t)s*O+o]=a*sc; } }
+}
+
+/* y[S,O] = x[S,I] @ W^T with int4 packed weights + per-group scales (fmt=4). */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                a+=hsum256(acc)*sc;
+#endif
+                for(; i<base+glen; i+=2){
+                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
 }
 
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
@@ -430,6 +482,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     if(g_idot&&(w->fmt==1||(w->fmt==2&&S>=g_i4s))){
         int I=w->I; int8_t *xq; float *sx;
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
@@ -602,12 +655,33 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
-        int fmt=(nb==(int64_t)O*I)?1:(nb==(int64_t)O*((I+1)/2))?2:3;
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); }
-            st_read_raw(&m->S,name,t->q8,drop); }
-        else { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); }
-            st_read_raw(&m->S,name,t->q4,drop); }
-        st_read_f32(&m->S,sn,t->s,drop);
+        int64_t ns=st_nbytes(&m->S,sn);
+        int fmt=(nb==(int64_t)O*I)?1:(nb==(int64_t)O*((I+1)/2))?2:
+                (nb==(int64_t)O*((I+3)/4))?3:-1;
+        int gs=0;
+        if(fmt==2){ gs=detect_group_size(O,I,ns); if(gs>0) fmt=4; }
+        if(fmt<0){
+            fprintf(stderr,"tensor %s: unrecognized weight layout nb=%lld for [%d,%d]\n",
+                    name,(long long)nb,O,I); exit(1);
+        }
+        int64_t nscale=(fmt==4)?(int64_t)O*((I+gs-1)/gs):(int64_t)O;
+        if(ns!=(int64_t)nscale*4){
+            fprintf(stderr,"tensor %s: scale nbytes %lld != expected %lld (fmt=%d gs=%d)\n",
+                    name,(long long)ns,(long long)nscale*4,fmt,gs); exit(1);
+        }
+        if(fmt==1){
+            if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=malloc(nb); t->s=falloc(O); }
+            st_read_raw(&m->S,name,t->q8,drop);
+        } else if(fmt==4){
+            if(t->fmt!=4||!t->q4||t->gs!=gs){
+                t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=malloc(nb); t->s=falloc(nscale);
+            }
+            st_read_raw(&m->S,name,t->q4,drop);
+        } else {
+            if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=malloc(nb); t->s=falloc(O); }
+            st_read_raw(&m->S,name,t->q4,drop);
+        }
+        st_read_f32_cap(&m->S,sn,t->s,nscale,drop);
     } else {
         if(!t->qf&&!t->q8&&!t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32(&m->S,name,t->qf,drop);
@@ -652,6 +726,15 @@ static void embed_row(Model *m, int tok, float *x){
     if(e->fmt==0){ memcpy(x,e->qf+(int64_t)tok*D,D*sizeof(float)); return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
+    if(e->fmt==4){
+        int gs=e->gs, ng=(D+gs-1)/gs; const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2);
+        const float *scl=e->s+(int64_t)tok*ng;
+        for(int g=0;g*gs<D;g++){ float s=scl[g]; int e0=g*gs, e1=e0+gs; if(e1>D) e1=D;
+            for(int i=e0;i<e1;i+=2){ uint8_t byte=q[i>>1];
+                x[i]=(float)((int)(byte&0xF)-8)*s;
+                if(i+1<e1) x[i+1]=(float)((int)(byte>>4)-8)*s; } }
+        return;
+    }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];
         for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
             if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; } return; }
@@ -671,9 +754,11 @@ static void expert_finalize(Model *m, int layer, int eid, ESlot *s,
     for(int k=0;k<3;k++){ fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
-        int64_t nb=tw[k]->nbytes;
+        int64_t nb=tw[k]->nbytes, ns=tq[k]->nbytes;
         int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        int gs=0;
+        if(fmt==2){ gs=detect_group_size(OO[k],II[k],ns); if(gs>0) fmt=4; }
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; (void)layer; (void)m;
