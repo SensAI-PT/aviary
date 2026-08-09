@@ -57,6 +57,8 @@ export interface ClusterNode {
   http_port: number
   model_id: string
   model_path: string
+  arch?: string
+  engine_id?: number
   status: string
   inflight: number
   uptime_sec: number
@@ -66,12 +68,54 @@ export interface ClusterNode {
   emap?: { rows: number; cols: number; map: string }
   hits?: string
   hits_seq?: number
+  usage?: Array<{ layer: number; expert: number; count: number }>
+  costs?: Array<{ layer: number; expert: number; tier: number; load_us: number; exec_us: number }>
+  profile?: ProfileTurn[]
+  expert_port?: number
 }
 
 export interface ClusterNodesResponse {
   nodes: ClusterNode[]
   healthy: number
   total: number
+  cohort?: { arch: string; model_id: string; engine_id: number | null }
+  merged_usage?: Array<{ layer: number; expert: number; count: number }>
+}
+
+export interface ClusterJob {
+  job_id: string
+  node_id: string
+  node_endpoint: string
+  path: string
+  status: "running" | "completed" | "failed"
+  started_at: number
+  ended_at: number | null
+  duration_sec: number
+  http_status: number | null
+  error: string | null
+}
+
+export interface ClusterJobsResponse {
+  active: ClusterJob[]
+  history: ClusterJob[]
+  active_count: number
+  completed_count: number
+  failed_count: number
+}
+
+export interface ClusterPlacementResponse {
+  experts: Record<string, string>
+  expert_tiers: Record<string, number>
+  rpc_matrix_us: Record<string, Record<string, number>>
+  computed_at: number
+  usage_top: Array<{ layer: number; expert: number; count: number }>
+}
+
+export interface ClusterOverviewResponse {
+  nodes: ClusterNodesResponse
+  placement: ClusterPlacementResponse
+  jobs: ClusterJobsResponse
+  updated_at: number
 }
 
 export interface ProfileTurn {
@@ -152,6 +196,24 @@ export async function getClusterNodes(baseUrl: string, apiKey = "", signal?: Abo
   const response = await fetch(serverEndpoint(baseUrl, "cluster/nodes"), { headers: headers(apiKey), signal })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ClusterNodesResponse
+}
+
+export async function getClusterPlacement(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ClusterPlacementResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/placement"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterPlacementResponse
+}
+
+export async function getClusterJobs(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ClusterJobsResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/jobs"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterJobsResponse
+}
+
+export async function getClusterOverview(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ClusterOverviewResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/overview"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterOverviewResponse
 }
 
 export function extractSSE(buffer: string) {

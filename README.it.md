@@ -8,44 +8,39 @@
 </p>
 
 <p align="center">
-  <strong>Aviary</strong> — cluster auto-organizzato per motori di inferenza
+  <strong>Eseguire grandi LLM su un cluster di hardware commodity, il più velocemente possibile.</strong>
+</p>
+
+<p align="center">
+  <strong>Aviary</strong> — piano di controllo cluster MoE sopra i motori
   <a href="https://github.com/JustVugg/colibri">Colibri</a>
 </p>
 
-**Trasforma N nodi Colibri in un unico cluster.** Aviary aggiunge uno scheduler
-master, agent worker e una dashboard in stile Spark sopra il motore
-[Colibri](https://github.com/JustVugg/colibri). Punta la UI web o qualsiasi
-client OpenAI al master — ogni richiesta va al nodo sano meno carico. Ogni agent
-esegue ancora una copia completa del modello (Fase 1: bilanciamento a replica
-completa; esecuzione cross-node degli expert in Fase 2).
+**Missione di Aviary:** eseguire grandi modelli MoE su un cluster di macchine commodity,
+massimizzando velocità e throughput.
 
-Oggi girano le stesse famiglie Colibri: **GLM-5.2** (744B), **Inkling** (975B),
-**Kimi K3** (2,8T) e **OLMoE** (7B) — un file C ciascuna, la stessa interfaccia
-`coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+Aviary aggiunge master, agent worker, scheduler di placement basato sui costi e una dashboard
+in stile Spark (Jobs, Executors, Placement, RPC) sopra [Colibri](https://github.com/JustVugg/colibri).
+Punta la UI o qualsiasi client OpenAI al master — le richieste vengono instradate al nodo
+ottimale; gli expert possono essere eseguiti via RPC cross-node con fallback locale automatico.
 
 > **Aviary possiede il piano di controllo del cluster; [Colibri](https://github.com/JustVugg/colibri)
-> possiede i motori.** Vedi [`docs/AVIARY.md`](docs/AVIARY.md) e
-> [`docs/cluster_protocol.md`](docs/cluster_protocol.md).
+> possiede i motori.** Vedi [`docs/AVIARY.md`](docs/AVIARY.md).
 
-## Cluster Aviary (Fase 1)
+## Cluster Aviary
 
-| componente | comando | porta | ruolo |
-|---|---|---|---|
-| **master** | `./c/coli master` | HTTP `9000`, controllo `9002` | Registro, heartbeat, routing, dashboard |
-| **agent** | `./c/coli agent --master URL` | HTTP `8001` | Un subprocess `Engine` Colibri + telemetria |
+| fase | contenuto | stato |
+|---|---|---|
+| **1** | Registro nodi, heartbeat, load balancing | ✓ |
+| **2** | Expert RPC cross-node, placement scheduler | ✓ |
 
 ```bash
-# macchina A — master + primo agent
+export AVIARY_CLUSTER=1
 ./c/coli master --host 0.0.0.0 --port 9000
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
-
-# macchina B — secondo agent
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
-  --advertise-host B
+COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 ```
 
-Apri **http://A:9000** — la scheda **Cluster** mostra i nodi e le heatmap EMAP per nodo.
-La Fase 2 (RPC expert cross-node) è pianificata: [`aviary-cluster-plan.md`](aviary-cluster-plan.md).
+Apri **http://A:9000** — scheda **Cluster**. Piano completo: [`aviary-cluster-plan.md`](aviary-cluster-plan.md).
 
 > **Colibrì** (il motore sottostante) è un motore di inferenza che puoi usare oggi, e una
 > piattaforma di ricerca aperta.

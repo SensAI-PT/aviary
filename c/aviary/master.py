@@ -1,4 +1,4 @@
-"""Aviary cluster master — registry, routing, and cluster HTTP API."""
+"""Aviary cluster master — registry, routing, placement scheduler, cluster HTTP API."""
 
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from aviary.protocol import ProtocolError, read_frame, write_line
+from aviary.jobs import JobTracker
+from aviary.placement import PlacementScheduler
+from aviary.protocol import ProtocolError, placement_frame, read_frame, write_line
 from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC, NodeRegistry
 
 try:
@@ -24,6 +26,7 @@ except ImportError:
     from openai_server import APIHandler, DEFAULT_CORS_ORIGINS, model_object  # type: ignore
 
 WEB_DIST = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+DEFAULT_PLACEMENT_SEC = float(os.environ.get("AVIARY_PLACEMENT_SEC", "4"))
 
 
 class ControlPlaneServer(socketserver.ThreadingTCPServer):
@@ -40,8 +43,6 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
         registry: NodeRegistry = self.server.registry  # type: ignore[attr-defined]
         conn = self.request
         peer_host = self.client_address[0]
-        # See CONTROL_IDLE_TIMEOUT_MS: this must stay well above the ~2s heartbeat
-        # cadence, not the ~150ms expert-RPC latency budget (#AVIARY-1).
         timeout_ms = CONTROL_IDLE_TIMEOUT_MS
         node_id = None
         try:
@@ -55,13 +56,16 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
                     model_id = fields[3]
                     payload.setdefault("host", peer_host)
                     try:
-                        registry.register(node_id, peer_host, http_port, model_id, payload)
+                        registry.register(node_id, peer_host, http_port, model_id, payload,
+                                          control_conn=conn)
                         write_line(conn, f"REGISTERED {node_id}")
-                    except ValueError:
-                        write_line(conn, f"ERROR {node_id} DUPLICATE")
+                    except ValueError as err:
+                        code = str(err) if str(err) not in ("DUPLICATE",) else "DUPLICATE"
+                        write_line(conn, f"ERROR {node_id} {code}")
                 elif kind == "HEARTBEAT" and len(fields) >= 3 and payload is not None:
                     node_id = fields[1]
                     inflight = int(fields[2])
+                    registry.set_control_conn(node_id, conn)
                     if registry.heartbeat(node_id, inflight, payload):
                         write_line(conn, f"HEARTBEAT_ACK {node_id}")
                 elif kind == "DEREGISTER" and len(fields) >= 2:
@@ -82,20 +86,18 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
 class MasterHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, registry: NodeRegistry, api_key=None, cors_origins=DEFAULT_CORS_ORIGINS):
+    def __init__(self, address, registry: NodeRegistry, scheduler: PlacementScheduler,
+                 jobs: JobTracker, api_key=None, cors_origins=DEFAULT_CORS_ORIGINS):
         super().__init__(address, MasterHTTPHandler)
         self.registry = registry
+        self.scheduler = scheduler
+        self.jobs = jobs
         self.api_key = api_key
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
 
     @property
     def model_id(self):
-        """What the cluster is serving, as reported by the agents themselves.
-
-        The master never loads a model and must not name one: agents send their
-        own model_id at REGISTER. Only used before any agent has registered.
-        """
         nodes = self.registry.snapshot().get("nodes") or []
         return next((n["model_id"] for n in nodes if n.get("model_id")),
                     os.environ.get("COLI_MODEL_ID", "colibri"))
@@ -105,7 +107,13 @@ class MasterHTTPHandler(APIHandler):
     server_version = "aviary-master"
 
     def _pick_node(self):
-        node = self.server.registry.pick_least_loaded()  # type: ignore[attr-defined]
+        registry = self.server.registry  # type: ignore[attr-defined]
+        scheduler = self.server.scheduler  # type: ignore[attr-defined]
+        plan = scheduler.last_plan
+        hot: set[tuple[int, int]] = set()
+        if plan and plan.experts:
+            hot = {tuple(map(int, k.split(":"))) for k in plan.experts}
+        node = registry.pick_with_affinity(hot or None)
         if node is None:
             raise RuntimeError("no healthy agents registered")
         return node
@@ -134,9 +142,34 @@ class MasterHTTPHandler(APIHandler):
         if path == "/cluster/nodes":
             self.send_json(200, self.server.registry.snapshot())  # type: ignore[attr-defined]
             return
+        if path == "/cluster/placement":
+            scheduler = self.server.scheduler  # type: ignore[attr-defined]
+            self.send_json(200, scheduler.snapshot())
+            return
+        if path == "/cluster/costs":
+            scheduler = self.server.scheduler  # type: ignore[attr-defined]
+            snap = scheduler.snapshot()
+            self.send_json(200, {"costs": snap, "nodes": self.server.registry.snapshot()})  # type: ignore[attr-defined]
+            return
+        if path == "/cluster/jobs":
+            jobs = self.server.jobs.snapshot()  # type: ignore[attr-defined]
+            self.send_json(200, jobs)
+            return
+        if path == "/cluster/overview":
+            registry = self.server.registry  # type: ignore[attr-defined]
+            scheduler = self.server.scheduler  # type: ignore[attr-defined]
+            jobs = self.server.jobs  # type: ignore[attr-defined]
+            self.send_json(200, {
+                "nodes": registry.snapshot(),
+                "placement": scheduler.snapshot(),
+                "jobs": jobs.snapshot(),
+                "updated_at": time.time(),
+            })
+            return
         if path == "/health":
             snap = self.server.registry.snapshot()  # type: ignore[attr-defined]
-            self.send_json(200, {"status": "ok", "scheduler": snap, "cluster": True})
+            self.send_json(200, {"status": "ok", "scheduler": snap, "cluster": True,
+                                 "placement": self.server.scheduler.snapshot()})  # type: ignore[attr-defined]
             return
         if self.serve_static(path):
             return
@@ -165,14 +198,19 @@ class MasterHTTPHandler(APIHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b""
         node = None
+        job = None
         try:
             node = self._pick_node()
+            job = self.server.jobs.start(node.node_id, node.endpoint, path)  # type: ignore[attr-defined]
             self.server.registry.increment_inflight(node.node_id, 1)  # type: ignore[attr-defined]
             status, resp_headers, resp = self._proxy_raw(
                 node, "POST", path, body=body,
                 headers={"Content-Type": self.headers.get("Content-Type", "application/json"),
                          "Accept": self.headers.get("Accept", "*/*")})
             self.send_response(status)
+            if job:
+                self.send_header("X-Aviary-Job-Id", job.job_id)
+                self.send_header("X-Aviary-Node-Id", node.node_id)
             has_length = False
             for key, value in resp_headers.items():
                 lower = key.lower()
@@ -182,11 +220,6 @@ class MasterHTTPHandler(APIHandler):
                     has_length = True
                 self.send_header(key, value)
             if not has_length:
-                # Agent's own response was close-framed (streaming SSE: no Content-Length,
-                # no chunked Transfer-Encoding — http.client already de-chunked it for us).
-                # We must say the same to the browser or it hangs forever waiting for a
-                # length/close signal that never comes on our (otherwise HTTP/1.1 keep-alive)
-                # connection to it. This is the fix for the UI stuck-loading bug (#cluster-1).
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.end_headers()
@@ -197,14 +230,17 @@ class MasterHTTPHandler(APIHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
             resp.close()
+            if job:
+                self.server.jobs.finish(job.job_id, http_status=status)  # type: ignore[attr-defined]
         except RuntimeError as error:
+            if job:
+                self.server.jobs.finish(job.job_id, error=str(error))  # type: ignore[attr-defined]
             self.send_json(502, {"error": {"message": str(error)}})
         finally:
             if node:
                 self.server.registry.increment_inflight(node.node_id, -1)  # type: ignore[attr-defined]
 
     def serve_static(self, path):
-        # Never SPA-fallback API routes (same guard as openai_server.APIHandler).
         if path.startswith("/v1/") or path.startswith("/cluster/") or path in (
                 "/health", "/experts", "/profile"):
             return False
@@ -242,6 +278,33 @@ class MasterHTTPHandler(APIHandler):
         return True
 
 
+def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> None:
+    snap = registry.snapshot()
+    nodes = snap.get("nodes") or []
+    if len(nodes) < 1:
+        return
+    scheduler.recompute(nodes)
+    conns = registry.control_connections()
+    for node in nodes:
+        nid = node["node_id"]
+        conn = conns.get(nid)
+        if not conn:
+            continue
+        try:
+            payload = scheduler.build_agent_payload(nid, nodes, int(node.get("expert_port", 9003)))
+            conn.sendall(placement_frame(payload).encode("utf-8"))
+        except OSError as error:
+            print(f"[aviary-master] placement push to {nid} failed: {error}", file=sys.stderr)
+
+
+def _placement_ticker(registry: NodeRegistry, scheduler: PlacementScheduler, stop: threading.Event):
+    while not stop.wait(DEFAULT_PLACEMENT_SEC):
+        try:
+            _push_placement(registry, scheduler)
+        except Exception as error:
+            print(f"[aviary-master] placement error: {error}", file=sys.stderr)
+
+
 def _lease_ticker(registry: NodeRegistry, stop: threading.Event):
     while not stop.wait(DEFAULT_HEARTBEAT_SEC):
         evicted = registry.tick_leases()
@@ -257,9 +320,14 @@ def run_master(host="0.0.0.0", port=9000, control_port=None, api_key=None, cors_
                   "(set COLI_ALLOW_INSECURE_BIND=1 to override)", file=sys.stderr)
             sys.exit(1)
     registry = NodeRegistry()
+    scheduler = PlacementScheduler()
+    jobs = JobTracker()
     stop = threading.Event()
     ticker = threading.Thread(target=_lease_ticker, args=(registry, stop), daemon=True)
     ticker.start()
+    placement_thread = threading.Thread(
+        target=_placement_ticker, args=(registry, scheduler, stop), daemon=True)
+    placement_thread.start()
 
     control = ControlPlaneServer((host if host != "0.0.0.0" else "", control_port), registry)
     control_thread = threading.Thread(
@@ -267,7 +335,7 @@ def run_master(host="0.0.0.0", port=9000, control_port=None, api_key=None, cors_
     control_thread.start()
 
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    http = MasterHTTPServer((host, port), registry, api_key, origins)
+    http = MasterHTTPServer((host, port), registry, scheduler, jobs, api_key, origins)
     print(f"Aviary master HTTP http://{host}:{port}  control :{control_port}", file=sys.stderr)
 
     previous = signal.getsignal(signal.SIGTERM)

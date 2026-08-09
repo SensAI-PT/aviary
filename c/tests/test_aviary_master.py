@@ -8,7 +8,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
+from aviary.jobs import JobTracker
 from aviary.master import ControlPlaneServer, MasterHTTPServer
+from aviary.placement import PlacementScheduler
 from aviary.protocol import heartbeat_frame, read_frame, register_frame
 from aviary.registry import NodeRegistry
 
@@ -81,7 +83,7 @@ class MasterHttpRoutingTest(unittest.TestCase):
         agent_thread.start()
         registry.register("node-a", "127.0.0.1", agent_port, "hy3-colibri",
                           {"host": "127.0.0.1"})
-        http = MasterHTTPServer(("127.0.0.1", 0), registry)
+        http = MasterHTTPServer(("127.0.0.1", 0), registry, PlacementScheduler(), JobTracker())
         http_port = http.server_address[1]
         http_thread = threading.Thread(target=http.serve_forever, daemon=True)
         http_thread.start()
@@ -134,7 +136,7 @@ class MasterStreamingProxyTest(unittest.TestCase):
         agent_thread.start()
         registry.register("node-a", "127.0.0.1", agent_port, "hy3-colibri",
                           {"host": "127.0.0.1"})
-        http_srv = MasterHTTPServer(("127.0.0.1", 0), registry)
+        http_srv = MasterHTTPServer(("127.0.0.1", 0), registry, PlacementScheduler(), JobTracker())
         http_port = http_srv.server_address[1]
         http_thread = threading.Thread(target=http_srv.serve_forever, daemon=True)
         http_thread.start()

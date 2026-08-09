@@ -8,41 +8,47 @@
 </p>
 
 <p align="center">
-  <strong>Aviary</strong> — 基于 <a href="https://github.com/JustVugg/colibri">Colibri</a>
-  推理引擎的自组织集群
+  <strong>在 commodity 硬件集群上尽可能快地运行大型 LLM。</strong>
 </p>
 
-**将 N 个 Colibri 节点组成一个集群。** Aviary 在 [Colibri](https://github.com/JustVugg/colibri)
-推理引擎之上增加 master 调度器、worker agent 和 Spark 风格的集群仪表盘。将 Web UI 或任意
-OpenAI 客户端指向 master — 每个请求路由到负载最低的健康 agent。每个 agent 仍运行模型的
-完整本地副本（阶段 1：全副本负载均衡；跨节点 expert 执行在阶段 2）。
+<p align="center">
+  <strong>Aviary</strong> — 基于 <a href="https://github.com/JustVugg/colibri">Colibri</a>
+  推理引擎的 MoE 集群控制平面
+</p>
 
-底层引擎与 Colibri 相同：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）与 **OLMoE**（7B）——各自一个 C 文件，共用 `coli chat` / `coli serve` /
-`coli web` 前端。[完整列表](README.md#other-supported-models)
+**Aviary 的使命：** 在 commodity 硬件组成的集群上运行大型 MoE 语言模型，并尽可能保持最快速度。
+
+Aviary 是 [Colibri](https://github.com/JustVugg/colibri) 之上的集群层。每个节点运行本地 Colibri
+引擎（纯 C、按用量从 disk/RAM/VRAM 热加载 expert）；Aviary 增加 master 调度器、worker agent、
+成本感知 placement 调度器，以及 Spark 风格的集群仪表盘（Jobs、Executors、Placement、RPC）。
+
+将 Web UI 或任意 OpenAI 客户端指向 master — 请求路由到最优 agent，expert 工作可跨节点 RPC，
+远程失败时自动回退本地 disk 加载。
 
 > **Aviary 拥有集群控制平面；[Colibri](https://github.com/JustVugg/colibri) 拥有引擎。**
 > 详见 [`docs/AVIARY.md`](docs/AVIARY.md) 与 [`docs/cluster_protocol.md`](docs/cluster_protocol.md)。
 
-## Aviary 集群（阶段 1）
+## Aviary 集群
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| **1** | 节点注册、心跳、负载均衡、Cluster 仪表盘 | ✓ |
+| **2** | 跨节点 expert RPC、placement 调度器、按模型隔离的 usage 统计 | ✓ |
+| **3–4** | 请求时间线、权重预取 | 计划中 |
 
 | 组件 | 命令 | 默认端口 | 职责 |
 |---|---|---|---|
-| **master** | `./c/coli master` | HTTP `9000`，控制 `9002` | 注册表、心跳、请求路由、仪表盘 |
-| **agent** | `./c/coli agent --master URL` | HTTP `8001` | 本地 Colibri `Engine` 子进程 + 遥测转发 |
+| **master** | `./c/coli master` | HTTP `9000`，控制 `9002` | 注册表、路由、placement、仪表盘 |
+| **agent** | `./c/coli agent --master URL` | HTTP `8001`，expert RPC `9003` | 本地 Engine + 遥测 |
 
 ```bash
-# 机器 A — master + 第一个 agent
+export AVIARY_CLUSTER=1
 ./c/coli master --host 0.0.0.0 --port 9000
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
-
-# 机器 B — 第二个 agent
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
-  --advertise-host B
+COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 ```
 
-打开 **http://A:9000** — **Cluster** 标签页显示已注册节点及每节点 expert 热力图。
-阶段 2（跨节点 expert RPC）见 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
+打开 **http://A:9000** — **Cluster** 标签页显示 Jobs、Executors、Placement 与 RPC 延迟。
+完整路线图见 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
 
 > **Colibrì**（Aviary 所包装的引擎）既是今天就能运行的推理引擎，也是一个开放的研究平台。
 

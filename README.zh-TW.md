@@ -8,41 +8,41 @@
 </p>
 
 <p align="center">
-  <strong>Aviary</strong> — 基於 <a href="https://github.com/JustVugg/colibri">Colibri</a>
-  推論引擎的自組織叢集
+  <strong>在 commodity 硬體叢集上盡可能快地執行大型 LLM。</strong>
 </p>
 
-**將 N 個 Colibri 節點組成一個叢集。** Aviary 在 [Colibri](https://github.com/JustVugg/colibri)
-推論引擎之上增加 master 排程器、worker agent 與 Spark 風格的叢集儀表板。將 Web UI 或任意
-OpenAI 用戶端指向 master — 每個請求路由到負載最低的健康 agent。每個 agent 仍執行模型的
-完整本地副本（階段 1：全副本負載平衡；跨節點 expert 執行在階段 2）。
+<p align="center">
+  <strong>Aviary</strong> — 基於 <a href="https://github.com/JustVugg/colibri">Colibri</a>
+  推論引擎的 MoE 叢集控制平面
+</p>
 
-底層引擎與 Colibri 相同：**GLM-5.2**（744B）、**Inkling**（975B）、**Kimi K3**
-（2.8T）與 **OLMoE**（7B）——各自一個 C 檔案，共用 `coli chat` / `coli serve` /
-`coli web` 前端。[完整清單](README.md#other-supported-models)
+**Aviary 的使命：** 在 commodity 硬體組成的叢集上執行大型 MoE 語言模型，並盡可能保持最快速度。
+
+Aviary 是 [Colibri](https://github.com/JustVugg/colibri) 之上的叢集層，提供 master 排程器、
+worker agent、成本感知 placement，以及 Spark 風格的 Cluster 儀表板（Jobs、Executors、Placement、RPC）。
 
 > **Aviary 擁有叢集控制平面；[Colibri](https://github.com/JustVugg/colibri) 擁有引擎。**
-> 詳見 [`docs/AVIARY.md`](docs/AVIARY.md) 與 [`docs/cluster_protocol.md`](docs/cluster_protocol.md)。
+> 詳見 [`docs/AVIARY.md`](docs/AVIARY.md)。
 
-## Aviary 叢集（階段 1）
+## Aviary 叢集
+
+| 階段 | 內容 | 狀態 |
+|---|---|---|
+| **1** | 節點註冊、心跳、負載均衡 | ✓ |
+| **2** | 跨節點 expert RPC、placement 排程器 | ✓ |
 
 | 元件 | 命令 | 預設埠 | 職責 |
 |---|---|---|---|
-| **master** | `./c/coli master` | HTTP `9000`，控制 `9002` | 註冊表、心跳、請求路由、儀表板 |
-| **agent** | `./c/coli agent --master URL` | HTTP `8001` | 本地 Colibri `Engine` 子行程 + 遙測轉發 |
+| **master** | `./c/coli master` | HTTP `9000`，控制 `9002` | 註冊表、路由、placement、儀表板 |
+| **agent** | `./c/coli agent --master URL` | HTTP `8001`，expert RPC `9003` | 本地 Engine + 遙測 |
 
 ```bash
-# 機器 A — master + 第一個 agent
+export AVIARY_CLUSTER=1
 ./c/coli master --host 0.0.0.0 --port 9000
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
-
-# 機器 B — 第二個 agent
-COLI_MODEL=/path/to/hy3_i4 ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
-  --advertise-host B
+COLI_MODEL=/path/to/model ./c/coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 ```
 
-開啟 **http://A:9000** — **Cluster** 分頁顯示已註冊節點及每節點 expert 熱力圖。
-階段 2（跨節點 expert RPC）見 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
+開啟 **http://A:9000** — **Cluster** 分頁。詳見 [`aviary-cluster-plan.md`](aviary-cluster-plan.md)。
 
 > **Colibrì**（Aviary 所包裝的引擎）既是今天就能執行的推論引擎，也是一個開放的研究平台。
 

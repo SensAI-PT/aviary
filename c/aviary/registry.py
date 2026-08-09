@@ -1,4 +1,4 @@
-"""In-memory cluster node registry with heartbeat lease."""
+"""In-memory cluster node registry with heartbeat lease and Phase 2 cohort state."""
 
 from __future__ import annotations
 
@@ -12,14 +12,6 @@ from typing import Any
 DEFAULT_HEARTBEAT_SEC = float(os.environ.get("AVIARY_HEARTBEAT_SEC", "2"))
 DEFAULT_HEARTBEAT_MISS = int(os.environ.get("AVIARY_HEARTBEAT_MISS", "3"))
 
-# Idle-read timeout for a control connection between heartbeats. Deliberately generous
-# (a few heartbeat intervals beyond the miss threshold that already decides liveness in
-# tick_leases()) so a socket read timeout never preempts that policy -- this is a "is the
-# connection hung" backstop, not the liveness mechanism itself. Must NOT reuse
-# AVIARY_RPC_TIMEOUT_MS (protocol.DEFAULT_RPC_TIMEOUT_MS): that constant is a per-expert-RPC
-# latency budget (Phase 2 cluster_rpc, ~150ms) with nothing to do with the ~2s heartbeat
-# cadence -- reusing it here made every control connection read-timeout, and get marked
-# dead, within one heartbeat interval of registering (#AVIARY-1).
 CONTROL_IDLE_TIMEOUT_MS = int(DEFAULT_HEARTBEAT_SEC * 1000 * (DEFAULT_HEARTBEAT_MISS + 2))
 
 
@@ -39,6 +31,13 @@ class NodeRecord:
     hits: str = ""
     hits_seq: int = 0
     model_path: str = ""
+    arch: str = ""
+    engine_id: int | None = None
+    usage: list[dict[str, Any]] = field(default_factory=list)
+    costs: list[dict[str, Any]] = field(default_factory=list)
+    profile: list[dict[str, Any]] = field(default_factory=list)
+    expert_port: int = int(os.environ.get("AVIARY_EXPERT_PORT", "9003"))
+    control_conn: Any = None
     status: str = "healthy"
     missed_heartbeats: int = 0
 
@@ -51,6 +50,8 @@ class NodeRecord:
             "http_port": self.http_port,
             "model_id": self.model_id,
             "model_path": self.model_path,
+            "arch": self.arch,
+            "engine_id": self.engine_id,
             "status": self.status,
             "inflight": self.inflight,
             "uptime_sec": now - self.registered_at,
@@ -60,17 +61,56 @@ class NodeRecord:
             "emap": self.emap,
             "hits": self.hits,
             "hits_seq": self.hits_seq,
+            "usage": self.usage,
+            "costs": self.costs,
+            "profile": self.profile,
+            "expert_port": self.expert_port,
         }
+
+
+@dataclass
+class ClusterCohort:
+    arch: str = ""
+    model_id: str = ""
+    engine_id: int | None = None
+    emap_rows: int = 0
+    emap_cols: int = 0
 
 
 class NodeRegistry:
     def __init__(self, heartbeat_miss: int = DEFAULT_HEARTBEAT_MISS):
         self._lock = threading.Lock()
         self._nodes: dict[str, NodeRecord] = {}
+        self._cohort: ClusterCohort | None = None
         self.heartbeat_miss = heartbeat_miss
+        self._merged_usage: dict[tuple[int, int], int] = {}
+
+    def _validate_cohort(self, model_id: str, payload: dict[str, Any]) -> None:
+        arch = str(payload.get("arch") or "")
+        engine_id = payload.get("engine_id")
+        emap = payload.get("emap") or {}
+        rows, cols = int(emap.get("rows") or 0), int(emap.get("cols") or 0)
+        with self._lock:
+            if self._cohort is None:
+                self._cohort = ClusterCohort(arch=arch, model_id=model_id,
+                                             engine_id=int(engine_id) if engine_id is not None else None,
+                                             emap_rows=rows, emap_cols=cols)
+                return
+            if self._cohort.model_id and model_id != self._cohort.model_id:
+                raise ValueError("COHORT_MODEL")
+            if arch and self._cohort.arch and arch != self._cohort.arch:
+                raise ValueError("COHORT_ARCH")
+            if engine_id is not None and self._cohort.engine_id is not None:
+                if int(engine_id) != self._cohort.engine_id:
+                    raise ValueError("COHORT_ENGINE")
+            if rows and self._cohort.emap_rows and rows != self._cohort.emap_rows:
+                raise ValueError("COHORT_EMAP")
+            if cols and self._cohort.emap_cols and cols != self._cohort.emap_cols:
+                raise ValueError("COHORT_EMAP")
 
     def register(self, node_id: str, host: str, http_port: int, model_id: str,
-                 payload: dict[str, Any]) -> NodeRecord:
+                 payload: dict[str, Any], control_conn: Any = None) -> NodeRecord:
+        self._validate_cohort(model_id, payload)
         host = payload.get("host") or host
         endpoint = f"http://{host}:{http_port}"
         with self._lock:
@@ -88,9 +128,22 @@ class NodeRegistry:
                 hits=payload.get("hits") or "",
                 hits_seq=int(payload.get("hits_seq") or 0),
                 model_path=str(payload.get("model_path") or ""),
+                arch=str(payload.get("arch") or ""),
+                engine_id=int(payload["engine_id"]) if payload.get("engine_id") is not None else None,
+                usage=list(payload.get("usage") or []),
+                costs=list(payload.get("costs") or []),
+                profile=list(payload.get("profile") or []),
+                expert_port=int(payload.get("expert_port") or os.environ.get("AVIARY_EXPERT_PORT", "9003")),
+                control_conn=control_conn,
             )
             self._nodes[node_id] = record
             return record
+
+    def set_control_conn(self, node_id: str, conn: Any) -> None:
+        with self._lock:
+            record = self._nodes.get(node_id)
+            if record:
+                record.control_conn = conn
 
     def heartbeat(self, node_id: str, inflight: int, payload: dict[str, Any]) -> NodeRecord | None:
         with self._lock:
@@ -101,16 +154,26 @@ class NodeRegistry:
             record.last_heartbeat = time.time()
             record.missed_heartbeats = 0
             record.status = "healthy"
-            if payload.get("hwinfo"):
-                record.hwinfo = payload["hwinfo"]
-            if payload.get("tiers"):
-                record.tiers = payload["tiers"]
-            if payload.get("emap"):
-                record.emap = payload["emap"]
+            for key in ("hwinfo", "tiers", "emap"):
+                if payload.get(key):
+                    setattr(record, key, payload[key])
             if "hits" in payload:
                 record.hits = payload.get("hits") or ""
             if "hits_seq" in payload:
                 record.hits_seq = int(payload["hits_seq"] or 0)
+            if payload.get("usage"):
+                record.usage = list(payload["usage"])
+                for r in record.usage:
+                    k = (int(r["layer"]), int(r["expert"]))
+                    self._merged_usage[k] = self._merged_usage.get(k, 0) + int(r.get("count", 0))
+            if payload.get("costs"):
+                record.costs = list(payload["costs"])
+            if payload.get("profile"):
+                record.profile = list(payload["profile"])
+            if payload.get("arch"):
+                record.arch = str(payload["arch"])
+            if payload.get("engine_id") is not None:
+                record.engine_id = int(payload["engine_id"])
             return record
 
     def deregister(self, node_id: str) -> None:
@@ -122,6 +185,7 @@ class NodeRegistry:
             record = self._nodes.get(node_id)
             if record:
                 record.status = "dead"
+                record.control_conn = None
 
     def tick_leases(self) -> list[str]:
         evicted = []
@@ -134,6 +198,7 @@ class NodeRegistry:
                     record.missed_heartbeats += 1
                     if record.missed_heartbeats >= self.heartbeat_miss:
                         record.status = "dead"
+                        record.control_conn = None
                         evicted.append(node_id)
                 elif age > DEFAULT_HEARTBEAT_SEC:
                     record.status = "stale"
@@ -143,20 +208,60 @@ class NodeRegistry:
         with self._lock:
             return [n for n in self._nodes.values() if n.status == "healthy"]
 
-    def pick_least_loaded(self) -> NodeRecord | None:
+    def pick_least_loaded(self, affinity_node: str | None = None) -> NodeRecord | None:
         nodes = self.healthy_nodes()
         if not nodes:
             return None
+        if affinity_node:
+            match = next((n for n in nodes if n.node_id == affinity_node), None)
+            if match and match.inflight <= min(n.inflight for n in nodes) + 1:
+                return match
         return min(nodes, key=lambda n: (n.inflight, n.last_heartbeat))
 
-    def snapshot(self) -> dict[str, Any]:
+    def pick_with_affinity(self, hot_experts: set[tuple[int, int]] | None = None) -> NodeRecord | None:
+        nodes = self.healthy_nodes()
+        if not nodes:
+            return None
+        if not hot_experts:
+            return self.pick_least_loaded()
+        from aviary.placement import decode_emap
+
+        def score(n: NodeRecord) -> tuple[int, float, int]:
+            inv = decode_emap(n.emap)
+            hot_hits = sum(1 for k in hot_experts if inv.get(k, {}).get("tier", 0) >= 1)
+            return (-hot_hits, n.inflight, n.last_heartbeat)
+
+        return min(nodes, key=score)
+
+    def cluster_state(self) -> dict[str, Any]:
         with self._lock:
             nodes = [record.snapshot() for record in self._nodes.values()]
+            cohort = self._cohort
         healthy = sum(1 for n in nodes if n["status"] == "healthy")
-        return {"nodes": nodes, "healthy": healthy, "total": len(nodes)}
+        return {
+            "nodes": nodes,
+            "healthy": healthy,
+            "total": len(nodes),
+            "cohort": {
+                "arch": cohort.arch if cohort else "",
+                "model_id": cohort.model_id if cohort else "",
+                "engine_id": cohort.engine_id if cohort else None,
+            },
+            "merged_usage": [{"layer": l, "expert": e, "count": c}
+                             for (l, e), c in sorted(self._merged_usage.items(),
+                                                     key=lambda kv: -kv[1])[:256]],
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.cluster_state()
 
     def increment_inflight(self, node_id: str, delta: int = 1) -> None:
         with self._lock:
             record = self._nodes.get(node_id)
             if record and record.status == "healthy":
                 record.inflight = max(0, record.inflight + delta)
+
+    def control_connections(self) -> dict[str, Any]:
+        with self._lock:
+            return {nid: rec.control_conn for nid, rec in self._nodes.items()
+                    if rec.control_conn and rec.status == "healthy"}

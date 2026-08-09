@@ -5,14 +5,17 @@ Model-agnostic: uses Colibri's model_arch / argv_for_arch / Engine resolution.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
+from aviary.expert_rpc import DEFAULT_EXPERT_PORT, start_expert_rpc_server
 from aviary.identity import load_or_create_node_id
 from aviary.protocol import (
     ProtocolError,
@@ -22,6 +25,7 @@ from aviary.protocol import (
     write_line,
 )
 from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC
+from aviary.usage import arch_engine_id, read_coli_usage, usage_delta
 
 try:
     from openai_server import (
@@ -58,7 +62,7 @@ def _local_ip_for(peer: tuple[str, int]) -> str:
 
 class ControlConnection:
     def __init__(self, node_id, master_host, control_port, http_port, model_id, model_path,
-                 advertise_host, engine, scheduler, arch):
+                 advertise_host, engine, scheduler, arch, expert_port, placement_path):
         self.node_id = node_id
         self.master_host = master_host
         self.control_port = control_port
@@ -68,11 +72,10 @@ class ControlConnection:
         self.advertise_host = advertise_host
         self.engine = engine
         self.scheduler = scheduler
-        # This node's engine family. Taken from run_agent, NOT from
-        # openai_server.ARCH: that is rebound after this module is imported, so
-        # a `from openai_server import ARCH` here would freeze the "glm" default
-        # and every node would report glm to the master.
         self.arch = arch
+        self.expert_port = expert_port
+        self.placement_path = placement_path
+        self._usage_snapshot: list[dict] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="aviary-control", daemon=True)
 
@@ -83,11 +86,27 @@ class ControlConnection:
         self._stop.set()
         self._thread.join(timeout=5)
 
+    def _write_placement(self, payload: dict) -> None:
+        self.placement_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.placement_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(self.placement_path)
+
+    def _handle_control(self, kind: str, fields: list[str], payload: dict | None) -> None:
+        if kind == "PLACEMENT" and payload is not None:
+            self._write_placement(payload)
+        elif kind == "PIN" and len(fields) >= 4:
+            pass  # Phase 2: forward PIN to engine when stdin hook exists
+        elif kind in ("LOAD", "EVICT") and len(fields) >= 3:
+            pass
+
     def _register_payload(self) -> dict:
         payload = {
             "host": self.advertise_host,
             "model_path": self.model_path,
             "arch": self.arch,
+            "engine_id": arch_engine_id(self.arch),
+            "expert_port": self.expert_port,
         }
         eng = self.engine
         if getattr(eng, "hwinfo", None):
@@ -126,11 +145,19 @@ class ControlConnection:
     def _telemetry_payload(self) -> dict:
         eng = self.engine
         snap = self.scheduler.snapshot()
+        usage_path = Path(self.model_path) / ".coli_usage"
+        _, _, engine_id, records = read_coli_usage(usage_path)
+        delta = usage_delta(self._usage_snapshot, records)
+        self._usage_snapshot = records
         payload = {
             "uptime_sec": time.time() - self._started,
             "hits": getattr(eng, "hits", None) or "",
             "hits_seq": getattr(eng, "hits_seq", 0),
             "arch": self.arch,
+            "engine_id": engine_id or arch_engine_id(self.arch),
+            "usage": delta or records[-64:],
+            "costs": list(getattr(eng, "ecost", []) or []),
+            "profile": list(getattr(eng, "profile", ()) or ())[-8:],
         }
         if getattr(eng, "hwinfo", None):
             payload["hwinfo"] = eng.hwinfo
@@ -164,16 +191,18 @@ class ControlConnection:
                         frame = heartbeat_frame(self.node_id, inflight, self._telemetry_payload())
                         sock.sendall(frame.encode("utf-8"))
                         try:
-                            kind, _, _ = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
+                            kind, fields, payload = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
                             if kind == "PING":
                                 write_line(sock, "PONG")
                             elif kind == "DRAIN":
                                 break
+                            else:
+                                self._handle_control(kind, fields, payload)
                         except ProtocolError:
                             break
                         next_beat = now + DEFAULT_HEARTBEAT_SEC
                     try:
-                        kind, fields, _ = read_frame(
+                        kind, fields, payload = read_frame(
                             sock, int(max(100, (next_beat - time.time()) * 1000)))
                         if kind == "EOF":
                             break
@@ -181,6 +210,8 @@ class ControlConnection:
                             write_line(sock, "PONG")
                         elif kind == "DRAIN":
                             break
+                        else:
+                            self._handle_control(kind, fields, payload)
                     except (ProtocolError, socket.timeout):
                         pass
             except OSError as error:
@@ -218,6 +249,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     parsed = urlparse(master_url if "://" in master_url else f"http://{master_url}")
     master_host = parsed.hostname or "127.0.0.1"
     control_port = control_port or int(os.environ.get("AVIARY_CONTROL_PORT", "9002"))
+    expert_port = int(os.environ.get("AVIARY_EXPERT_PORT", str(DEFAULT_EXPERT_PORT)))
     node_id = load_or_create_node_id(model)
     arch = model_arch(model)
     openai_server.ARCH = arch
@@ -226,21 +258,34 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     if not advertise and host in ("0.0.0.0", "::"):
         advertise = _local_ip_for((master_host, control_port))
     engine_bin = engine_path or str(default_engine())
+    placement_path = Path(model) / ".aviary_placement.json"
+
+    child_env = dict(env or os.environ)
+    if os.environ.get("AVIARY_CLUSTER", "0") not in ("0", ""):
+        child_env["AVIARY_CLUSTER"] = "1"
+        child_env["AVIARY_PLACEMENT"] = str(placement_path)
 
     server = APIServer((host, port), None, model_id, api_key, max_tokens,
                        cors_origins=DEFAULT_CORS_ORIGINS,
                        max_queue=max_queue, queue_timeout=queue_timeout,
                        kv_slots=kv_slots,
                        allowed_hosts=_agent_allowed_hosts(advertise, allowed_hosts))
-    runtime = Engine(engine_bin, model, cap, max_tokens, env, kv_slots, arch)
+    runtime = Engine(engine_bin, model, cap, max_tokens, child_env, kv_slots, arch)
     server.engine = runtime
 
+    rpc_host = advertise or host
+    if rpc_host in ("0.0.0.0", "::"):
+        rpc_host = "0.0.0.0"
+    rpc_server, _, _ = start_expert_rpc_server(rpc_host, expert_port, runtime)
+
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
-                                advertise, runtime, server.scheduler, arch)
+                                advertise, runtime, server.scheduler, arch, expert_port,
+                                placement_path)
     control.start()
 
     print(f"Aviary agent {node_id} arch={arch} listening on http://{host}:{port}/v1 "
-          f"(master control {master_host}:{control_port})", file=sys.stderr)
+          f"(master control {master_host}:{control_port}, expert RPC :{expert_port})",
+          file=sys.stderr)
 
     previous = signal.getsignal(signal.SIGTERM)
 
@@ -253,6 +298,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     finally:
         signal.signal(signal.SIGTERM, previous)
         control.stop()
+        rpc_server.shutdown()
         server.scheduler.close()
         server.server_close()
         runtime.close()

@@ -94,9 +94,18 @@ Sent every `AVIARY_HEARTBEAT_SEC` (and optionally when `hits_seq` changes).
   "emap": { "rows": 79, "cols": 256, "map": "..." },
   "hits": "<hex>",
   "hits_seq": 42,
-  "uptime_sec": 3600.5
+  "uptime_sec": 3600.5,
+  "arch": "hy3",
+  "engine_id": 1234567890,
+  "usage": [{"layer": 12, "expert": 45, "count": 3}],
+  "costs": [{"layer": 12, "expert": 45, "tier": 1, "load_us": 0, "exec_us": 42000}],
+  "profile": [{"wall_s": 0.5, "expert_disk_s": 0.01, "expert_matmul_s": 0.2}]
 }
 ```
+
+Phase 2 fields (`arch`, `engine_id`, `usage`, `costs`, `profile`) are owned by agents;
+the master aggregates them for placement but does not write `.coli_usage` itself.
+Stats are never merged across different `engine_id` values (one LLM family per cohort).
 
 Master reply (optional, may be omitted under load):
 
@@ -126,13 +135,21 @@ DRAIN\n
 | `PING` | Agent must reply `PONG\n` within `AVIARY_RPC_TIMEOUT_MS` |
 | `DRAIN` | Stop accepting new HTTP work; finish in-flight; agent may reconnect after drain |
 
-Phase 2 reserves (ignored by Phase 1 agents):
+Phase 2 control commands:
 
 ```
+PLACEMENT <bytes>\n<json_payload>\n
+PIN <layer> <eid> <tier>\n
 LOAD <layer> <eid> <tier>\n
 EVICT <layer> <eid>\n
-PIN <layer> <eid> <tier>\n
 ```
+
+| frame | meaning |
+|---|---|
+| `PLACEMENT` | Full routing table for this agent (`node_id`, `peers`, `experts`) — written to `AVIARY_PLACEMENT` |
+| `PIN` | Pin expert to RAM/VRAM tier on this node |
+| `LOAD` | Prefetch expert into tier |
+| `EVICT` | Evict expert from hot store |
 
 ## Failure semantics
 
@@ -153,7 +170,10 @@ PIN <layer> <eid> <tier>\n
 | `/v1/chat/completions` | POST | Proxied to least-loaded healthy agent (streaming preserved) |
 | `/v1/models` | GET | From first healthy agent |
 | `/health` | GET | Master liveness + scheduler snapshot |
-| `/experts` | GET | Aggregated cluster EMAP (first node or merged in dashboard) |
+| `/cluster/placement` | GET | Current scheduler output (`experts`, `rpc_matrix_us`, …) |
+| `/cluster/costs` | GET | Cost matrix snapshot for debugging |
+| `/cluster/jobs` | GET | Active and recent proxied requests (`active`, `history`) |
+| `/cluster/overview` | GET | Combined snapshot for the Spark-style dashboard UI |
 
 Auth follows `coli serve`: `COLI_API_KEY` / `--api-key` when set.
 

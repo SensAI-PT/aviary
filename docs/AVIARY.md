@@ -1,48 +1,74 @@
-# Aviary — cluster overlay on Colibri
+# Aviary — run large LLMs on commodity hardware, fast
 
-Aviary turns N single-node [Colibri](https://github.com/JustVugg/colibri) engines
-into a request-routed cluster with a Spark-style node dashboard. This repository
-(`SensAI-PT/aviary-hy3`) is **Aviary**, not upstream Colibri — it ships a synced
-Colibri engine base plus the cluster control plane.
+**Mission:** run large MoE language models on a cluster of commodity machines, as fast as
+possible.
+
+Aviary is the cluster control plane for [Colibri](https://github.com/JustVugg/colibri) — a
+pure-C MoE inference engine that streams experts from disk/RAM/VRAM based on routing history.
+This repository (`SensAI-PT/aviary-hy3`) ships Aviary plus a synced Colibri engine base.
 
 Built on Colibri and the Hy3-enabled fork
 [`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3).
 
-## What Aviary adds
+## The problem Aviary solves
+
+Frontier MoE models (hundreds of billions of parameters, a handful active per token) do not
+fit comfortably on one machine — and datacenter GPU racks are not the only path forward.
+Teams already have several boxes with fast NVMe, ample RAM, and optional GPUs.
+
+Aviary wires those machines into one inference cluster and asks a harder question than
+"can we distribute?": **given this hardware, where should each expert live so the next
+token is as fast as possible?**
+
+That means:
+
+- tracking **per-model** expert usage (`.coli_usage` isolated by engine family)
+- measuring **execution cost** per node, tier (disk/RAM/VRAM), and expert
+- deciding when **remote RPC** beats **local disk load**
+- falling back to local execution whenever the cluster path misses — never blocking on the network
+
+## Architecture
+
+```
+Client → master (HTTP :9000)
+           ├─ routes chat to primary agent
+           ├─ placement scheduler (every ~4s)
+           └─ Cluster dashboard (jobs, executors, placement, RPC)
+
+Agent (each node)
+  ├─ Colibri engine subprocess (MoE forward, hot-load, .coli_usage)
+  ├─ expert RPC server (:9003) — serves individual expert matmuls to peers
+  └─ control heartbeat → master (EMAP, ECOST, usage, profile)
+```
+
+A single chat request lands on one **primary** agent. Inside `moe()`, the engine may RPC
+individual expert forwards to whichever node currently holds that expert hottest. Remote
+miss/timeout always falls through to local disk load.
+
+## Feature status
 
 | feature | status | description |
 |---|---|---|
-| `coli master` | Phase 1 ✓ | Node registry, heartbeat lease, OpenAI API proxy, dashboard host |
-| `coli agent` | Phase 1 ✓ | Wraps one local `Engine`; relays `HWINFO`/`TIERS`/`EMAP`/`HITS` telemetry |
-| Cluster dashboard tab | Phase 1 ✓ | Live node list, hardware, load, per-node expert heatmaps |
-| Least-loaded routing | Phase 1 ✓ | Master picks the healthy agent with lowest in-flight count |
-| Streaming chat proxy | Phase 1 ✓ | Master correctly close-frames SSE responses to the browser |
-| Cross-node expert RPC | Phase 2 | Single request can dispatch expert calls to peer nodes (planned) |
-| Placement scheduler | Phase 2 | Cluster-wide EMAP aggregation + `LOAD`/`EVICT`/`PIN` (planned) |
+| `coli master` | ✓ | Node registry, heartbeat lease, OpenAI API proxy, dashboard host |
+| `coli agent` | ✓ | Wraps one local `Engine`; relays telemetry to master |
+| Cluster dashboard | ✓ | Spark-style: Overview, Jobs, Executors, Placement, RPC tabs |
+| Least-loaded + affinity routing | ✓ | Master picks agent by load and hot-expert affinity |
+| Cross-node expert RPC | ✓ | `EXEC_EXPERT` mux + TCP expert server; `cluster_rpc.h` in `moe()` |
+| Placement scheduler | ✓ | Cost-aware expert placement; `PLACEMENT` pushed to agents |
+| Per-model usage isolation | ✓ | Stats keyed by `engine_id`; never merged across architectures |
+| Request job tracking | ✓ | `GET /cluster/jobs`, `GET /cluster/overview` |
+| MTP / dense layer placement | planned | Phase 2.4 — after expert RPC gates proven |
+| Cross-node weight prefetch | planned | Phase 4 |
 
-Phase 1 uses **full-replica load balancing**: each agent runs a complete independent
-copy of the model. The network is never required for correctness — if a remote node
-is slow or gone, agents fall back to local disk exactly like single-node `coli serve`.
+Enable Phase 2 on agents:
 
-See [`aviary-cluster-plan.md`](../aviary-cluster-plan.md) for the full Phase 1–4 roadmap.
+```bash
+export AVIARY_CLUSTER=1
+COLI_MODEL=/path/to/model ./coli agent --master http://MASTER:9000 ...
+```
 
-## Ownership boundary
-
-| Layer | Owns | Paths |
-|---|---|---|
-| **Colibri** | Engines, serve protocol, OpenAI HTTP, model detection | `c/*.c`, `c/openai_server.py`, `c/coli` (except master/agent), shared headers |
-| **Aviary** | Cluster registry, agent/master, cluster protocol, Cluster UI | `c/aviary/**`, `docs/cluster_protocol.md`, `coli master` / `coli agent`, `web/src/Cluster.tsx` (+ thin tab wiring) |
-
-**Rule:** Aviary must not permanently fork per-model engines (`hy3.c`, `deepseek_v4.c`,
-`kimi_k3.c`, `inkling.c`, `colibri.c`, …). New Colibri families work automatically once
-`coli`/`openai_server` resolve them — including **DeepSeek V4 Flash** after syncing
-upstream Colibri.
-
-Aviary’s runtime contract with Colibri:
-
-1. OpenAI-compatible HTTP (`POST /v1/chat/completions`, …)
-2. `GET /health`, `GET /experts`, `GET /profile`
-3. Serve-protocol telemetry when the engine emits it (`HWINFO` / `TIERS` / `EMAP` / `HITS`)
+The master writes placement tables to each agent; agents persist them at
+`<model_dir>/.aviary_placement.json` and set `AVIARY_PLACEMENT` for the engine.
 
 ## Quick start
 
@@ -53,25 +79,30 @@ git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
 # machine A — master (HTTP :9000, control :9002)
 ./coli master --host 0.0.0.0 --port 9000
 
-# machine A — first agent (any Colibri family — Hy3, DeepSeek V4, GLM, …)
+# machine A — first agent
+export AVIARY_CLUSTER=1
 COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 
 # machine B — second agent (same model weights on disk)
+export AVIARY_CLUSTER=1
 COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
   --advertise-host B
 ```
 
 Open **http://A:9000** — chat and the **Cluster** tab both go through the master.
-Point the web UI’s server URL at the master, not an individual agent.
+Point the web UI's server URL at the master, not an individual agent.
 
 ### Environment
 
 | variable | default | meaning |
 |---|---|---|
+| `AVIARY_CLUSTER` | `0` | Enable cross-node expert RPC on agents (`1` to activate) |
 | `AVIARY_CONTROL_PORT` | `9002` | Master control-plane TCP port |
+| `AVIARY_EXPERT_PORT` | `9003` | Agent expert RPC TCP port |
 | `AVIARY_HEARTBEAT_SEC` | `2` | Agent heartbeat interval |
 | `AVIARY_HEARTBEAT_MISS` | `3` | Missed heartbeats before eviction |
-| `AVIARY_RPC_TIMEOUT_MS` | `150` | Control-plane I/O deadline (expert RPC in Phase 2) |
+| `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |
+| `AVIARY_PLACEMENT_SEC` | `4` | Placement scheduler recompute interval |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
@@ -82,20 +113,34 @@ Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
 |---|---|---|
 | `/cluster/health` | GET | `{ "status": "ok", "nodes": N, "healthy": M }` |
 | `/cluster/nodes` | GET | Full node registry snapshot |
-| `/v1/chat/completions` | POST | Proxied to least-loaded healthy agent (streaming preserved) |
+| `/cluster/overview` | GET | Combined nodes + placement + jobs (dashboard poll) |
+| `/cluster/jobs` | GET | Active and recent proxied requests |
+| `/cluster/placement` | GET | Current scheduler output |
+| `/cluster/costs` | GET | Cost matrix snapshot |
+| `/v1/chat/completions` | POST | Proxied to chosen agent (streaming preserved) |
 | `/v1/models` | GET | From first healthy agent |
 | `/health` | GET | Master liveness + scheduler snapshot |
 | static `web/dist` | GET | Dashboard (Chat, Brain, Profiling, Cluster tabs) |
 
+Proxied chat responses include `X-Aviary-Job-Id` and `X-Aviary-Node-Id` headers for tracing
+in the Cluster **Jobs** tab.
+
+## Ownership boundary
+
+| Layer | Owns | Paths |
+|---|---|---|
+| **Colibri** | Engines, serve protocol, OpenAI HTTP, model detection | `c/*.c`, `c/openai_server.py`, `c/coli` (except master/agent) |
+| **Aviary** | Cluster registry, placement, agent/master, cluster protocol, Cluster UI | `c/aviary/**`, `c/cluster_rpc.h`, `docs/cluster_protocol.md`, `web/src/Cluster.tsx` |
+
+**Rule:** Aviary must not permanently fork per-model engines. New Colibri families work
+automatically once `coli`/`openai_server` resolve them.
+
 ## Synced Colibri base
 
-This repository’s Colibri sources track upstream via periodic merges from
+This repository's Colibri sources track upstream via periodic merges from
 [`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3) and
-[`JustVugg/colibri`](https://github.com/JustVugg/colibri). After refreshing engine
-sources, re-apply the Aviary overlay (`c/aviary/`, `coli master`/`agent`, Cluster tab).
-
-Hy3 mux + dashboard telemetry in `hy3.c` is a **Colibri-base parity** patch (same
-capability as `colibri.c` / Inkling serve), not Aviary-specific logic.
+[`JustVugg/colibri`](https://github.com/JustVugg/colibri). After refreshing engine sources,
+re-apply the Aviary overlay (`c/aviary/`, `coli master`/`agent`, Cluster tab).
 
 ## Further reading
 

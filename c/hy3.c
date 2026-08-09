@@ -189,6 +189,8 @@ typedef struct {
 } Model;
 
 #include "route_trace.h"   /* shared .coli_usage / ROUTE_TRACE (#700) */
+#include "cluster_telemetry.h"
+#include "cluster_rpc.h"
 #include "telemetry.h"
 #include "decode_batch.h"
 
@@ -1050,6 +1052,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->ecap=cap; m->ecache=calloc(nrows,sizeof(ESlot*)); m->ecn=calloc(nrows,sizeof(int));
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
     rt_init("hy3",c->n_layers,c->n_experts);   /* owns .coli_usage counters */
+    ct_init(); cluster_init();
     m->eusage=rt_counts_all();                 /* alias: bump sites unchanged */
     m->eheat=calloc(nrows,sizeof(uint32_t*));
     for(int i=0;i<c->n_layers;i++){
@@ -1326,6 +1329,26 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 }
 
 /* MoE: HYV3TopKRouter math (sigmoid, bias for selection, normalize, router_scaling_factor) */
+static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const float *x, float *out){
+    Cfg *c=&m->c; int D=c->hidden, I=c->moe_inter;
+    ESlot *e=NULL; int tier=1; uint32_t load_us=0;
+    for(int z=0;z<m->npin[layer];z++) if(m->pin[layer][z].eid==eid){ e=&m->pin[layer][z]; tier=2; break; }
+    if(!e){ ESlot *Sl=m->ecache[layer];
+        for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid){ e=&Sl[z]; Sl[z].used=++m->eclock; break; } }
+    ESlot local;
+    if(!e){ tier=0; double t0=now_s(); expert_load(m,layer,eid,&local); e=&local;
+        load_us=(uint32_t)((now_s()-t0)*1e6); m->miss++; } else m->hits++;
+    double t0=now_s();
+    float *gg=falloc(I), *uu=falloc(I), *hh=falloc(D);
+    matmul_qt(gg,x,&e->g,1); matmul_qt(uu,x,&e->u,1);
+    for(int z=0;z<I;z++) gg[z]=siluf(gg[z])*uu[z];
+    matmul_qt(hh,gg,&e->d,1);
+    memcpy(out,hh,(size_t)D*sizeof(float));
+    ct_record(layer,eid,tier,load_us,(uint32_t)((now_s()-t0)*1e6));
+    free(gg); free(uu); free(hh);
+    return 0;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     int sI=c->moe_inter*c->n_shared;
@@ -1401,6 +1424,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
+            cluster_init();
+            if(g_cluster_enabled){
+                int remote_ok=1;
+                for(int r=0;r<nr && remote_ok;r++){
+                    float rpc_out[D];
+                    if(cluster_rpc_expert(layer,eid,x+(int64_t)rows[r]*D,D,rpc_out,NULL)==0){
+                        float *os=out+(int64_t)rows[r]*D;
+                        for(int d=0;d<D;d++) os[d]+=rw[r]*rpc_out[d];
+                    } else { remote_ok=0; cluster_reload(); }
+                }
+                if(remote_ok){ ct_flush(); continue; }
+            }
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
 #endif
@@ -1412,7 +1447,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm+=now_s()-t0;
+            ct_record(layer,eid,1,0,(uint32_t)((now_s()-t0)*1e6));
         }
+        ct_flush();
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
           int promo=nmiss<m->ecap?nmiss:m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -2344,6 +2381,25 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"EXEC_EXPERT ",12)){
+        /* Re-parse: line already consumed header fields; stdin waits on payload. */
+        char req_id[64]; int layer, eid; size_t bytes;
+        if(sscanf(line,"EXEC_EXPERT %63s %d %d %zu",req_id,&layer,&eid,&bytes)==4){
+            free(line);
+            Cfg *c=&m->c; int D=c->hidden;
+            float *x=falloc(D), *out=falloc(D);
+            if(bytes==(size_t)D*sizeof(float) && layer>=0 && layer<c->n_layers
+               && fread(x,1,bytes,stdin)==bytes && fgetc(stdin)=='\n'){
+                Layer *l=&m->L[layer];
+                if(l->sparse && expert_forward_row(m,l,layer,eid,x,out)>=0){
+                    ct_flush();
+                    printf("EXPERT_RESULT %s %zu\n",req_id,bytes);
+                    fwrite(out,1,bytes,stdout); putchar('\n'); fflush(stdout);
+                } else printf("EXPERT_MISS %s\n",req_id);
+            } else printf("EXPERT_MISS %s\n",req_id);
+            fflush(stdout); free(x); free(out); return 0;
+        }
+    }
     if(!strncmp(line,"CANCEL ",7)){
         unsigned long long id=0; char tail;
         if(sscanf(line+7,"%llu %c",&id,&tail)!=1 || id==0){

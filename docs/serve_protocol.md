@@ -89,6 +89,9 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `GPUS` | `GPUS <n> (<used_gb> <total_gb> <experts>)×n` | per-device VRAM + resident expert count (CUDA builds) |
 | `TOPK` | `TOPK <id> 5 (<logprob> <hextext>)×5` | token text hex-encoded so the line stays line-shaped |
 | `REPIN` | `REPIN <layer> <eid> <old_tier> <gpu>` | one line per hot-store swap (`REPIN=n` mode) |
+| `ECOST` | `ECOST <n> (<layer> <eid> <tier> <load_us> <exec_us>)×n` | batched per-expert timing samples for cluster placement (Phase 2) |
+| `EXPERT_RESULT` | `EXPERT_RESULT <req_id> <bytes>\n<floats>\n` | mux response to `EXEC_EXPERT` (Phase 2) |
+| `EXPERT_MISS` | `EXPERT_MISS <req_id>\n` | peer does not hold the expert hot (race / eviction) |
 
 All telemetry is advisory: servers render what they know and skip the rest.
 

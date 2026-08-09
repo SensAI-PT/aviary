@@ -70,6 +70,10 @@ def read_frame(conn: socket.socket, timeout_ms: int | None = None) -> tuple[str,
         size = int(fields[3])
         raw = _read_payload(conn, size, timeout_sec)
         payload = json.loads(raw.decode("utf-8"))
+    elif kind == "PLACEMENT" and len(fields) >= 2:
+        size = int(fields[1])
+        raw = _read_payload(conn, size, timeout_sec)
+        payload = json.loads(raw.decode("utf-8"))
     return (kind, fields, payload)
 
 
@@ -95,3 +99,7 @@ def register_frame(node_id: str, http_port: int, model_id: str, payload: dict[st
 
 def heartbeat_frame(node_id: str, inflight: int, payload: dict[str, Any]) -> str:
     return encode_payload_frame(f"HEARTBEAT {node_id} {inflight}", payload)
+
+
+def placement_frame(payload: dict[str, Any]) -> str:
+    return encode_payload_frame("PLACEMENT", payload)

@@ -2174,6 +2174,10 @@ class Engine:
         self.hits_seq = 0
         self.profile = collections.deque(maxlen=PROFILE_TURNS)
         self.profile_seq = 0
+        self.ecost = []
+        self.ecost_seq = 0
+        self.rpc_pending = {}
+        self.rpc_lock = threading.Lock()
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = None
         if self.protocol == "mux":
@@ -2280,6 +2284,38 @@ class Engine:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "ECOST" and len(fields) >= 2:
+                    n = int(fields[1])
+                    samples = []
+                    for i in range(n):
+                        base = 2 + i * 5
+                        if base + 4 >= len(fields):
+                            break
+                        samples.append({
+                            "layer": int(fields[base]),
+                            "expert": int(fields[base + 1]),
+                            "tier": int(fields[base + 2]),
+                            "load_us": int(fields[base + 3]),
+                            "exec_us": int(fields[base + 4]),
+                        })
+                    self.ecost = samples
+                    self.ecost_seq += 1
+                elif kind == "EXPERT_RESULT" and len(fields) >= 3:
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid EXPERT_RESULT terminator")
+                    with self.rpc_lock:
+                        events = self.rpc_pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("result", data))
+                elif kind == "EXPERT_MISS" and len(fields) >= 2:
+                    request_id = fields[1]
+                    with self.rpc_lock:
+                        events = self.rpc_pending.pop(request_id, None)
+                    if events is not None:
+                        events.put(("miss", None))
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -2293,6 +2329,34 @@ class Engine:
             if not self.closed:
                 self.dispatcher_error = error
                 self._fail_pending(error)
+
+    def exec_expert(self, layer: int, eid: int, x_in: tuple[float, ...], timeout: float = 0.15):
+        """Run a single expert forward via mux EXEC_EXPERT (Aviary Phase 2)."""
+        import struct
+        import queue as queue_mod
+
+        if self.protocol != "mux" or self.closed:
+            return None
+        hidden = len(x_in)
+        raw = struct.pack(f"{hidden}f", *x_in)
+        with self.rpc_lock:
+            self._rpc_seq = getattr(self, "_rpc_seq", 0) + 1
+            rid = f"rpc{self._rpc_seq}"
+            events = queue_mod.Queue()
+            self.rpc_pending[rid] = events
+        frame = f"EXEC_EXPERT {rid} {layer} {eid} {len(raw)}\n".encode() + raw + b"\n"
+        try:
+            with self.write_lock:
+                self.process.stdin.write(frame)
+                self.process.stdin.flush()
+            kind, payload = events.get(timeout=timeout)
+            if kind == "miss":
+                return None
+            return list(struct.unpack(f"{hidden}f", payload))
+        except (OSError, struct.error, queue_mod.Empty):
+            with self.rpc_lock:
+                self.rpc_pending.pop(rid, None)
+            return None
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
