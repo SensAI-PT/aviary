@@ -19,7 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
+                           render_chat, render_chat_kimi, render_chat_qwen3, serve,
                            split_thinking_reply, stop_policy, tune_child_env)
 
 
@@ -671,7 +671,14 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
+        self.assertEqual(model_arch(self._model("qwen3_moe")), "qwen3_moe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
+
+    def test_render_chat_qwen3_basic(self):
+        prompt = render_chat_qwen3([{"role": "user", "content": "hello"}])
+        self.assertIn("<|im_start|>user", prompt)
+        self.assertIn("hello", prompt)
+        self.assertTrue(prompt.endswith("<|im_start|>assistant\n"))
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}

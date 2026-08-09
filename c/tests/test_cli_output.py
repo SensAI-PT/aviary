@@ -181,6 +181,7 @@ class BannerModelLineTest(unittest.TestCase):
             ("inkling", "Inkling"),
             ("kimi_k3", "Kimi K3"),
             ("deepseek_v4", "DeepSeek V4 Flash"),
+            ("qwen3_moe", "Qwen3 MoE"),
             ("olmoe", "OLMoE"),
         ):
             with self.subTest(model_type=model_type):
@@ -193,11 +194,17 @@ class BannerModelLineTest(unittest.TestCase):
         self.assertNotIn("GLM", line)
         self.assertNotIn("744B", line)
 
+    def test_qwen3_moe_is_not_read_as_glm(self):
+        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+                          "num_experts": 128})
+        self.assertIn("Qwen3 MoE", line)
+        self.assertNotIn("GLM", line)
+
     def test_unknown_model_states_its_own_type(self):
         """No forcing into the roster: an unknown checkpoint speaks for itself."""
-        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+        line = self.line({"model_type": "custom_moe", "num_hidden_layers": 48,
                           "n_routed_experts": 128})
-        self.assertIn("qwen3_moe", line)
+        self.assertIn("custom_moe", line)
         self.assertIn("48L x 128E", line)
         self.assertNotIn("GLM", line)
 

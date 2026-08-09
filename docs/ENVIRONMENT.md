@@ -16,6 +16,7 @@ what follows, but the sister engines read their own:
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
+| `hy3` / `qwen3_moe` | `c/hy3.c`, `c/qwen3_moe.c` | same streaming-MoE knobs as colibri serve path (`PIPE`, `PIN`, `RAM_GB`, `IDOT`, …) — see [hy3.md](hy3.md) / [qwen3_moe.md](qwen3_moe.md) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; nothing warns you about it. A few variables are genuinely shared because

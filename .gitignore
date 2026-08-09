@@ -21,6 +21,8 @@ c/kimi_k3
 c/kimi_k3.exe
 c/hy3
 c/hy3.exe
+c/qwen3_moe
+c/qwen3_moe.exe
 c/olmoe.exe
 c/iobench
 c/iobench.exe
@@ -64,6 +66,8 @@ c/glm_tiny_mix/
 c/glm_bench_medium/
 c/bench/
 c/hy3_tiny/
+c/qwen3_moe_tiny/
+c/qwen3_moe_tiny_i4/
 
 # pesi modello / artefatti di run
 *.safetensors

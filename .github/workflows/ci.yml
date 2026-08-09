@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build engines
-        run: cd c && make colibri hy3 inkling
+        run: cd c && make colibri hy3 qwen3_moe inkling
       - name: C test suite
         run: cd c && make test-c
 
@@ -287,6 +287,26 @@ jobs:
           # like inkling-oracle does for tiny_inkling/.
           python3 tools/make_hy3_oracle.py
           SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
+
+  qwen3-oracle:
+    name: Qwen3 MoE oracle (teacher-forcing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build qwen3_moe
+        run: cd c && make qwen3_moe
+      - name: Tiny-model fixture + teacher-forcing oracle (fp32, 32/32 positions)
+        run: |
+          cd c
+          python3 tools/make_qwen3_oracle.py
+          SNAP=./qwen3_moe_tiny TF=1 ./qwen3_moe 64 16 16
 
   engine-hip-syntax:
     name: HIP syntax check

@@ -149,6 +149,7 @@ def sprite_lines():
 _BANNER_MODELS = (
     ("deepseek_v4", "DeepSeek V4 Flash", "284B"),   # before "deepseek": V4 is its own engine
     ("hy_v3",       "Hy3",               "295B"),
+    ("qwen3_moe",   "Qwen3 MoE",         "30B"),
     ("inkling",     "Inkling",           "975B"),
     ("kimi",        "Kimi K3",           "2.8T"),
     ("olmoe",       "OLMoE",             "7B"),
@@ -235,6 +236,8 @@ def model_arch(model):
         return "glm"
     if model_type == "hy_v3" or "hy_v3" in model_type:
         return "hy3"
+    if "qwen3_moe" in model_type:
+        return "qwen3_moe"
     if "inkling" in model_type:
         return "inkling"
     if "kimi" in model_type:
@@ -244,7 +247,7 @@ def model_arch(model):
     return "glm"
 
 _ENGINE_NAMES = {"inkling": "inkling", "kimi": "kimi_k3", "hy3": "hy3",
-                 "deepseek_v4": "deepseek_v4"}
+                 "deepseek_v4": "deepseek_v4", "qwen3_moe": "qwen3_moe"}
 
 # Make targets, where they differ from the binary name in _ENGINE_NAMES.
 _ENGINE_TARGETS = {"deepseek_v4": "deepseek-v4"}
@@ -255,7 +258,8 @@ def make_target_for_arch(arch):
 # OpenAI-API model ids. Mirrored in openai_server.py and aviary/agent.py, which
 # must not import this script.
 _MODEL_IDS = {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
-              "hy3": "hy3-colibri", "deepseek_v4": "deepseek-v4-colibri"}
+              "hy3": "hy3-colibri", "deepseek_v4": "deepseek-v4-colibri",
+              "qwen3_moe": "qwen3-moe-colibri"}
 
 def model_id_for_arch(arch):
     return _MODEL_IDS.get(arch, "glm-5.2-colibri")
@@ -271,7 +275,7 @@ def engine_for(model):
 def argv_for_arch(arch, cap):
     """Engine argv tail after the executable path."""
     cap = cap_for_arch(arch, cap)
-    if arch == "hy3":
+    if arch == "hy3" or arch == "qwen3_moe":
         return [str(cap), "4", "8"]
     return [str(cap)]
 
@@ -284,6 +288,12 @@ def model_config(model):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+
+def is_qwen3_moe_repo(repo):
+    if os.path.isdir(repo):
+        return "qwen3_moe" in (model_config(repo).get("model_type") or "").lower()
+    r = repo.lower()
+    return "qwen3" in r and "a3b" in r
 
 def is_hy3_repo(repo):
     if os.path.isdir(repo):
@@ -339,7 +349,7 @@ def env_for_engine(a, arch):
             if sys.platform != "win32":
                 env.setdefault("OMP_PROC_BIND", "close")
                 env.setdefault("OMP_PLACES", "cores")
-    if arch == "hy3":
+    if arch == "hy3" or arch == "qwen3_moe":
         env.setdefault("IDOT", "0")
     if a.ngen: env["NGEN"] = str(a.ngen)
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
@@ -452,7 +462,7 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
-    if model_arch(a.model) == "hy3" and "IDOT" not in e:
+    if model_arch(a.model) in ("hy3", "qwen3_moe") and "IDOT" not in e:
         e["IDOT"] = "0"
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
@@ -1193,7 +1203,7 @@ def cmd_serve(a):
     arch=model_arch(a.model)
     engine=engine_for(a.model)
     need_model(a.model,engine)
-    if arch not in ("glm", "hy3") and a.kv_slots!=1:
+    if arch not in ("glm", "hy3", "qwen3_moe") and a.kv_slots!=1:
         sys.exit(f"{arch} currently supports exactly one KV slot")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
@@ -1219,7 +1229,7 @@ def cmd_agent(a):
     arch=model_arch(a.model)
     engine=engine_for(a.model)
     need_model(a.model,engine)
-    if arch not in ("glm", "hy3") and a.kv_slots!=1:
+    if arch not in ("glm", "hy3", "qwen3_moe") and a.kv_slots!=1:
         sys.exit(f"{arch} currently supports exactly one KV slot")
     import openai_server
     openai_server.ARCH=arch
@@ -1253,7 +1263,7 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","hy3","deepseek_v4"):
+            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","hy3","qwen3_moe","deepseek_v4"):
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
@@ -1336,16 +1346,20 @@ def cmd_convert(a):
     venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     is_hy3 = is_hy3_repo(a.repo)
-    script = "convert_hy3.py" if is_hy3 else "convert_fp8_to_int4.py"
+    is_qwen3 = is_qwen3_moe_repo(a.repo)
+    script = ("convert_hy3.py" if is_hy3 else
+              "convert_qwen3_moe.py" if is_qwen3 else
+              "convert_fp8_to_int4.py")
     base=[py, os.path.join(TOOLS, script),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
           "--group-size", str(a.group_size)]
     if a.xbits:
         base += ["--xbits", str(a.xbits)]
-    if is_hy3:
-        n_layers = str(model_config(a.repo).get("num_hidden_layers", 80)) if os.path.isdir(a.repo) else "80"
+    if is_hy3 or is_qwen3:
+        n_layers = str(model_config(a.repo).get("num_hidden_layers", 80 if is_hy3 else 48)) if os.path.isdir(a.repo) else ("80" if is_hy3 else "48")
         base += ["--n-layers", n_layers]
-        print(f"  {C.dim}Hy3 convert: {' '.join(base)}{C.r}")
+        label = "Hy3" if is_hy3 else "Qwen3 MoE"
+        print(f"  {C.dim}{label} convert: {' '.join(base)}{C.r}")
         sys.exit(subprocess.call(base))
     print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
     rc=subprocess.call(base)

@@ -1220,6 +1220,79 @@ def inkling_content_segments(content, param, audio_out):
     return segments
 
 
+def render_chat_qwen3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """Qwen3 Instruct chat template (non-thinking subset)."""
+    im_start, im_end = "<|im_start|>", ""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if enable_thinking:
+        raise APIError(400, "Thinking mode is not supported for Qwen3-30B-A3B-Instruct-2507.",
+                       "enable_thinking", "unsupported_value")
+    tools, forced = _resolve_tool_choice(tools, tool_choice)
+    parts = []
+    system = "\n\n".join(content_text(m.get("content"), f"messages.{i}.content")
+                         for i, m in enumerate(messages) if m.get("role") in ("system", "developer"))
+    if system:
+        parts.append(f"{im_start}system\n{system}{im_end}\n")
+    elif tools:
+        parts.append(f"{im_start}system\n")
+    if tools:
+        parts.append("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+                     "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n")
+        clean_tools = [{k: v for k, v in (t.get("function", t) if isinstance(t, dict) else {}).items()
+                        if k not in ("defer_loading", "strict")} for t in tools]
+        parts.append("\n".join(json.dumps(t, ensure_ascii=False) for t in clean_tools))
+        parts.append("</tools>\n\nFor each function call, return a json object with function name "
+                     "and arguments within <tool_call></tool_call> XML tags:\n"
+                     "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+                     "</tool_call>\n")
+        if forced:
+            parts.append(f"\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            parts.append("\nYou must call one of the functions above. Do not answer directly.")
+        if not system:
+            parts.append("")
+    prev_tool = False
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role in ("system", "developer"):
+            continue
+        if role == "user":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            if prev_tool:
+                parts.append("")
+            parts.append(f"{im_start}user\n{text}{im_end}\n")
+            prev_tool = False
+        elif role == "assistant":
+            text = content_text(message.get("content"), f"messages.{index}.content") if message.get("content") is not None else ""
+            if prev_tool:
+                parts.append("")
+            parts.append(f"{im_start}assistant\n{text}")
+            calls = message.get("tool_calls")
+            if calls:
+                for tc in calls:
+                    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                    args = fn.get("arguments", "{}")
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=False)
+                    parts.append(f"\n<tool_call>\n{{\"name\": \"{fn.get('name','')}\", "
+                                 f"\"arguments\": {args}}}\n</tool_call>")
+            parts.append(f"{im_end}\n")
+            prev_tool = False
+        elif role == "tool":
+            if not prev_tool:
+                parts.append(f"{im_start}user\n")
+            parts.append(f"<tool_response>\n{content_text(message.get('content'), f'messages.{index}.content')}\n</tool_response>\n")
+            prev_tool = True
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.", f"messages.{index}.role")
+    if prev_tool:
+        parts.append(f"{im_end}\n")
+    parts.append(f"{im_start}assistant\n")
+    return "".join(parts)
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None):
     """Validated multi-turn K3 payload for the C engine.
@@ -1982,6 +2055,8 @@ def model_arch(model):
         return "glm"
     if model_type == "hy_v3" or "hy_v3" in model_type:
         return "hy3"
+    if "qwen3_moe" in model_type:
+        return "qwen3_moe"
     if "inkling" in model_type:
         return "inkling"
     if "kimi" in model_type:
@@ -1994,7 +2069,8 @@ def model_arch(model):
 # OpenAI-API model ids per engine family. coli keeps its own copy so it never has
 # to import this module just to print a banner; aviary.agent imports this one.
 MODEL_IDS = {"kimi": "kimi-k3-colibri", "inkling": "inkling-colibri",
-             "hy3": "hy3-colibri", "deepseek_v4": "deepseek-v4-colibri"}
+             "hy3": "hy3-colibri", "deepseek_v4": "deepseek-v4-colibri",
+             "qwen3_moe": "qwen3-moe-colibri"}
 
 
 def model_id_for_arch(arch):
@@ -2028,7 +2104,7 @@ def cap_for_arch(arch, cap):
 
 def argv_for_arch(arch, cap):
     cap = cap_for_arch(arch, cap)
-    if arch == "hy3":
+    if arch == "hy3" or arch == "qwen3_moe":
         return [str(cap), "4", "8"]
     return [str(cap)]
 
@@ -3240,6 +3316,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         renderer = (render_chat_hy3 if ARCH == "hy3" else
+                    render_chat_qwen3 if ARCH == "qwen3_moe" else
                     render_chat_inkling if ARCH == "inkling" else
                     render_chat_kimi if ARCH == "kimi" else
                     render_chat_v4 if ARCH == "deepseek_v4" else render_chat)

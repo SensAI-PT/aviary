@@ -500,6 +500,7 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_ab
 endif
 
 HY3_INPUT = hy3.c
+QWEN3_MOE_INPUT = qwen3_moe.c
 
 all: colibri$(EXE)
 
@@ -552,6 +553,7 @@ colibri: colibri$(EXE)
 glm: colibri$(EXE)
 ifneq ($(EXE),)
 hy3: hy3$(EXE)
+qwen3_moe: qwen3_moe$(EXE)
 endif
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
@@ -586,6 +588,9 @@ shaders/%.spv: shaders/%.comp
 
 hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
 	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
+
+qwen3_moe$(EXE): $(QWEN3_MOE_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(QWEN3_MOE_INPUT) $(CUDA_OBJ) -o qwen3_moe$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -1028,13 +1033,14 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) hy3$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
+install: colibri$(EXE) hy3$(EXE) qwen3_moe$(EXE) olmoe$(EXE) $(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
 	$(INSTALL) -m 755 colibri$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri$(EXE)
 	$(INSTALL) -m 755 hy3$(EXE) $(DESTDIR)$(LIBEXECDIR)/hy3$(EXE)
+	$(INSTALL) -m 755 qwen3_moe$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen3_moe$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
