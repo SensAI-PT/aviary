@@ -4,6 +4,21 @@
 (30.5B total / ~3.3B active) with Colibri's expert-streaming approach. Auto-detected from
 `config.json` (`model_type: qwen3_moe`); same `coli chat` / `coli serve` / `coli agent` front end.
 
+## Pre-converted weights (Hugging Face)
+
+**https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4**
+
+Colibri/Aviary int4 container (grouped gs=64). **Not** GGUF / AWQ / vLLM — only loads in this engine.
+
+```bash
+# once per machine (needs huggingface_hub / hf CLI)
+pip install -U "huggingface_hub[cli]"
+hf download UnderstandLing/Qwen3_30B_A3B_i4 --local-dir /path/to/qwen3_i4
+```
+
+Put the directory on fast local storage (NVMe/ext4), not a network mount or `/mnt/c`.
+Every Aviary agent needs its own copy (or the same path on each node).
+
 ## Build
 
 ```bash
@@ -12,16 +27,16 @@ make qwen3_moe
 ./setup.sh   # builds colibri + hy3 + qwen3_moe and runs tiny self-test when fixtures exist
 ```
 
-## Convert weights to int4
+## Convert weights yourself (optional)
+
+Only needed if you prefer regenerating from the upstream BF16/FP8 checkpoint:
 
 ```bash
 cd c
-./coli convert --repo Qwen/Qwen3-30B-A3B-Instruct-2507 --model /path/to/qwen3_i4
-# or from a local BF16/FP8 checkout:
-python3 tools/convert_qwen3_moe.py --indir /path/to/model --outdir /path/to/qwen3_i4
+python coli convert --repo Qwen/Qwen3-30B-A3B-Instruct-2507 --model /path/to/qwen3_i4
+# or from a local checkout:
+python tools/convert_qwen3_moe.py --indir /path/to/model --outdir /path/to/qwen3_i4
 ```
-
-Publish the converted container (e.g. `Qwen3-30B-A3B-Instruct-2507-colibri-int4`) for cluster nodes.
 
 ## Single-node quick start
 

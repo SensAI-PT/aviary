@@ -76,13 +76,19 @@ It is the intended **"small yet proof"** model for Aviary: you get authentic spa
 behavior, streaming-from-disk paths, and cluster routing — without Hy3/GLM/Kimi-scale weight
 footprints.
 
+**Easiest — download the ready int4 container** from
+[UnderstandLing/Qwen3_30B_A3B_i4](https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4):
+
 ```bash
-cd c
-make qwen3_moe
-./coli convert --repo Qwen/Qwen3-30B-A3B-Instruct-2507 --model /path/to/qwen3_i4
+pip install -U "huggingface_hub[cli]"
+hf download UnderstandLing/Qwen3_30B_A3B_i4 --local-dir /path/to/qwen3_i4
+
+cd c && make qwen3_moe
+COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://MASTER:9000 --ram 10
 ```
 
-Full engine and conversion notes: [`docs/qwen3_moe.md`](docs/qwen3_moe.md)
+Or convert from the upstream Qwen checkpoint with `python coli convert …` — see
+[`docs/qwen3_moe.md`](docs/qwen3_moe.md).
 
 **Local smoke test (no 30B download):**
 

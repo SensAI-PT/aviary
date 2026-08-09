@@ -678,7 +678,10 @@ class CapSentinelShimTest(unittest.TestCase):
         prompt = render_chat_qwen3([{"role": "user", "content": "hello"}])
         self.assertIn("<|im_start|>user", prompt)
         self.assertIn("hello", prompt)
-        self.assertTrue(prompt.endswith("<|im_start|>assistant\n"))
+        self.assertIn("<|im_end|>", prompt)
+        self.assertEqual(prompt,
+                         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n")
+
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}

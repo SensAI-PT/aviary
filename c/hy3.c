@@ -2453,7 +2453,7 @@ static void run_serve_mux(Model *m, const char *snap){
             if(!req[i].active) continue;
             ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
             kv_bind_slot(m,&sc->kv);
-            float *logit=step(m,sc->hist+sc->len-1,1,sc->len-1);
+            float *logit=step(m,sc->hist+sc->len,1,sc->len);
             m->n_fw++;
             sc->len++;
             g_temp=r->temp; g_nuc=r->top_p;

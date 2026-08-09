@@ -1790,13 +1790,13 @@ static int decode_tokens(Model *m, Tok *T, int *all, int kv, int n_new, int eos,
 
 static int qwen3_wrap(char *buf, int cap, const char *user, int think){
     (void)think;
-    return snprintf(buf,cap,"<|im_start|>user\n%s\n<|im_start|>assistant\n",user);
+    return snprintf(buf,cap,"<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",user);
 }
 
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"");
+    int eos=tok_id_of(&T,"<|im_end|>");
     if(eos<0) eos=tok_id_of(&T,"<|endoftext|>");
     if(eos<0) eos=tok_id_of(&T,"<|end|>");
     if(g_temp<0) g_temp=0.7f;
@@ -1830,7 +1830,7 @@ static void run_serve(Model *m, const char *snap){
     coli_serve_binary_mode();   /* #748: TEXT-mode stdout mangles the READY sentinel */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"");
+    int eos=tok_id_of(&T,"<|im_end|>");
     if(eos<0) eos=tok_id_of(&T,"<|endoftext|>");
     if(eos<0) eos=tok_id_of(&T,"<|end|>");
     if(g_temp<0) g_temp=0.7f;
@@ -2095,7 +2095,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"");
+    int eos=tok_id_of(&T,"<|im_end|>");
     if(eos<0) eos=tok_id_of(&T,"<|endoftext|>");
     if(eos<0) eos=tok_id_of(&T,"<|end|>");
     g_draft=0; /* MTP is not mux-safe on Hy3 v1 */
@@ -2137,7 +2137,7 @@ static void run_serve_mux(Model *m, const char *snap){
             if(!req[i].active) continue;
             ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
             kv_bind_slot(m,&sc->kv);
-            float *logit=step(m,sc->hist+sc->len-1,1,sc->len-1);
+            float *logit=step(m,sc->hist+sc->len,1,sc->len);
             m->n_fw++;
             sc->len++;
             g_temp=r->temp; g_nuc=r->top_p;

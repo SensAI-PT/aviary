@@ -1223,7 +1223,7 @@ def inkling_content_segments(content, param, audio_out):
 def render_chat_qwen3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                       tool_choice=None):
     """Qwen3 Instruct chat template (non-thinking subset)."""
-    im_start, im_end = "<|im_start|>", ""
+    im_start, im_end = "<|im_start|>", "<|im_end|>"
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if enable_thinking:
