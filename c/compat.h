@@ -100,6 +100,7 @@ static inline int compat_open_direct(const char *path){
  * is defense-in-depth: if anyone adds a future CRT-based read path, O_BINARY
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
+#define COMPAT_O_BINARY O_BINARY
 
 /* --- posix_fadvise: Windows has no direct equivalent. Semantics:
  *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
@@ -375,6 +376,9 @@ static inline char *compat_mkdtemp(char *tmpl){
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
 #endif
+#ifndef COMPAT_O_BINARY
+#define COMPAT_O_BINARY 0
+#endif
 
 /* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
  *
@@ -436,7 +440,7 @@ static inline int coli_stdin_readable(void)
  * (#720 -> #748: Kimi K3 su Windows caricava 93 layer in 42 minuti e poi restava
  * fermo per sempre, perche' il gateway aspettava un byte gia' storpiato).
  * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
- * hy3.c is the fourth engine — call this before emitting READY (#748).
+ * Vale anche per hy3.c: chiamala prima di emettere READY (#748).
  *
  * No-op su Linux/macOS. */
 static inline void coli_serve_binary_mode(void)

@@ -25,32 +25,24 @@ from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC
 
 try:
     from openai_server import (
-        ARCH,
         APIServer,
         DEFAULT_CORS_ORIGINS,
         Engine,
         default_engine,
         model_arch,
+        model_id_for_arch,
     )
     from resource_plan import analyze_model, discover_gpus, memory_available
 except ImportError:
     from openai_server import (  # type: ignore
-        ARCH,
         APIServer,
         DEFAULT_CORS_ORIGINS,
         Engine,
         default_engine,
         model_arch,
+        model_id_for_arch,
     )
     discover_gpus = memory_available = analyze_model = None  # type: ignore
-
-
-def _default_model_id(arch: str) -> str:
-    return {
-        "kimi": "kimi-k3-colibri",
-        "inkling": "inkling-colibri",
-        "hy3": "hy3-colibri",
-    }.get(arch, "glm-5.2-colibri")
 
 
 def _local_ip_for(peer: tuple[str, int]) -> str:
@@ -66,7 +58,7 @@ def _local_ip_for(peer: tuple[str, int]) -> str:
 
 class ControlConnection:
     def __init__(self, node_id, master_host, control_port, http_port, model_id, model_path,
-                 advertise_host, engine, scheduler):
+                 advertise_host, engine, scheduler, arch):
         self.node_id = node_id
         self.master_host = master_host
         self.control_port = control_port
@@ -76,6 +68,11 @@ class ControlConnection:
         self.advertise_host = advertise_host
         self.engine = engine
         self.scheduler = scheduler
+        # This node's engine family. Taken from run_agent, NOT from
+        # openai_server.ARCH: that is rebound after this module is imported, so
+        # a `from openai_server import ARCH` here would freeze the "glm" default
+        # and every node would report glm to the master.
+        self.arch = arch
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="aviary-control", daemon=True)
 
@@ -90,7 +87,7 @@ class ControlConnection:
         payload = {
             "host": self.advertise_host,
             "model_path": self.model_path,
-            "arch": ARCH,
+            "arch": self.arch,
         }
         eng = self.engine
         if getattr(eng, "hwinfo", None):
@@ -133,7 +130,7 @@ class ControlConnection:
             "uptime_sec": time.time() - self._started,
             "hits": getattr(eng, "hits", None) or "",
             "hits_seq": getattr(eng, "hits_seq", 0),
-            "arch": ARCH,
+            "arch": self.arch,
         }
         if getattr(eng, "hwinfo", None):
             payload["hwinfo"] = eng.hwinfo
@@ -224,7 +221,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     node_id = load_or_create_node_id(model)
     arch = model_arch(model)
     openai_server.ARCH = arch
-    model_id = model_id or os.environ.get("COLI_MODEL_ID") or _default_model_id(arch)
+    model_id = model_id or os.environ.get("COLI_MODEL_ID") or model_id_for_arch(arch)
     advertise = advertise_host or (host if host not in ("0.0.0.0", "::") else None)
     if not advertise and host in ("0.0.0.0", "::"):
         advertise = _local_ip_for((master_host, control_port))
@@ -239,7 +236,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     server.engine = runtime
 
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
-                                advertise, runtime, server.scheduler)
+                                advertise, runtime, server.scheduler, arch)
     control.start()
 
     print(f"Aviary agent {node_id} arch={arch} listening on http://{host}:{port}/v1 "

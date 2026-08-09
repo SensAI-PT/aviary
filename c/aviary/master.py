@@ -88,7 +88,17 @@ class MasterHTTPServer(ThreadingHTTPServer):
         self.api_key = api_key
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
-        self.model_id = os.environ.get("COLI_MODEL_ID", "hy3-colibri")
+
+    @property
+    def model_id(self):
+        """What the cluster is serving, as reported by the agents themselves.
+
+        The master never loads a model and must not name one: agents send their
+        own model_id at REGISTER. Only used before any agent has registered.
+        """
+        nodes = self.registry.snapshot().get("nodes") or []
+        return next((n["model_id"] for n in nodes if n.get("model_id")),
+                    os.environ.get("COLI_MODEL_ID", "colibri"))
 
 
 class MasterHTTPHandler(APIHandler):

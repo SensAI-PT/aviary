@@ -33,9 +33,10 @@ See [`aviary-cluster-plan.md`](../aviary-cluster-plan.md) for the full Phase 1�
 | **Colibri** | Engines, serve protocol, OpenAI HTTP, model detection | `c/*.c`, `c/openai_server.py`, `c/coli` (except master/agent), shared headers |
 | **Aviary** | Cluster registry, agent/master, cluster protocol, Cluster UI | `c/aviary/**`, `docs/cluster_protocol.md`, `coli master` / `coli agent`, `web/src/Cluster.tsx` (+ thin tab wiring) |
 
-**Rule:** Aviary must not permanently fork per-model engines (`hy3.c`, `kimi_k3.c`,
-`inkling.c`, `colibri.c`, …). New Colibri families work automatically once
-`coli`/`openai_server` resolve them.
+**Rule:** Aviary must not permanently fork per-model engines (`hy3.c`, `deepseek_v4.c`,
+`kimi_k3.c`, `inkling.c`, `colibri.c`, …). New Colibri families work automatically once
+`coli`/`openai_server` resolve them — including **DeepSeek V4 Flash** after syncing
+upstream Colibri.
 
 Aviary’s runtime contract with Colibri:
 
@@ -52,11 +53,11 @@ git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
 # machine A — master (HTTP :9000, control :9002)
 ./coli master --host 0.0.0.0 --port 9000
 
-# machine A — first agent
-COLI_MODEL=/path/to/hy3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+# machine A — first agent (any Colibri family — Hy3, DeepSeek V4, GLM, …)
+COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 
 # machine B — second agent (same model weights on disk)
-COLI_MODEL=/path/to/hy3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
   --advertise-host B
 ```
 
