@@ -226,10 +226,26 @@ class NodeRegistry:
             return self.pick_least_loaded()
         from aviary.placement import decode_emap
 
-        def score(n: NodeRecord) -> tuple[int, float, int]:
+        def hot_hits(n: NodeRecord) -> int:
             inv = decode_emap(n.emap)
-            hot_hits = sum(1 for k in hot_experts if inv.get(k, {}).get("tier", 0) >= 1)
-            return (-hot_hits, n.inflight, n.last_heartbeat)
+            return sum(1 for k in hot_experts if inv.get(k, {}).get("tier", 0) >= 1)
+
+        hits = {n.node_id: hot_hits(n) for n in nodes}
+        max_hits = max(hits.values())
+        min_hits = min(hits.values())
+
+        # Bootstrap cold executors: when one node has warmed hot experts and another
+        # has almost none, route chat there so it can collect usage/ECOST and pin
+        # experts. Otherwise affinity permanently locks all traffic on the first
+        # warmed node (205 vs 0 resident hot experts → 100% on one machine).
+        bootstrap_ratio = float(os.environ.get("AVIARY_ROUTE_BOOTSTRAP_RATIO", "0.1"))
+        if max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
+            cold = [n for n in nodes if hits[n.node_id] <= min_hits + 1]
+            if cold:
+                return min(cold, key=lambda n: (n.inflight, n.last_heartbeat))
+
+        def score(n: NodeRecord) -> tuple[int, float, int]:
+            return (-hits[n.node_id], n.inflight, n.last_heartbeat)
 
         return min(nodes, key=score)
 

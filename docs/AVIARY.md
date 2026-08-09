@@ -52,7 +52,7 @@ miss/timeout always falls through to local disk load.
 | `coli master` | ✓ | Node registry, heartbeat lease, OpenAI API proxy, dashboard host |
 | `coli agent` | ✓ | Wraps one local `Engine`; relays telemetry to master |
 | Cluster dashboard | ✓ | Spark-style: Overview, Jobs, Executors, Placement, RPC tabs |
-| Least-loaded + affinity routing | ✓ | Master picks agent by load and hot-expert affinity |
+| Least-loaded + affinity routing | ✓ | Master picks agent by load and hot-expert affinity; cold executors bootstrap when peers are warmed |
 | Cross-node expert RPC | ✓ | `EXEC_EXPERT` mux + TCP expert server; `cluster_rpc.h` in `moe()` |
 | Placement scheduler | ✓ | Cost-aware expert placement; `PLACEMENT` pushed to agents |
 | Per-model usage isolation | ✓ | Stats keyed by `engine_id`; never merged across architectures |
@@ -103,6 +103,7 @@ Point the web UI's server URL at the master, not an individual agent.
 | `AVIARY_HEARTBEAT_MISS` | `3` | Missed heartbeats before eviction |
 | `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |
 | `AVIARY_PLACEMENT_SEC` | `4` | Placement scheduler recompute interval |
+| `AVIARY_ROUTE_BOOTSTRAP_RATIO` | `0.1` | Route chat to cold executors when their hot-expert residents are below this fraction of the cluster leader (collects usage/ECOST) |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
