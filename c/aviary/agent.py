@@ -215,7 +215,8 @@ class ControlConnection:
                 while not self._stop.is_set():
                     now = time.time()
                     if now >= next_beat:
-                        inflight = self.scheduler.snapshot().get("active", 0)
+                        snap = self.scheduler.snapshot()
+                        inflight = int(snap.get("active", 0)) + int(snap.get("queued", 0))
                         frame = heartbeat_frame(self.node_id, inflight, self._telemetry_payload())
                         sock.sendall(frame.encode("utf-8"))
                         try:
@@ -305,6 +306,8 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     server.model_path = model
     server.node_id = node_id
     server.trace_buffer = TraceBuffer()
+    runtime.trace_buffer = server.trace_buffer
+    runtime.node_id = node_id
     server.scheduler.server = server
 
     rpc_host = advertise or host

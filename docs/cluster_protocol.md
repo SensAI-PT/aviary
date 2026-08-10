@@ -203,10 +203,14 @@ original roadmap. This keeps hop count bounded by hot-expert count rather than l
 Expert execution RPC between agents uses the same line+byte-count philosophy:
 
 ```
-EXEC_EXPERT <req_id> <layer> <eid> <bytes>\n<hidden_dim floats>\n
+EXEC_EXPERT <req_id> <layer> <eid> <bytes> [<job_id>]\n<hidden_dim floats>\n
 EXPERT_RESULT <req_id> <bytes>\n<hidden_dim floats>\n
 EXPERT_MISS <req_id>\n
 ```
+
+Optional `<job_id>` correlates inbound expert serves with the master's chat job trace.
+The engine mux also accepts `CLUSTER_JOB <job_id>\n` before each generation turn so
+`TRACE layer eid kind peer rpc_us` lines on stdout attach to that job.
 
 The master pushes `PIN`/`LOAD`/`EVICT` control lines after each `PLACEMENT` update. Agents
 forward these to the engine mux as:

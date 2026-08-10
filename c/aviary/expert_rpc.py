@@ -37,6 +37,10 @@ class ExpertRPCHandler(socketserver.BaseRequestHandler):
             if len(fields) < 5 or fields[0] != "EXEC_EXPERT":
                 return
             req_id, layer, eid, nbytes = fields[1], int(fields[2]), int(fields[3]), int(fields[4])
+            job_id = fields[5] if len(fields) > 5 and fields[5] not in ("", "-") else None
+            trace_buffer = getattr(self.server, "trace_buffer", None)  # type: ignore[attr-defined]
+            if trace_buffer and job_id:
+                trace_buffer.set_job(job_id)
             payload = rest
             while len(payload) < nbytes + 1:
                 chunk = conn.recv(nbytes + 1 - len(payload))
@@ -59,6 +63,11 @@ class ExpertRPCHandler(socketserver.BaseRequestHandler):
                 return
             raw = struct.pack(f"{len(out)}f", *out)
             conn.sendall(f"EXPERT_RESULT {req_id} {len(raw)}\n".encode() + raw + b"\n")
+            trace_buffer = getattr(self.server, "trace_buffer", None)  # type: ignore[attr-defined]
+            node_id = getattr(self.server, "node_id", "")  # type: ignore[attr-defined]
+            if trace_buffer and job_id:
+                trace_buffer.record("rpc_in", node_id, layer, eid,
+                                    rpc_us=(time.perf_counter() - t0) * 1e6, local=True)
         except (OSError, struct.error, ValueError):
             pass
 
@@ -106,13 +115,12 @@ def start_expert_rpc_server(host: str, port: int, engine, stop_event: threading.
     def _exec(layer, eid, x_in):
         t0 = time.perf_counter()
         out = bridge(layer, eid, x_in)
-        if trace_buffer and out is not None:
-            trace_buffer.record("rpc_in", node_id, layer, eid,
-                                rpc_us=(time.perf_counter() - t0) * 1e6, local=True)
         return out
 
     server = ExpertRPCServer((host if host != "0.0.0.0" else "", port), _exec,
                              tier_check=lambda l, e: tier_check_from_emap(engine, l, e))
+    server.trace_buffer = trace_buffer
+    server.node_id = node_id
     thread = threading.Thread(target=server.serve_forever, name="aviary-expert-rpc", daemon=True)
     thread.start()
     return server, thread, bridge

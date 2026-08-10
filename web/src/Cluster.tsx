@@ -312,6 +312,10 @@ function JobsPanel({ jobs, nodes, selectedJobId, onSelectJob, onSelectNode, t }:
             {nodeMap[selected.node_id]?.arch ? <><dt>{t("cluster.col.arch")}</dt><dd>{nodeMap[selected.node_id].arch}</dd></> : null}
             {selected.trace?.length ? (
               <>
+                <dt>{t("cluster.jobTraceSummary")}</dt>
+                <dd><JobTraceSummary trace={selected.trace} /></dd>
+                <dt>{t("cluster.jobExpertHops")}</dt>
+                <dd><JobExpertHopTable trace={selected.trace} t={t} /></dd>
                 <dt>{t("cluster.jobTrace")}</dt>
                 <dd><JobTraceGantt job={selected} /></dd>
               </>
@@ -548,6 +552,53 @@ function RpcPanel({ nodes, placement, t }: {
   )
 }
 
+function JobTraceSummary({ trace }: { trace: ClusterJob["trace"] }) {
+  const events = trace || []
+  const local = events.filter((e) => e.kind === "local" || e.local).length
+  const remote = events.filter((e) => e.kind === "remote").length
+  const fallback = events.filter((e) => e.kind === "fallback").length
+  const layers = new Set(events.map((e) => e.layer)).size
+  return (
+    <div className="cluster-trace-summary">
+      <span>{local} local</span>
+      <span>{remote} remote</span>
+      <span>{fallback} fallback</span>
+      <span>{layers} layers</span>
+    </div>
+  )
+}
+
+function JobExpertHopTable({ trace, t }: { trace: ClusterJob["trace"]; t: (key: string) => string }) {
+  const events = trace || []
+  if (!events.length) return null
+  return (
+    <div className="cluster-trace-table-wrap">
+      <table className="cluster-trace-table">
+        <thead>
+          <tr>
+            <th>{t("cluster.col.layer")}</th>
+            <th>{t("cluster.col.expert")}</th>
+            <th>{t("cluster.col.kind")}</th>
+            <th>{t("cluster.col.executor")}</th>
+            <th>{t("cluster.col.rpcUs")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {events.map((ev, i) => (
+            <tr key={`${ev.ts}-${i}`}>
+              <td>L{ev.layer}</td>
+              <td>E{ev.expert}</td>
+              <td><code>{ev.kind}</code></td>
+              <td><code>{ev.local ? "local" : shortId(ev.node_id)}</code></td>
+              <td>{ev.rpc_us != null ? `${Math.round(ev.rpc_us)}µs` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function JobTraceGantt({ job }: { job: ClusterJob }) {
   const trace = job.trace || []
   if (!trace.length) return null
@@ -562,11 +613,11 @@ function JobTraceGantt({ job }: { job: ClusterJob }) {
       {trace.map((ev, i) => (
         <div
           key={`${ev.ts}-${i}`}
-          className={cn("cluster-gantt-seg", ev.local ? "local" : "remote")}
+          className={cn("cluster-gantt-seg", ev.kind === "remote" ? "remote" : ev.kind === "fallback" ? "fallback" : "local")}
           style={{ marginLeft: `${Math.max(0, Math.min(92, ((ev.ts - t0) / span) * 100))}%` }}
-          title={`L${ev.layer} E${ev.expert}${ev.rpc_us ? ` · ${Math.round(ev.rpc_us)}µs` : ""}`}
+          title={`${ev.kind} L${ev.layer} E${ev.expert}${ev.rpc_us ? ` · ${Math.round(ev.rpc_us)}µs` : ""}`}
         >
-          <code>{ev.local ? "local" : shortId(ev.node_id)} L{ev.layer}:E{ev.expert}</code>
+          <code>{ev.kind} L{ev.layer}:E{ev.expert}</code>
         </div>
       ))}
     </div>

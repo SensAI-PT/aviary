@@ -1354,6 +1354,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     } else { remote_ok=0; cluster_reload(); }
                 }
                 if(remote_ok){ ct_flush(); continue; }
+                cluster_emit_trace(layer, eid, "fallback", "-", 0);
             }
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
@@ -1367,6 +1368,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm+=now_s()-t0;
             ct_record(layer,eid,1,0,(uint32_t)((now_s()-t0)*1e6));
+            cluster_emit_trace(layer, eid, "local", "-", (uint32_t)((now_s()-t0)*1e6));
         }
         ct_flush();
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
@@ -2100,6 +2102,15 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
                 printf("CLUSTER_OK %s\n",req_id); fflush(stdout);
             } else printf("CLUSTER_MISS %s\n",req_id);
             fflush(stdout); return 0;
+        }
+    }
+    if(!strncmp(line,"CLUSTER_JOB ",12)){
+        char job_id[128];
+        if(sscanf(line+12," %127s", job_id)==1){
+            cluster_set_job_id(job_id);
+            free(line);
+            printf("CLUSTER_OK job\n"); fflush(stdout);
+            return 0;
         }
     }
     if(!strncmp(line,"CLUSTER_PIN ",12)){

@@ -1,6 +1,8 @@
 """Tests for Aviary master chat routing (affinity + cold-node bootstrap)."""
 
+import os
 import unittest
+from unittest import mock
 
 from aviary.registry import NodeRegistry
 
@@ -17,8 +19,10 @@ class PickWithAffinityTest(unittest.TestCase):
         hot = {(0, 0), (0, 1), (0, 2), (0, 3)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "a")
 
-    def test_cold_node_bootstrapped_when_peer_is_warmed(self):
-        """205 vs 0 resident hot experts — traffic must not stay 100% on one node."""
+    @mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "1.0"})
+    @mock.patch("aviary.registry.random.random", return_value=0.0)
+    def test_cold_node_bootstrapped_when_peer_is_warmed(self, _rand):
+        """Cold executor receives traffic when bootstrap triggers (ratio=1)."""
         reg = NodeRegistry()
         warm_map = _emap(*([1] * 8))
         cold_map = _emap(*([0] * 8))
@@ -27,7 +31,21 @@ class PickWithAffinityTest(unittest.TestCase):
         hot = {(0, i) for i in range(8)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "cold")
 
-    def test_least_loaded_among_cold_peers(self):
+    @mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "0.1"})
+    @mock.patch("aviary.registry.random.random")
+    def test_bootstrap_is_probabilistic_not_exclusive(self, rand):
+        reg = NodeRegistry()
+        reg.register("warm", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": _emap(1, 1, 1, 1)})
+        reg.register("cold", "10.0.0.2", 8001, "m", {"host": "10.0.0.2", "emap": _emap(0, 0, 0, 0)})
+        hot = {(0, i) for i in range(4)}
+        rand.side_effect = [0.05, 0.5, 0.05, 0.5]
+        picks = [reg.pick_with_affinity(hot).node_id for _ in range(4)]
+        self.assertEqual(picks.count("cold"), 2)
+        self.assertEqual(picks.count("warm"), 2)
+
+    @mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "1.0"})
+    @mock.patch("aviary.registry.random.random", return_value=0.0)
+    def test_least_loaded_among_cold_peers(self, _rand):
         reg = NodeRegistry()
         reg.register("a", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": _emap(1, 1)})
         reg.register("b", "10.0.0.2", 8001, "m", {"host": "10.0.0.2", "emap": _emap(0, 0)})
@@ -35,6 +53,28 @@ class PickWithAffinityTest(unittest.TestCase):
         reg.increment_inflight("b", 3)
         hot = {(0, 0), (0, 1)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "c")
+
+    def test_proxy_and_agent_inflight_merge(self):
+        reg = NodeRegistry()
+        reg.register("a", "10.0.0.1", 8001, "m", {"host": "10.0.0.1"})
+        reg.register("b", "10.0.0.2", 8001, "m", {"host": "10.0.0.2"})
+        reg.increment_inflight("a", 2)
+        reg.heartbeat("a", 1, {})
+        self.assertEqual(reg._nodes["a"].agent_inflight, 1)
+        self.assertEqual(reg._nodes["a"].proxy_inflight, 2)
+        self.assertEqual(reg._nodes["a"].inflight, 3)
+        reg.increment_inflight("a", -2)
+        self.assertEqual(reg._nodes["a"].inflight, 1)
+
+    def test_slow_node_penalty(self):
+        reg = NodeRegistry()
+        reg.register("fast", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": _emap(1, 1)})
+        reg.register("slow", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": _emap(1, 1),
+            "profile": [{"expert_wait_s": 5.0, "wall_s": 10.0}],
+        })
+        hot = {(0, 0), (0, 1)}
+        self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,23 @@ pure-C MoE inference engine that streams experts from disk/RAM/VRAM based on rou
 This repository (`SensAI-PT/aviary-hy3`) ships Aviary plus a synced Colibri engine base.
 
 Built on Colibri and the Hy3-enabled fork
-[`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3).
+[`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3). See
+[`COLIBRI_SYNC.md`](COLIBRI_SYNC.md) for upstream merge procedure and drift tracking.
+
+## Aviary vs Colibri
+
+| | **Colibri** | **Aviary** |
+|---|---|---|
+| Deployment | Single machine | Cluster (1 master + N agents) |
+| Weights | Local disk/RAM/VRAM hot-load | **Full model replica on every node's disk** |
+| Network | None | Activations + control RPC only |
+| Routing | Per-expert local tiers | Cluster placement + cross-node expert RPC |
+| Goal | Fast single-node MoE | Concurrent throughput + placement wins |
+| Key question | — | Is activation + RTT faster than disk load on one node? |
+
+Colibri answers "how fast can one machine run this MoE?" Aviary answers "how do we wire several
+modest machines so the **next token** is as fast as possible — without shipping checkpoints
+over the network?"
 
 ## The problem Aviary solves
 
@@ -56,7 +72,8 @@ boxes add up to N× throughput, not one virtual GPU with the sum of their VRAM.
 | `coli master` | ✓ | Node registry, heartbeat lease, OpenAI API proxy, dashboard host |
 | `coli agent` | ✓ | Wraps one local `Engine`; relays telemetry to master |
 | Cluster dashboard | ✓ | Spark-style: Overview, Jobs, Executors, Placement, RPC tabs |
-| Least-loaded + affinity routing | ✓ | Master picks agent by load and hot-expert affinity; cold executors bootstrap when peers are warmed |
+| Least-loaded + affinity routing | ✓ | Master picks agent by load, hot-expert affinity, and slow-node penalty; probabilistic cold bootstrap |
+| Per-request expert trace | ✓ | Jobs tab: layer/expert hops (local, remote, fallback) per chat |
 | Cross-node expert RPC | ✓ | `EXEC_EXPERT` mux + TCP expert server; `cluster_rpc.h` in `moe()` |
 | Placement scheduler | ✓ | Cost-aware expert placement; `PLACEMENT` pushed to agents |
 | Per-model usage isolation | ✓ | Stats keyed by `engine_id`; never merged across architectures |
@@ -74,29 +91,102 @@ COLI_MODEL=/path/to/model ./coli agent --master http://MASTER:9000 ...
 The master writes placement tables to each agent; agents persist them at
 `<model_dir>/.aviary_placement.json` and set `AVIARY_PLACEMENT` for the engine.
 
-## Quick start
+## Quick start — 1 master + 2 agents
+
+### 1. Build
 
 ```bash
 git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
 ./setup.sh
+```
 
+### 2. API key (optional)
+
+```bash
+export COLI_API_KEY=your-secret   # set on master and every agent
+```
+
+### 3. Model on every node
+
+Place the **same checkpoint directory** on each machine. For cluster testing, use
+[Qwen3-30B-A3B int4](https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4):
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download UnderstandLing/Qwen3_30B_A3B_i4 --local-dir /path/to/qwen3_i4
+cd c && make qwen3_moe
+```
+
+DIY convert: [`qwen3_moe.md`](qwen3_moe.md).
+
+### 4. Start master and agents
+
+```bash
 # machine A — master (HTTP :9000, control :9002)
 ./coli master --host 0.0.0.0 --port 9000
 
-# machine A — first agent
+# machine A — agent 1
 export AVIARY_CLUSTER=1
-COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 
-# machine B — second agent (same model weights on disk)
+# machine B — agent 2
 export AVIARY_CLUSTER=1
-COLI_MODEL=/path/to/model ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
   --advertise-host B
 ```
 
-Open **http://A:9000** — chat and the **Cluster** tab both go through the master.
-Point the web UI's server URL at the master, not an individual agent.
+WSL2: if port 9003 is taken by Windows, add `--expert-port 9013`.
 
-### Environment
+### 5. Use the cluster
+
+Open **http://A:9000**. Chat and the **Cluster** tab both go through the master.
+Point the web UI server URL at the master, not an individual agent.
+
+## Benchmark hypothesis
+
+The central experiment: **cross-node expert RPC vs single-node disk load**.
+
+| setup | description |
+|---|---|
+| **Baseline** | One node, `AVIARY_CLUSTER=0`, experts loaded from local NVMe |
+| **Cluster** | N nodes with full replicas, `AVIARY_CLUSTER=1`, placement + RPC |
+| **Metrics** | tokens/s, p50/p95 latency, `expert_wait_s` (Executors profile), RPC histogram, disk I/O |
+
+```bash
+python c/tools/cluster_bench.py --master http://A:9000 --prompt "Hello" --requests 20
+```
+
+If activation + RTT across the LAN beats NVMe load latency for your hardware, cluster mode wins.
+If not, you still gain **N× concurrent chat capacity** from N full replicas.
+
+## Reading cluster statistics
+
+| UI tab | What it shows | Per chat request? |
+|---|---|---|
+| **Jobs** | Primary executor, duration, expert path table | **Yes** — pick a job for layer/expert hops |
+| **Overview → usage_top** | Cluster-wide hot experts (aggregate) | No |
+| **Placement** | Scheduler's expert ownership (~4s refresh) | No — planned, not actual routing |
+| **RPC** | PING latency between expert ports | No — infrastructure health |
+| **Executors → profile** | Recent turn `wall_s`, `expert_wait_s` per node | Per-node, not job-linked |
+
+**Job trace kinds:** `local` (disk/RAM/VRAM on primary), `remote` (RPC to peer), `fallback`
+(remote miss → local load), `rpc_in` (peer served an inbound expert).
+
+## Correctness gate
+
+Remote expert RPC is an **optimization**, not a correctness requirement. For every parallel
+expert path, output must be **token-exact identical** to the standard local `moe()` kernel —
+the same bar Colibri uses for TF oracle gates (see
+[Colibri #911](https://github.com/JustVugg/colibri/issues/911)).
+
+Today:
+
+- RPC miss/timeout → automatic local fallback (`cluster_rpc.h`)
+- `c/tests/test_cluster_oracle.py` compares local vs cluster token IDs when a model fixture exists
+
+Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts float equality.
+
+## Environment
 
 | variable | default | meaning |
 |---|---|---|
@@ -107,7 +197,7 @@ Point the web UI's server URL at the master, not an individual agent.
 | `AVIARY_HEARTBEAT_MISS` | `3` | Missed heartbeats before eviction |
 | `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |
 | `AVIARY_PLACEMENT_SEC` | `4` | Placement scheduler recompute interval |
-| `AVIARY_ROUTE_BOOTSTRAP_RATIO` | `0.1` | Route chat to cold executors when their hot-expert residents are below this fraction of the cluster leader (collects usage/ECOST) |
+| `AVIARY_ROUTE_BOOTSTRAP_RATIO` | `0.1` | When cold nodes have &lt; this fraction of the leader's hot-expert residents, **this fraction** of chat routes to cold (probabilistic, not 100%) |
 | `AVIARY_PREFETCH` | `0` | Enable Phase 4 best-effort shard prefetch daemon on agents |
 | `AVIARY_PREFETCH_SEC` | `10` | Prefetch poll interval (seconds) |
 | `AVIARY_PREFETCH_MAX` | `2` | Max concurrent shard downloads per agent |
@@ -148,13 +238,20 @@ automatically once `coli`/`openai_server` resolve them.
 
 ## Synced Colibri base
 
-This repository's Colibri sources track upstream via periodic merges from
-[`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3) and
-[`JustVugg/colibri`](https://github.com/JustVugg/colibri). After refreshing engine sources,
-re-apply the Aviary overlay (`c/aviary/`, `coli master`/`agent`, Cluster tab).
+This repository tracks three lines of development:
+
+| remote | role |
+|---|---|
+| `SensAI-PT/aviary-hy3` | Aviary product (this repo) |
+| `ErikTromp/colibri-hy3` | Hy3/Qwen3 engine fork base |
+| `JustVugg/colibri` | Upstream Colibri engines and UI |
+
+See [`COLIBRI_SYNC.md`](COLIBRI_SYNC.md) for merge order, paths to preserve, and validation.
+Run `c/tools/sync_drift.sh` to print ahead/behind counts.
 
 ## Further reading
 
+- [`COLIBRI_SYNC.md`](COLIBRI_SYNC.md) — upstream merge procedure
 - [`cluster_protocol.md`](cluster_protocol.md) — agent⇄master wire format
 - [`serve_protocol.md`](serve_protocol.md) — engine⇄server mux protocol (telemetry source)
 - [Colibri upstream](https://github.com/JustVugg/colibri) — engines, benchmarks, model roster

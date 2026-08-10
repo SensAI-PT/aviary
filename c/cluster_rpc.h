@@ -30,6 +30,7 @@ typedef SOCKET cluster_sock_t;
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 typedef int cluster_sock_t;
 #define CLUSTER_INVALID_SOCKET (-1)
 #define cluster_close(s) close(s)
@@ -38,6 +39,7 @@ typedef int cluster_sock_t;
 static int g_cluster_enabled;
 static int g_rpc_timeout_ms = 150;
 static char g_cluster_self[64];
+static char g_cluster_job_id[128];
 static char g_placement_path[4096];
 
 /* peer host:port strings keyed by node uuid (small cluster) */
@@ -51,6 +53,17 @@ static int g_n_peers;
 static int g_expert_peer[CLUSTER_MAX_EXPERTS]; /* indexed by layer*256+eid */
 
 static int cluster_expert_key(int layer, int eid){ return layer * 256 + eid; }
+
+static void cluster_set_job_id(const char *job_id){
+    if(!job_id || !job_id[0] || !strcmp(job_id, "-")){ g_cluster_job_id[0]=0; return; }
+    snprintf(g_cluster_job_id, sizeof(g_cluster_job_id), "%s", job_id);
+}
+
+static void cluster_emit_trace(int layer, int eid, const char *kind, const char *peer, uint32_t rpc_us){
+    if(!g_cluster_enabled) return;
+    printf("TRACE %d %d %s %s %u\n", layer, eid, kind, peer && peer[0] ? peer : "-", rpc_us);
+    fflush(stdout);
+}
 
 static void cluster_trim(char *s){
     size_t n = strlen(s);
@@ -266,7 +279,17 @@ static int cluster_rpc_expert(int layer, int eid, const float *x_in, int hidden,
     unsigned req_id = ++req_seq;
     size_t bytes = (size_t)hidden * sizeof(float);
     char hdr[256];
-    snprintf(hdr, sizeof(hdr), "EXEC_EXPERT %u %d %d %zu\n", req_id, layer, eid, bytes);
+    if(g_cluster_job_id[0])
+        snprintf(hdr, sizeof(hdr), "EXEC_EXPERT %u %d %d %zu %s\n",
+                 req_id, layer, eid, bytes, g_cluster_job_id);
+    else
+        snprintf(hdr, sizeof(hdr), "EXEC_EXPERT %u %d %d %zu\n", req_id, layer, eid, bytes);
+    struct timespec t0, t1;
+#ifdef _WIN32
+    (void)t0; (void)t1;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
     if(cluster_send_all(s, hdr, strlen(hdr), g_rpc_timeout_ms) < 0){ cluster_close(s); return -1; }
     if(cluster_send_all(s, (const char*)x_in, bytes, g_rpc_timeout_ms) < 0){ cluster_close(s); return -1; }
     if(cluster_send_all(s, "\n", 1, g_rpc_timeout_ms) < 0){ cluster_close(s); return -1; }
@@ -291,7 +314,14 @@ static int cluster_rpc_expert(int layer, int eid, const float *x_in, int hidden,
     char term;
     cluster_read_line(s, (char*)&term, 1, g_rpc_timeout_ms); /* consume trailing newline if any */
     cluster_close(s);
-    if(rpc_us_out) *rpc_us_out = (uint32_t)(g_rpc_timeout_ms * 1000);
+#ifndef _WIN32
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t rpc_us = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000000u + (t1.tv_nsec - t0.tv_nsec) / 1000u);
+#else
+    uint32_t rpc_us = (uint32_t)(g_rpc_timeout_ms * 1000);
+#endif
+    if(rpc_us_out) *rpc_us_out = rpc_us;
+    cluster_emit_trace(layer, eid, "remote", host, rpc_us);
     return 0;
 }
 

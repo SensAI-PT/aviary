@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ class NodeRecord:
     registered_at: float = field(default_factory=time.time)
     last_heartbeat: float = field(default_factory=time.time)
     inflight: int = 0
+    agent_inflight: int = 0
+    proxy_inflight: int = 0
     hwinfo: dict[str, Any] | None = None
     tiers: dict[str, Any] | None = None
     emap: dict[str, Any] | None = None
@@ -150,7 +153,8 @@ class NodeRegistry:
             record = self._nodes.get(node_id)
             if record is None or record.status == "dead":
                 return None
-            record.inflight = inflight
+            record.agent_inflight = inflight
+            record.inflight = record.agent_inflight + record.proxy_inflight
             record.last_heartbeat = time.time()
             record.missed_heartbeats = 0
             record.status = "healthy"
@@ -208,6 +212,20 @@ class NodeRegistry:
         with self._lock:
             return [n for n in self._nodes.values() if n.status == "healthy"]
 
+    @staticmethod
+    def _load_key(n: NodeRecord) -> tuple[float, float, str]:
+        return (n.inflight + NodeRegistry._slow_penalty(n), -n.last_heartbeat, n.node_id)
+
+    @staticmethod
+    def _slow_penalty(n: NodeRecord) -> float:
+        penalty = 0.0
+        for turn in (n.profile or [])[-4:]:
+            penalty += float(turn.get("expert_wait_s", 0)) * 2.0
+            penalty += float(turn.get("wall_s", 0)) * 0.5
+        for cost in (n.costs or [])[-32:]:
+            penalty += float(cost.get("exec_us", 0)) / 1_000_000
+        return penalty
+
     def pick_least_loaded(self, affinity_node: str | None = None) -> NodeRecord | None:
         nodes = self.healthy_nodes()
         if not nodes:
@@ -216,7 +234,7 @@ class NodeRegistry:
             match = next((n for n in nodes if n.node_id == affinity_node), None)
             if match and match.inflight <= min(n.inflight for n in nodes) + 1:
                 return match
-        return min(nodes, key=lambda n: (n.inflight, n.last_heartbeat))
+        return min(nodes, key=self._load_key)
 
     def pick_with_affinity(self, hot_experts: set[tuple[int, int]] | None = None) -> NodeRecord | None:
         nodes = self.healthy_nodes()
@@ -235,17 +253,20 @@ class NodeRegistry:
         min_hits = min(hits.values())
 
         # Bootstrap cold executors: when one node has warmed hot experts and another
-        # has almost none, route chat there so it can collect usage/ECOST and pin
-        # experts. Otherwise affinity permanently locks all traffic on the first
-        # warmed node (205 vs 0 resident hot experts → 100% on one machine).
+        # has almost none, occasionally route chat there so it can collect usage/ECOST
+        # and pin experts. Fraction is AVIARY_ROUTE_BOOTSTRAP_RATIO (not 100%).
         bootstrap_ratio = float(os.environ.get("AVIARY_ROUTE_BOOTSTRAP_RATIO", "0.1"))
-        if max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
+        if bootstrap_ratio > 0 and max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
+            warm = [n for n in nodes if hits[n.node_id] > min_hits + 1]
             cold = [n for n in nodes if hits[n.node_id] <= min_hits + 1]
-            if cold:
-                return min(cold, key=lambda n: (n.inflight, n.last_heartbeat))
+            warm_min = min((n.inflight for n in warm), default=0)
+            cold = [n for n in cold if n.inflight <= warm_min + 1]
+            if cold and (not warm or min(n.inflight for n in cold) <= warm_min + 1):
+                if random.random() < bootstrap_ratio:
+                    return min(cold, key=self._load_key)
 
-        def score(n: NodeRecord) -> tuple[int, float, int]:
-            return (-hits[n.node_id], n.inflight, n.last_heartbeat)
+        def score(n: NodeRecord) -> tuple[int, float, float, str]:
+            return (-hits[n.node_id], n.inflight + self._slow_penalty(n), -n.last_heartbeat, n.node_id)
 
         return min(nodes, key=score)
 
@@ -275,7 +296,8 @@ class NodeRegistry:
         with self._lock:
             record = self._nodes.get(node_id)
             if record and record.status == "healthy":
-                record.inflight = max(0, record.inflight + delta)
+                record.proxy_inflight = max(0, record.proxy_inflight + delta)
+                record.inflight = record.agent_inflight + record.proxy_inflight
 
     def control_connections(self) -> dict[str, Any]:
         with self._lock:

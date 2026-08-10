@@ -2178,6 +2178,8 @@ class Engine:
         self.ecost_seq = 0
         self.rpc_pending = {}
         self.rpc_lock = threading.Lock()
+        self.trace_buffer = None
+        self.node_id = ""
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = None
         if self.protocol == "mux":
@@ -2300,6 +2302,16 @@ class Engine:
                         })
                     self.ecost = samples
                     self.ecost_seq += 1
+                elif kind == "TRACE" and len(fields) >= 5:
+                    layer, eid = int(fields[1]), int(fields[2])
+                    mode, peer = fields[3], fields[4]
+                    rpc_us = float(fields[5]) if len(fields) > 5 else None
+                    tb = getattr(self, "trace_buffer", None)
+                    if tb:
+                        nid = (peer if mode == "remote" and peer not in ("", "-")
+                               else getattr(self, "node_id", ""))
+                        tb.record(mode, nid, layer, eid, rpc_us=rpc_us,
+                                  local=mode in ("local", "fallback", "rpc_in"))
                 elif kind == "EXPERT_RESULT" and len(fields) >= 3:
                     request_id = fields[1]
                     size = int(fields[2])
@@ -2399,6 +2411,20 @@ class Engine:
             with self.rpc_lock:
                 self.rpc_pending.pop(rid, None)
             return False
+
+    def set_cluster_job(self, job_id: str | None) -> None:
+        """Tell the engine subprocess which Aviary job is active (for TRACE / RPC correlation)."""
+        if self.protocol != "mux" or self.closed:
+            return
+        cmd = f"CLUSTER_JOB {job_id}\n" if job_id else "CLUSTER_JOB -\n"
+        try:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    return
+                self.process.stdin.write(cmd.encode())
+                self.process.stdin.flush()
+        except OSError:
+            pass
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
@@ -3033,6 +3059,9 @@ class APIHandler(BaseHTTPRequestHandler):
         trace = getattr(self.server, "trace_buffer", None)
         if trace:
             trace.set_job(job_id)
+        eng = getattr(self.server, "engine", None)
+        if eng:
+            eng.set_cluster_job(job_id)
         try:
             self._check_host()
             self.require_auth()
