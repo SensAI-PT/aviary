@@ -1268,7 +1268,7 @@ def cmd_agent(a):
     run_agent(a.model, a.master, a.host, a.port, model_id, a.api_key,
               a.control_port, a.advertise_host, a.cap, a.ngen, env_for_engine(a,arch),
               a.max_queue, a.queue_timeout, a.kv_slots, engine,
-              allowed_hosts=a.allowed_host)
+              allowed_hosts=a.allowed_host, expert_port=a.expert_port)
 
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
@@ -1503,6 +1503,9 @@ def main():
     pa.add_argument("--host", default="127.0.0.1")
     pa.add_argument("--port", type=int, default=8001)
     pa.add_argument("--control-port", type=int, default=int(os.environ.get("AVIARY_CONTROL_PORT", "9002")))
+    pa.add_argument("--expert-port", type=int,
+                    default=int(os.environ.get("AVIARY_EXPERT_PORT", "9003")),
+                    help="TCP port for peer expert RPC (default 9003; use a free port under WSL if 9003 is held by Windows)")
     pa.add_argument("--advertise-host", default=None, help="address master uses to proxy (auto-detected if omitted)")
     pa.add_argument("--model-id", default=None)
     pa.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))

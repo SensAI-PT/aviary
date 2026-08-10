@@ -102,7 +102,7 @@ Point the web UI's server URL at the master, not an individual agent.
 |---|---|---|
 | `AVIARY_CLUSTER` | `0` | Enable cross-node expert RPC on agents (`1` to activate) |
 | `AVIARY_CONTROL_PORT` | `9002` | Master control-plane TCP port |
-| `AVIARY_EXPERT_PORT` | `9003` | Agent expert RPC TCP port |
+| `AVIARY_EXPERT_PORT` | `9003` | Agent expert RPC TCP port (or `coli agent --expert-port`) |
 | `AVIARY_HEARTBEAT_SEC` | `2` | Agent heartbeat interval |
 | `AVIARY_HEARTBEAT_MISS` | `3` | Missed heartbeats before eviction |
 | `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |

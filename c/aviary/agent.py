@@ -271,13 +271,15 @@ def _agent_allowed_hosts(advertise, allowed_hosts):
 
 def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api_key=None,
               control_port=None, advertise_host=None, cap=None, max_tokens=1024, env=None,
-              max_queue=8, queue_timeout=300, kv_slots=1, engine_path=None, allowed_hosts=None):
+              max_queue=8, queue_timeout=300, kv_slots=1, engine_path=None, allowed_hosts=None,
+              expert_port=None):
     import openai_server
 
     parsed = urlparse(master_url if "://" in master_url else f"http://{master_url}")
     master_host = parsed.hostname or "127.0.0.1"
     control_port = control_port or int(os.environ.get("AVIARY_CONTROL_PORT", "9002"))
-    expert_port = int(os.environ.get("AVIARY_EXPERT_PORT", str(DEFAULT_EXPERT_PORT)))
+    expert_port = int(expert_port if expert_port is not None
+                      else os.environ.get("AVIARY_EXPERT_PORT", str(DEFAULT_EXPERT_PORT)))
     node_id = load_or_create_node_id(model)
     arch = model_arch(model)
     openai_server.ARCH = arch
