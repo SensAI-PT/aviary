@@ -85,7 +85,7 @@ VRAM. Each agent holds a complete model replica.
 ### 1. Build
 
 ```bash
-git clone https://github.com/SensAI-PT/aviary-hy3.git && cd aviary-hy3/c
+git clone https://github.com/SensAI-PT/aviary.git && cd aviary/c
 ./setup.sh
 ./coli info    # sanity check
 ```
