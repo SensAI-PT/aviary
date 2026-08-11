@@ -37,7 +37,8 @@ COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
 
 The published Qwen int4 container is grouped (`fmt=4`, gs=64); Metal MoE handles
 that format. Dense GEMM also runs on Metal when `S` is large enough. GQA attention
-stays on the CPU.
+stays on the CPU. With `AVIARY_CLUSTER=1`, Metal still runs for local experts;
+placed remotes RPC to peers (who may also use Metal on `EXEC_EXPERT`).
 ## Convert weights yourself (optional)
 
 Only needed if you prefer regenerating from the upstream BF16/FP8 checkpoint:

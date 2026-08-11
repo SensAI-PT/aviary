@@ -94,7 +94,9 @@ COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
 ```
 
 Batched routed-expert MoE (+ dense GEMM) on the Apple GPU; GQA attention stays
-on the CPU. See [metal.md](metal.md). `--gpu` / `--vram` remain CUDA-only.
+on the CPU. With `AVIARY_CLUSTER=1`, Metal runs for locally executed experts;
+remote placement still uses RPC (peers may Metal-accelerate `EXEC_EXPERT`).
+See [metal.md](metal.md). `--gpu` / `--vram` remain CUDA-only.
 
 ## Tuning knobs
 

@@ -62,3 +62,9 @@ threshold (default 16). Streaming, cache, MTP, DSA and the persistence formats
 are unchanged; every GPU path falls back to the CPU per-block on any fault.
 Numerics are dequant→f32-MAC (same as the CUDA tier); greedy outputs are
 byte-identical to the CPU engine.
+
+**Aviary cluster:** with `AVIARY_CLUSTER=1`, hy3/qwen still use Metal for
+experts executed locally. Placement remotes go through `EXEC_EXPERT` RPC first;
+peers can run that single-expert forward on Metal too. Empty placement (or
+RPC miss) falls back to local Metal/CPU — Metal is no longer disabled wholesale
+when the cluster flag is on.

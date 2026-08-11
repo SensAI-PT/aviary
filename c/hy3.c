@@ -1447,13 +1447,33 @@ static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const floa
     if(!e){ tier=0; double t0=now_s(); expert_load(m,layer,eid,&local); e=&local; owned=1;
         load_us=(uint32_t)((now_s()-t0)*1e6); m->miss++; } else m->hits++;
     double t0=now_s();
-    float *gg=falloc(I), *uu=falloc(I), *hh=falloc(D);
-    matmul_qt(gg,x,&e->g,1); matmul_qt(uu,x,&e->u,1);
-    for(int z=0;z<I;z++) gg[z]=siluf(gg[z])*uu[z];
-    matmul_qt(hh,gg,&e->d,1);
-    memcpy(out,hh,(size_t)D*sizeof(float));
+    int metal_ok=0;
+#ifdef COLI_METAL
+    if(g_metal){
+        int f=e->g.fmt;
+        if((f==1||f==2||f==4) && e->u.fmt==f && e->d.fmt==f
+           && (f!=4 || (e->g.gs>0 && e->u.gs==e->g.gs && e->d.gs==e->g.gs))){
+            const void *MG=f==1?(const void*)e->g.q8:(const void*)e->g.q4;
+            const void *MU=f==1?(const void*)e->u.q8:(const void*)e->u.q4;
+            const void *MD=f==1?(const void*)e->d.q8:(const void*)e->d.q4;
+            const float *MGS=e->g.s, *MUS=e->u.s, *MDS=e->d.s;
+            int xoff=0, nr=1, row=0; float rw1=1.f;
+            memset(out,0,(size_t)D*sizeof(float));
+            if(coli_metal_moe_block(1,D,I,f,f==4?e->g.gs:0,&MG,&MU,&MD,&MGS,&MUS,&MDS,
+                                    x,&xoff,&nr,&row,&rw1,out,1))
+                metal_ok=1;
+        }
+    }
+#endif
+    if(!metal_ok){
+        float *gg=falloc(I), *uu=falloc(I), *hh=falloc(D);
+        matmul_qt(gg,x,&e->g,1); matmul_qt(uu,x,&e->u,1);
+        for(int z=0;z<I;z++) gg[z]=siluf(gg[z])*uu[z];
+        matmul_qt(hh,gg,&e->d,1);
+        memcpy(out,hh,(size_t)D*sizeof(float));
+        free(gg); free(uu); free(hh);
+    }
     ct_record(layer,eid,tier,load_us,(uint32_t)((now_s()-t0)*1e6));
-    free(gg); free(uu); free(hh);
     if(owned){ eslot_release(&local); }
     return 0;
 }
@@ -1527,18 +1547,38 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
-        /* Drain PIPE waits before Metal/CPU compute so every slot is finalized. */
+        /* Drain PIPE waits before RPC/Metal/CPU so every slot is finalized. */
         for(int j=0;j<nb;j++)
             if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
-        int metal_done=0;
-#ifdef COLI_METAL
-        /* Batched GPU MoE for fmt 1/2/4. Skip when cluster RPC may own experts. */
+        /* Per-expert completion: RPC remotes first, then Metal-batch locals, then CPU. */
+        unsigned char done[64]; memset(done,0,(size_t)nb);
         cluster_init();
-        if(g_metal && !g_cluster_enabled){
+        if(g_cluster_enabled){
+            for(int j=0;j<nb;j++){
+                int eid=uniq[base+j], nr=0;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                if(!nr){ done[j]=1; continue; }
+                int remote_ok=1;
+                for(int r=0;r<nr && remote_ok;r++){
+                    float rpc_out[D];
+                    if(cluster_rpc_expert(layer,eid,x+(int64_t)rows[r]*D,D,rpc_out,NULL)==0){
+                        float *os=out+(int64_t)rows[r]*D;
+                        for(int d=0;d<D;d++) os[d]+=rw[r]*rpc_out[d];
+                    } else { remote_ok=0; cluster_reload(); }
+                }
+                if(remote_ok) done[j]=1;
+                else cluster_emit_trace(layer, eid, "fallback", "-", 0);
+            }
+        }
+#ifdef COLI_METAL
+        /* Batched GPU MoE for remaining local experts (fmt 1/2/4). */
+        if(g_metal){
             int mfmt=-1, mgs=0, all_ok=1, nbb=0, Rtot=0;
             const void *MG[64],*MU[64],*MD[64]; const float *MGS[64],*MUS[64],*MDS[64];
             int xoffb[65],nrb[64], ej[64];
             for(int j=0;j<nb;j++){
+                if(done[j]) continue;
                 ESlot *e=use[j]; int f=e->g.fmt;
                 if(f!=1&&f!=2&&f!=4){ all_ok=0; break; }
                 if(e->u.fmt!=f||e->d.fmt!=f){ all_ok=0; break; }
@@ -1551,10 +1591,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 int *mrows=malloc((size_t)nb*S*sizeof(int));
                 float *mrw=malloc((size_t)nb*S*sizeof(float));
                 for(int j=0;j<nb;j++){
+                    if(done[j]) continue;
                     int eid=uniq[base+j], cnt=0;
                     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                         if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; }
-                    if(!cnt) continue;
+                    if(!cnt){ done[j]=1; continue; }
                     ESlot *e=use[j];
                     MG[nbb]=mfmt==1?(const void*)e->g.q8:(const void*)e->g.q4;
                     MU[nbb]=mfmt==1?(const void*)e->u.q8:(const void*)e->u.q4;
@@ -1575,33 +1616,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     double t0=now_s();
                     if(coli_metal_moe_block(nbb,D,I,mfmt,mfmt==4?mgs:0,MG,MU,MD,MGS,MUS,MDS,
                                             mxg,xoffb,nrb,mrows,mrw,out,S)){
-                        metal_done=1; m->t_emm+=now_s()-t0;
-                        for(int bi=0;bi<nbb;bi++)
-                            ct_record(layer,uniq[base+ej[bi]],1,0,(uint32_t)((now_s()-t0)*1e6));
+                        m->t_emm+=now_s()-t0;
+                        for(int bi=0;bi<nbb;bi++){
+                            int j=ej[bi];
+                            done[j]=1;
+                            ct_record(layer,uniq[base+j],1,0,(uint32_t)((now_s()-t0)*1e6));
+                            cluster_emit_trace(layer, uniq[base+j], "local", "-",
+                                (uint32_t)((now_s()-t0)*1e6));
+                        }
                     } else m->t_emm+=now_s()-t0;
                 }
                 free(mxg); free(mrows); free(mrw);
             }
         }
 #endif
-        if(!metal_done) for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+        for(int j=0;j<nb;j++){
+            if(done[j]) continue;
+            int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
-            cluster_init();
-            if(g_cluster_enabled){
-                int remote_ok=1;
-                for(int r=0;r<nr && remote_ok;r++){
-                    float rpc_out[D];
-                    if(cluster_rpc_expert(layer,eid,x+(int64_t)rows[r]*D,D,rpc_out,NULL)==0){
-                        float *os=out+(int64_t)rows[r]*D;
-                        for(int d=0;d<D;d++) os[d]+=rw[r]*rpc_out[d];
-                    } else { remote_ok=0; cluster_reload(); }
-                }
-                if(remote_ok){ ct_flush(); continue; }
-                cluster_emit_trace(layer, eid, "fallback", "-", 0);
-            }
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
 #endif
@@ -2221,15 +2256,20 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
+static void metal_stats_eprint(void){
+#ifdef COLI_METAL
+    if(!g_metal) return;
+    uint64_t mok=0,mfb=0,mex=0; coli_metal_moe_counts(&mok,&mfb,&mex);
+    fprintf(stderr,"[metal] %llu MoE blocks on GPU, %llu CPU fallbacks, %llu experts\n",
+        (unsigned long long)mok,(unsigned long long)mfb,(unsigned long long)mex);
+#endif
+}
+
 static void profile_print(Model *m, double elapsed){
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-acc);
-#ifdef COLI_METAL
-    if(g_metal){ uint64_t mok=0,mfb=0,mex=0; coli_metal_moe_counts(&mok,&mfb,&mex);
-        printf("[metal] %llu MoE blocks on GPU, %llu CPU fallbacks, %llu experts\n",
-            (unsigned long long)mok,(unsigned long long)mfb,(unsigned long long)mex); }
-#endif
+    metal_stats_eprint();
 }
 
 static void perf_report(Model *m){
@@ -2390,7 +2430,7 @@ static void run_serve(Model *m, const char *snap){
             hwinfo_emit(m); tiers_emit(m); emap_emit(m); hits_emit(m);
             printf("STAT %d %.2f %.1f %.2f 0 0 %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
                 rss_gb(),decode_tps);
-            fflush(stdout); usage_save(m); repin_pass(m); continue;
+            fflush(stdout); metal_stats_eprint(); usage_save(m); repin_pass(m); continue;
         }
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout); continue; }
         char *raw=NULL, *input=line;
@@ -2454,7 +2494,7 @@ static void run_serve(Model *m, const char *snap){
         hwinfo_emit(m); tiers_emit(m); emap_emit(m); hits_emit(m);
         printf("STAT %d %.2f %.1f %.2f %d %d %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
             rss_gb(),prompt_tokens,prod>=cur,decode_tps);
-        fflush(stdout); usage_save(m); repin_pass(m);
+        fflush(stdout); metal_stats_eprint(); usage_save(m); repin_pass(m);
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
     }
     free(line); free(buf); free(hist); usage_save(m);
@@ -2545,7 +2585,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
-    fflush(stdout);
+    fflush(stdout); metal_stats_eprint();
     r->active=0;
 }
 
