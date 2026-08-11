@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Dependency-free OpenAI-compatible HTTP gateway for the colibri engine."""
 
+from __future__ import annotations
+
 import argparse
 import codecs
 import collections
