@@ -1044,7 +1044,7 @@ static int cluster_pin_expert(Model *m, int layer, int eid, int tier){
     (void)tier;
     if(layer<0||layer>=m->c.n_layers||!m->L[layer].sparse) return 0;
     if(cluster_expert_resident(m,layer,eid)) return 1;
-    ESlot slot; expert_load(m,layer,eid,&slot);
+    ESlot slot={0}; expert_load(m,layer,eid,&slot);
     ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
     if(*nn<m->ecap){ Sl[(*nn)++]=slot; Sl[*nn-1].used=++m->eclock; return 1; }
     int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z;
@@ -1256,8 +1256,8 @@ static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const floa
     for(int z=0;z<m->npin[layer];z++) if(m->pin[layer][z].eid==eid){ e=&m->pin[layer][z]; tier=2; break; }
     if(!e){ ESlot *Sl=m->ecache[layer];
         for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid){ e=&Sl[z]; Sl[z].used=++m->eclock; break; } }
-    ESlot local;
-    if(!e){ tier=0; double t0=now_s(); expert_load(m,layer,eid,&local); e=&local;
+    ESlot local={0}; int owned=0;
+    if(!e){ tier=0; double t0=now_s(); expert_load(m,layer,eid,&local); e=&local; owned=1;
         load_us=(uint32_t)((now_s()-t0)*1e6); m->miss++; } else m->hits++;
     double t0=now_s();
     float *gg=falloc(I), *uu=falloc(I), *hh=falloc(D);
@@ -1267,6 +1267,7 @@ static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const floa
     memcpy(out,hh,(size_t)D*sizeof(float));
     ct_record(layer,eid,tier,load_us,(uint32_t)((now_s()-t0)*1e6));
     free(gg); free(uu); free(hh);
+    if(owned){ compat_aligned_free(local.slab); free(local.fslab); }
     return 0;
 }
 
