@@ -96,11 +96,11 @@ static float ref_e4m3(uint8_t b) {
                        : (1.0f+(float)mant*(1.0f/8.0f))*powf(2.0f,(float)exp-7.0f);
   return sign ? -val : val;
 }
-static int fp8_nblk(int n){ return (n+127)/128; }
+static int test_fp8_nblk(int n){ return (n+127)/128; }
 
 static void cpu_ref_fp8(const uint8_t *q8, const float *bscale, const float *x,
                         double *y, double *mag, int S, int I, int O) {
-  int nblkI = fp8_nblk(I);
+  int nblkI = test_fp8_nblk(I);
   for (int o=0;o<O;o++){
     const uint8_t *w = q8 + (size_t)o*I;
     const float *scl = bscale + (size_t)(o/128)*nblkI;
@@ -172,7 +172,7 @@ static int run_grouped(int O, int I, int gs, int S, int outlier, const char *nam
 // the block-scale accumulation, avoiding cancellation-noise false positives on
 // near-zero results).
 static int run_fp8(int O, int I, int S, const char *name) {
-  int nblkO=fp8_nblk(O), nblkI=fp8_nblk(I), nblk=nblkO*nblkI;
+  int nblkO=test_fp8_nblk(O), nblkI=test_fp8_nblk(I), nblk=nblkO*nblkI;
   std::vector<uint8_t> W((size_t)O*I);
   std::vector<float> scale((size_t)nblk), x((size_t)S*I), yg((size_t)S*O);
   std::vector<double> yr((size_t)S*O), mag((size_t)S*O);
@@ -213,7 +213,7 @@ static int run_fp8(int O, int I, int S, const char *name) {
 static int run_fp8_lut(const char *name) {
   enum { O=256, I=1 };
   std::vector<uint8_t> W(O*I); for (int b=0;b<O;b++) W[b]=(uint8_t)b;
-  std::vector<float> scale(fp8_nblk(O)*fp8_nblk(I), 1.0f);   // nblkO=2,nblkI=1 -> both blocks scale=1
+  std::vector<float> scale(test_fp8_nblk(O)*test_fp8_nblk(I), 1.0f);   // nblkO=2,nblkI=1 -> both blocks scale=1
   std::vector<float> x(I, 1.0f), yg(O);
   ColiMetalTensor *t=nullptr;
   if (!coli_metal_matmul(&t, yg.data(), x.data(), W.data(), scale.data(), FP8, 1, I, O, 0)) {
@@ -250,7 +250,7 @@ static int run_fp8_gemm_gate(const char *name) {
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
 // (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
-// `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
+// fmt to {1,2,4,5,6} as its very FIRST statement, before any of g/u/d/gs/us/ds is
 // dereferenced or even resolve()'d -- so an fmt=8 submission is refused before the
 // bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
@@ -263,7 +263,7 @@ static int run_fp8_moe_gate(const char *name) {
   const float *gs[1] = {(const float*)bad}, *us[1] = {(const float*)bad}, *ds[1] = {(const float*)bad};
   float xg[8]={0}, out[8]={0}, rw[1]={1.0f};
   int xoff[1]={0}, nr[1]={1}, rows[1]={0};
-  int rc = coli_metal_moe_block(1, 8, 8, FP8, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, 1);
+  int rc = coli_metal_moe_block(1, 8, 8, FP8, 0, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, 1);
   int ok = (rc == 0);
   printf("  %-42s rc=%d (expect 0/CPU-fallback)  %s\n", name, rc, ok?"ok":"*** MISMATCH (should have refused)");
   return ok?0:1;
@@ -304,13 +304,78 @@ static int run_moe(const std::vector<int>& nrv, const char* name) {
     float* os=&refout[(size_t)rows[gr]*D]; for(int o=0;o<D;o++) os[o]+=rw[gr]*hh[o];
   }
   std::vector<float> gout((size_t)S*D,0.f);
-  int ok = coli_metal_moe_block(nb,D,I,fmt,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+  int ok = coli_metal_moe_block(nb,D,I,fmt,0,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
                                 xg.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
   double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
   double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
   printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
   for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
   return pass?0:1;
+}
+
+// fmt=4 grouped-int4 MoE: same packing as fmt=2 but per-group scales along the reduction dim.
+// Dims match Qwen3 MoE (D=2048, I=768, gs=64). Oracle folds scl[k/gs] into acc (no *sc[o]).
+static int run_moe_grouped(const std::vector<int>& nrv, const char* name) {
+  const int D=2048, I=768, fmt=4, gsz=64;
+  int rbG=(D+1)/2, rbD=(I+1)/2, ngG=(D+gsz-1)/gsz, ngD=(I+gsz-1)/gsz;
+  int nb=(int)nrv.size();
+  int R=0; std::vector<int> xoff(nb),nr(nrv); for(int e=0;e<nb;e++){ xoff[e]=R; R+=nrv[e]; }
+  srand(4242+nb);
+  std::vector<void*> slab(nb), fslab(nb);
+  std::vector<const void*> g(nb),u(nb),d(nb); std::vector<const float*> gs(nb),us(nb),ds(nb);
+  size_t wbytes=(size_t)I*rbG*2 + (size_t)D*rbD;
+  size_t sbytes=((size_t)I*ngG*2 + (size_t)D*ngD)*sizeof(float);
+  size_t wlen=roundpg(wbytes), flen=roundpg(sbytes);
+  for(int e=0;e<nb;e++){
+    posix_memalign(&slab[e],16384,wlen); posix_memalign(&fslab[e],16384,flen);
+    uint8_t* sp=(uint8_t*)slab[e]; for(size_t i=0;i<wbytes;i++) sp[i]=(uint8_t)(rand()&0xFF);
+    float* fp=(float*)fslab[e];
+    for(size_t i=0;i<(size_t)I*ngG*2+(size_t)D*ngD;i++)
+      fp[i]=(0.001f+(rand()%1000)/1000.f)*((rand()&1)?1.f:-1.f);
+    g[e]=sp; u[e]=sp+(size_t)I*rbG; d[e]=sp+(size_t)I*rbG*2;
+    gs[e]=fp; us[e]=fp+(size_t)I*ngG; ds[e]=fp+(size_t)I*ngG*2;
+    coli_metal_register(slab[e],wlen); coli_metal_register(fslab[e],flen);
+  }
+  std::vector<float> xg((size_t)R*D); for(auto&v:xg) v=((rand()%2000)-1000)/1000.f;
+  std::vector<int> rows(R); std::vector<float> rw(R);
+  for(int gr=0;gr<R;gr++){ rows[gr]=0; rw[gr]=0.1f+(rand()%100)/100.f; }
+  int S=1;
+  std::vector<float> refout((size_t)S*D,0.f), gg(I),uu(I),hh(D);
+  auto gemv_g=[&](float* y, const float* xr, const uint8_t* w, const float* scl, int O, int K, int rb, int ng){
+    for(int o=0;o<O;o++){
+      const uint8_t* wr=w+(size_t)o*rb; const float* so=scl+(size_t)o*ng;
+      float a=0; for(int k=0;k<K;k++) a+=deq4(wr,k)*xr[k]*so[k/gsz];
+      y[o]=a;
+    }
+  };
+  for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++){ int gr=xoff[e]+r; const float* xr=&xg[(size_t)gr*D];
+    gemv_g(gg.data(),xr,(const uint8_t*)g[e],gs[e],I,D,rbG,ngG);
+    gemv_g(uu.data(),xr,(const uint8_t*)u[e],us[e],I,D,rbG,ngG);
+    for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
+    gemv_g(hh.data(),gg.data(),(const uint8_t*)d[e],ds[e],D,I,rbD,ngD);
+    float* os=&refout[(size_t)rows[gr]*D]; for(int o=0;o<D;o++) os[o]+=rw[gr]*hh[o];
+  }
+  std::vector<float> gout((size_t)S*D,0.f);
+  int ok = coli_metal_moe_block(nb,D,I,fmt,gsz,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+                                xg.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
+  double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
+  double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
+  printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
+  for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
+  return pass?0:1;
+}
+
+// Negative: fmt=4 with gsz=0 must refuse (CPU fallback).
+static int run_moe_grouped_gate(const char *name) {
+  const void *bad = (const void*)(uintptr_t)0xdeadbeef;
+  const void *g[1] = {bad}, *u[1] = {bad}, *d[1] = {bad};
+  const float *gs[1] = {(const float*)bad}, *us[1] = {(const float*)bad}, *ds[1] = {(const float*)bad};
+  float xg[8]={0}, out[8]={0}, rw[1]={1.0f};
+  int xoff[1]={0}, nr[1]={1}, rows[1]={0};
+  int rc = coli_metal_moe_block(1, 64, 64, 4, 0, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, 1);
+  int ok = (rc == 0);
+  printf("  %-42s rc=%d (expect 0/CPU-fallback)  %s\n", name, rc, ok?"ok":"*** MISMATCH (should have refused)");
+  return ok?0:1;
 }
 
 // ---- fmt=6 (E8/IQ3) moe_block vs the engine's own scalar decoder ----
@@ -358,7 +423,7 @@ static int run_moe_e8(const std::vector<int>& nrv, const char* name) {
   std::vector<float> xg_gpu(xg);
   for(int gr=0;gr<R;gr++) e8_rot_rows(&xg_gpu[(size_t)gr*D],1,D);
   std::vector<float> gout((size_t)S*D,0.f);
-  int ok = coli_metal_moe_block(nb,D,I,fmt,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+  int ok = coli_metal_moe_block(nb,D,I,fmt,0,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
                                 xg_gpu.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
   double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
   double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
@@ -672,6 +737,10 @@ int main(void) {
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
+  printf("Metal fmt=4 grouped moe_block tests:\n");
+  fail |= run_moe_grouped({1,1,1,1,1,1,1,1}, "moe4 decode nb=8");
+  fail |= run_moe_grouped({3,1,4,2,1,5},     "moe4 ragged nb=6");
+  fail |= run_moe_grouped_gate("fmt=4 with gsz=0 refused");
   printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
   fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
   fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");

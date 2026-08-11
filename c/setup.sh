@@ -31,8 +31,14 @@ MINGW*|MSYS*)
 esac
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
+# On Apple Silicon, METAL=1 links the opt-in GPU MoE backend into colibri/hy3/qwen3_moe
+# (enable at runtime with COLI_METAL=1). Override with METAL=0 if needed.
 echo "  building (ARCH=${ARCH:-native})…"
-make -s colibri hy3 qwen3_moe ARCH="${ARCH:-native}"
+METAL_FLAG=()
+case "$UNAME_S" in
+Darwin) METAL_FLAG=(METAL="${METAL:-1}") ;;
+esac
+make -s colibri hy3 qwen3_moe ARCH="${ARCH:-native}" "${METAL_FLAG[@]}"
 
 # 3) self-test sull'oracolo tiny, se presente
 if [ -d glm_tiny ] && [ -f ref_glm.json ]; then

@@ -85,12 +85,26 @@ COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12
 
 Works on 16 GB RAM; experts matmul on CPU. Slower decode, same memory story.
 
+### Apple Silicon — Metal MoE
+
+```bash
+cd c && make hy3 METAL=1
+COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
+  COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 56
+```
+
+Batched routed-expert MoE (+ dense GEMM) on the Apple GPU; GQA attention stays
+on the CPU. With `AVIARY_CLUSTER=1`, Metal runs for locally executed experts;
+remote placement still uses RPC (peers may Metal-accelerate `EXEC_EXPERT`).
+See [metal.md](metal.md). `--gpu` / `--vram` remain CUDA-only.
+
 ## Tuning knobs
 
 | Flag / env | Effect |
 |------------|--------|
 | **`--ram N`** | Engine memory budget (GB). Caps LRU slots/layer and autopin size. On a 16 GB machine use **12–14** (leave headroom for the OS). |
 | **`--gpu 0`** / **`COLI_GPU`** | Enable CUDA on device 0. Requires `make hy3 CUDA=1`. |
+| **`COLI_METAL=1`** | Apple Silicon Metal MoE (requires `make hy3 METAL=1`). See [metal.md](metal.md). |
 | **`--vram N`** / **`CUDA_EXPERT_GB`** | VRAM budget for hot pinned experts. Try **12–14** on a 16 GB GPU. |
 | **`--auto-tier`** | Runs `coli plan` and applies RAM/VRAM/device env vars automatically. |
 | **`--ctx N`** | Max context (default 4096). Lower (e.g. 2048) saves KV RAM on tight machines. |

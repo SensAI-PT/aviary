@@ -24,9 +24,21 @@ Every Aviary agent needs its own copy (or the same path on each node).
 ```bash
 cd c
 make qwen3_moe
-./setup.sh   # builds colibri + hy3 + qwen3_moe and runs tiny self-test when fixtures exist
+make qwen3_moe METAL=1   # Apple Silicon: opt-in Metal MoE (+ dense GEMM; attention CPU)
+./setup.sh   # builds colibri + hy3 + qwen3_moe (METAL=1 on Darwin) and runs tiny self-test when fixtures exist
 ```
 
+Metal usage (see [metal.md](metal.md)):
+
+```bash
+COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
+  COLI_MODEL=/path/to/qwen3_i4 ./coli chat --ram 16
+```
+
+The published Qwen int4 container is grouped (`fmt=4`, gs=64); Metal MoE handles
+that format. Dense GEMM also runs on Metal when `S` is large enough. GQA attention
+stays on the CPU. With `AVIARY_CLUSTER=1`, Metal still runs for local experts;
+placed remotes RPC to peers (who may also use Metal on `EXEC_EXPERT`).
 ## Convert weights yourself (optional)
 
 Only needed if you prefer regenerating from the upstream BF16/FP8 checkpoint:
@@ -68,6 +80,7 @@ COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://MASTER:9000 \
 | `--ram N` / `RAM_GB` | Expert-cache budget (GB). Without it the engine uses ~88% of free RAM and may raise `cap` aggressively. |
 | `--cap N` | Initial LRU slots/layer (default 8 for Qwen). `RAM_GB` can still raise/lower this. |
 | `--gpu 0` / `--vram N` | CUDA hot-expert tier (`COLI_CUDA=1`, `CUDA_EXPERT_GB=N`). Needs a CUDA build of `qwen3_moe`. |
+| `COLI_METAL=1` | Apple Silicon Metal MoE (needs `make qwen3_moe METAL=1`). See [metal.md](metal.md). `--gpu` is CUDA-only. |
 | `--gpu none` | Force CPU-only. |
 
 Expect `[RAM_GB=10.0] …` (no `auto`) on stderr when `--ram` is set.
