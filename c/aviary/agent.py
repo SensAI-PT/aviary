@@ -5,6 +5,7 @@ Model-agnostic: uses Colibri's model_arch / argv_for_arch / Engine resolution.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -244,7 +245,25 @@ class ControlConnection:
                     except (ProtocolError, socket.timeout):
                         pass
             except OSError as error:
-                print(f"[aviary-agent] control connection failed: {error}", file=sys.stderr)
+                # Control plane is a raw TCP socket to master --control-port (default 9002),
+                # not the master HTTP UI (--port, default 9000) and not local expert RPC.
+                target = f"{self.master_host}:{self.control_port}"
+                hint = ""
+                err = str(error).lower()
+                if "timed out" in err or getattr(error, "errno", None) in (
+                        getattr(errno, "ETIMEDOUT", -1), getattr(errno, "EHOSTUNREACH", -1)):
+                    hint = (f" — nothing answered TCP {target}. "
+                            f"Master HTTP UI can still work on another port; "
+                            f"confirm the master's --control-port (default 9002) "
+                            f"matches this agent's --control-port, and that the "
+                            f"firewall allows it.")
+                elif getattr(error, "errno", None) in (
+                        getattr(errno, "ECONNREFUSED", -1),):
+                    hint = (f" — connection refused at {target}. "
+                            f"Is the master running with --control-port "
+                            f"{self.control_port}?")
+                print(f"[aviary-agent] control connection to {target} failed: "
+                      f"{error}{hint}", file=sys.stderr)
             finally:
                 if sock:
                     try:
@@ -329,7 +348,8 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
         prefetch.start()
 
     print(f"Aviary agent {node_id} arch={arch} listening on http://{host}:{port}/v1 "
-          f"(master control {master_host}:{control_port}, expert RPC :{expert_port})",
+          f"(master control tcp://{master_host}:{control_port}, "
+          f"local expert RPC on {rpc_host}:{expert_port})",
           file=sys.stderr)
 
     previous = signal.getsignal(signal.SIGTERM)
