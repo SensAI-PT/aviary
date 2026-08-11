@@ -3,9 +3,16 @@
 On Apple Silicon the decode profile is matmul-bound, and unified memory removes
 the PCIe copy tax that keeps CUDA's streaming experts on the CPU — so colibrì
 has an opt-in Metal backend that runs the **routed-expert SwiGLU (batched,
-zero-copy from the RAM slabs)**, the **fused decode attention** (full MLA layer
-in one command buffer, S≤4), and **prefill's large GEMMs** on the GPU.
-Decode is token-exact vs the CPU path. Prefill's large GEMMs run on the GPU in a
+zero-copy from the RAM slabs)**, and on GLM also the **fused decode attention**
+(full MLA layer in one command buffer, S≤4) and **prefill's large GEMMs** on the
+GPU.
+
+**Engines:** `colibri` (GLM) gets MoE + fused MLA attention + GEMM. `hy3` and
+`qwen3_moe` get MoE (fmt 1/2/4) + dense GEMM; **GQA attention stays on the CPU**.
+`inkling` uses the same MoE path. Decode is token-exact vs the CPU path for MoE
+fmt 1/2/4 (grouped int4 uses per-group scales, same as dense `mm_gemv`).
+
+Prefill's large GEMMs run on the GPU in a
 different accumulation order, so on **near-tie logits** they can occasionally pick a
 different top token than the CPU — a floating-point ordering difference, not a kernel
 bug (`make metal-test` passes the GEMM at ~3e-6 against a 1e-4 tolerance; see
@@ -15,7 +22,7 @@ containers. Set `COLI_METAL_GEMM_MIN=100000` to keep every GEMM on the CPU for
 bit-exact prefill (`DEBUG_LOGITS=1` on a `TF=1` run dumps the top-5 logits and the
 top1–top2 margin at each mismatch, so you can see how close the tie was).
 
-`COLI_METAL_PREFILL=1` extends the fused attention to **prefill** (S>4): the whole
+`COLI_METAL_PREFILL=1` extends the fused attention to **prefill** (S>4) on GLM only: the whole
 attention — projections, scores, softmax, value, output — runs on the GPU in one
 command buffer instead of the CPU. On a 544-token prompt this cuts prefill attention
 ~4x (35.9 s → 9.0 s). It is **off by default**: like the prefill GEMM above, the GPU
@@ -29,10 +36,16 @@ back to the CPU automatically.
 ```bash
 cd c
 make colibri METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+make hy3 METAL=1              # MoE + GEMM; GQA attention on CPU
+make qwen3_moe METAL=1        # same as hy3
                               # any macOS SDK builds; the COLI_METAL_RESSET residency-set
                               # path needs the macOS 15 SDK and is compiled out below it
 make metal-test           # standalone kernel/attention correctness vs CPU reference
 COLI_METAL=1 COLI_MODEL=/path/glm52_i4 ./coli chat --ram 96
+COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
+  COLI_MODEL=/path/hy3_i4 ./coli chat --ram 56
+COLI_METAL=1 COLI_NO_OMP_TUNE=1 DIRECT=1 PIPE=1 \
+  COLI_MODEL=/path/qwen3_i4 ./coli chat --ram 16
 ```
 
 Measured on an M4 Max (128 GB, warm cache, MTP on): CPU 0.30 → Metal

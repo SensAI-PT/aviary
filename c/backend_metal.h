@@ -137,18 +137,16 @@ int coli_metal_resset_stats(double *flush_s);
  *
  *  D           = hidden size, Iinter = moe intermediate size
  *  g/u/d[e]    = pointers to expert e's gate/up/down quantized weights (in RAM slabs)
- *  gs/us/ds[e] = pointers to expert e's per-row scales
- *  fmt         = quant format (shared across experts). NOTE: fmt=4 (grouped int4) is
- *                NOT yet supported here -- gates to {1,2} and returns 0 (CPU fallback)
- *                for fmt=4 experts, same as before this stage. Grouped-int4 gained GPU
- *                support in mm_gemv (coli_metal_matmul/coli_metal_gemm/bind_gemv) only;
- *                extending the batched routed-expert path is future work (see PR_BODY.md).
+ *  gs/us/ds[e] = scale pointers: per-row [O] for fmt 1/2, or [O,ceil(K/gsz)] for fmt=4
+ *  fmt         = quant format (shared across experts): 1=i8, 2=i4 per-row, 4=i4 grouped,
+ *                5=bf16, 6=e8. Pass gsz>0 (even) for fmt=4; gsz is ignored otherwise.
+ *  gsz         = group size along the reduction dim for fmt=4 (0 for other fmts)
  *  xg          = packed activations [total_rows, D]; xoff[e] = row offset of expert e
  *  nr[e]       = rows for expert e; rows[]/rw[] map packed rows back to out positions
  *  out         = [S, D] accumulate target
  * Returns 1 on success, 0 to signal the caller to fall back to the CPU path.
  */
-int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int gsz,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -163,7 +161,7 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
  * end returns 0 on GPU fault (caller redoes those experts on CPU).
  */
 typedef struct ColiMetalMoeHandle ColiMetalMoeHandle;
-ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int gsz,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,

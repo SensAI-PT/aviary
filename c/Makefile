@@ -586,11 +586,11 @@ shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
-hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
-	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
+hy3$(EXE): $(HY3_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(HY3_INPUT) $(CUDA_OBJ) $(METAL_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
-qwen3_moe$(EXE): $(QWEN3_MOE_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) .build-config
-	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(QWEN3_MOE_INPUT) $(CUDA_OBJ) -o qwen3_moe$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
+qwen3_moe$(EXE): $(QWEN3_MOE_INPUT) st.h json.h compat.h uring.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) $(QWEN3_MOE_INPUT) $(CUDA_OBJ) $(METAL_OBJ) -o qwen3_moe$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config

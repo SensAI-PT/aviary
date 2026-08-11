@@ -34,9 +34,18 @@
 #include "compat.h"
 #include "tok.h"
 #include "tier.h"
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA) || defined(COLI_METAL)
 #include <omp.h>
+#endif
+#ifdef COLI_CUDA
 #include "backend_cuda.h"
+#endif
+#ifdef COLI_METAL
+/* Apple-GPU routed-expert MoE (opt-in, COLI_METAL=1). Reuses coli_metal_moe_block;
+ * GQA attention stays on the CPU. fmt=4 (grouped int4) MoE supported via gsz. */
+#include "backend_metal.h"
+static int g_metal;
+static int g_metal_gemm_min=16;
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -473,6 +482,12 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
 }
 
 static void matmul_qt(float *y, const float *x, QT *w, int S){
+#ifdef COLI_METAL
+    if(g_metal && S>=g_metal_gemm_min && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
+        const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
+    }
+#endif
 #ifdef COLI_CUDA
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
@@ -544,6 +559,32 @@ static void qt_alloc(QT *t, int O, int I, int bits){
     else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
     else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
 }
+#ifdef COLI_METAL
+/* Re-home dense QT weights into 16KB-aligned registered slabs so coli_metal_gemm
+ * can resolve them (newBufferWithBytesNoCopy requires page alignment). */
+static void qt_metal_bind(QT *t){
+    if(!g_metal) return;
+    if(!(t->fmt==1||t->fmt==2||t->fmt==4)) return;
+    size_t wb, sb; void *wsrc;
+    if(t->fmt==1){ wb=(size_t)t->O*(size_t)t->I; wsrc=t->q8; sb=(size_t)t->O*sizeof(float); }
+    else if(t->fmt==4){
+        wb=(size_t)t->O*((size_t)(t->I+1)/2); wsrc=t->q4;
+        sb=(size_t)t->O*((size_t)(t->I+t->gs-1)/t->gs)*sizeof(float);
+    } else { wb=(size_t)t->O*((size_t)(t->I+1)/2); wsrc=t->q4; sb=(size_t)t->O*sizeof(float); }
+    if(!wsrc||!t->s) return;
+    size_t wlen=(wb+16383)&~(size_t)16383, slen=(sb+16383)&~(size_t)16383;
+    void *nw=NULL, *ns=NULL;
+    if(posix_memalign(&nw,16384,wlen)||posix_memalign(&ns,16384,slen)){
+        fprintf(stderr,"OOM metal qt\n"); exit(1);
+    }
+    memset(nw,0,wlen); memset(ns,0,slen);
+    memcpy(nw,wsrc,wb); memcpy(ns,t->s,sb);
+    free(wsrc); free(t->s);
+    if(t->fmt==1) t->q8=(int8_t*)nw; else t->q4=(uint8_t*)nw;
+    t->s=(float*)ns;
+    coli_metal_register(nw,wlen); coli_metal_register(ns,slen);
+}
+#endif
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf,w,(int64_t)t->O*t->I*sizeof(float));
     else if(t->fmt==1) quantize_rows(w,t->q8,t->s,t->O,t->I,bits);
@@ -692,6 +733,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+#ifdef COLI_METAL
+    qt_metal_bind(&t);
+#endif
 #ifdef COLI_CUDA
     if(g_cuda_enabled&&g_cuda_dense){
         t.cuda_eligible=1;
@@ -766,6 +810,53 @@ static void expert_finalize(Model *m, int layer, int eid, ESlot *s,
     s->eid=eid; (void)layer; (void)m;
 }
 
+/* Grow/reallocate expert weight+scale slabs; under Metal use 16KB alignment and
+ * coli_metal_register for zero-copy MoE resolve. */
+static void eslot_ensure_slabs(ESlot *s, int64_t wtot, int64_t ftot){
+    int64_t wneed=wtot+8192; size_t align=4096;
+#ifdef COLI_METAL
+    if(g_metal){ align=16384; wneed=(wneed+16383)&~(int64_t)16383; }
+#endif
+    if(!s->slab||wneed>s->slab_cap){
+#ifdef COLI_METAL
+        if(g_metal&&s->slab) coli_metal_unregister(s->slab);
+#endif
+        compat_aligned_free(s->slab);
+        if(posix_memalign((void**)&s->slab,align,(size_t)wneed)){fprintf(stderr,"OOM slab\n");exit(1);}
+        s->slab_cap=wneed;
+#ifdef COLI_METAL
+        if(g_metal) coli_metal_register(s->slab,(size_t)wneed);
+#endif
+    }
+    if(!s->fslab||ftot>s->fslab_cap){
+#ifdef COLI_METAL
+        if(g_metal&&s->fslab) coli_metal_unregister(s->fslab);
+#endif
+        free(s->fslab);
+#ifdef COLI_METAL
+        if(g_metal){
+            size_t flen=((size_t)ftot*sizeof(float)+16383)&~(size_t)16383;
+            void *p=NULL;
+            if(posix_memalign(&p,16384,flen)){fprintf(stderr,"OOM fslab\n");exit(1);}
+            memset(p,0,flen); s->fslab=(float*)p;
+            coli_metal_register(p,flen);
+        } else
+#endif
+        { s->fslab=falloc(ftot); }
+        s->fslab_cap=ftot;
+    }
+}
+static void eslot_release(ESlot *s){
+#ifdef COLI_METAL
+    if(g_metal){
+        if(s->slab) coli_metal_unregister(s->slab);
+        if(s->fslab) coli_metal_unregister(s->fslab);
+    }
+#endif
+    compat_aligned_free(s->slab); free(s->fslab);
+    s->slab=NULL; s->fslab=NULL; s->slab_cap=0; s->fslab_cap=0;
+}
+
 static int expert_load(Model *m, int layer, int eid, ESlot *s){
 #ifdef COLI_CUDA
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
@@ -788,12 +879,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s){
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
-    if(!s->slab||wtot+8192>s->slab_cap){
-        compat_aligned_free(s->slab);
-        if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
-        s->slab_cap=wtot+8192;
-    }
-    if(!s->fslab||ftot>s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
+    eslot_ensure_slabs(s,wtot,ftot);
     int ord[3]={0,1,2};
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
     int contig=tw[ord[0]]->fd==tw[ord[1]]->fd&&tw[ord[1]]->fd==tw[ord[2]]->fd
@@ -913,12 +999,7 @@ static void uring_pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
         }
         int64_t wtot=job->tw[0]->nbytes+job->tw[1]->nbytes+job->tw[2]->nbytes;
         int64_t ftot=(job->tq[0]->nbytes+job->tq[1]->nbytes+job->tq[2]->nbytes)/4;
-        if(!s->slab||wtot+8192>s->slab_cap){
-            compat_aligned_free(s->slab);
-            if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
-            s->slab_cap=wtot+8192;
-        }
-        if(!s->fslab||ftot>s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
+        eslot_ensure_slabs(s,wtot,ftot);
         for(int a=0;a<3;a++) job->ord[a]=a;
         for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++)
             if(job->tw[job->ord[bb]]->off<job->tw[job->ord[a]]->off){
@@ -1373,7 +1454,7 @@ static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const floa
     memcpy(out,hh,(size_t)D*sizeof(float));
     ct_record(layer,eid,tier,load_us,(uint32_t)((now_s()-t0)*1e6));
     free(gg); free(uu); free(hh);
-    if(owned){ compat_aligned_free(local.slab); free(local.fslab); }
+    if(owned){ eslot_release(&local); }
     return 0;
 }
 
@@ -1446,8 +1527,64 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+        /* Drain PIPE waits before Metal/CPU compute so every slot is finalized. */
+        for(int j=0;j<nb;j++)
             if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
+        int metal_done=0;
+#ifdef COLI_METAL
+        /* Batched GPU MoE for fmt 1/2/4. Skip when cluster RPC may own experts. */
+        cluster_init();
+        if(g_metal && !g_cluster_enabled){
+            int mfmt=-1, mgs=0, all_ok=1, nbb=0, Rtot=0;
+            const void *MG[64],*MU[64],*MD[64]; const float *MGS[64],*MUS[64],*MDS[64];
+            int xoffb[65],nrb[64], ej[64];
+            for(int j=0;j<nb;j++){
+                ESlot *e=use[j]; int f=e->g.fmt;
+                if(f!=1&&f!=2&&f!=4){ all_ok=0; break; }
+                if(e->u.fmt!=f||e->d.fmt!=f){ all_ok=0; break; }
+                if(f==4 && (e->g.gs<=0 || e->u.gs!=e->g.gs || e->d.gs!=e->g.gs)){ all_ok=0; break; }
+                if(mfmt<0){ mfmt=f; mgs=e->g.gs; }
+                else if(f!=mfmt || (f==4 && e->g.gs!=mgs)){ all_ok=0; break; }
+            }
+            if(all_ok&&mfmt>=0){
+                float *mxg=falloc((int64_t)nb*S*D);
+                int *mrows=malloc((size_t)nb*S*sizeof(int));
+                float *mrw=malloc((size_t)nb*S*sizeof(float));
+                for(int j=0;j<nb;j++){
+                    int eid=uniq[base+j], cnt=0;
+                    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                        if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; }
+                    if(!cnt) continue;
+                    ESlot *e=use[j];
+                    MG[nbb]=mfmt==1?(const void*)e->g.q8:(const void*)e->g.q4;
+                    MU[nbb]=mfmt==1?(const void*)e->u.q8:(const void*)e->u.q4;
+                    MD[nbb]=mfmt==1?(const void*)e->d.q8:(const void*)e->d.q4;
+                    MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s;
+                    xoffb[nbb]=Rtot; nrb[nbb]=cnt; ej[nbb]=j; Rtot+=cnt; nbb++;
+                }
+                if(nbb>0){
+                    int p=0;
+                    for(int bi=0;bi<nbb;bi++){
+                        int eid=uniq[base+ej[bi]];
+                        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                            if(idxs[(int64_t)s*K+kk]==eid){
+                                memcpy(mxg+(int64_t)p*D,x+(int64_t)s*D,(size_t)D*sizeof(float));
+                                mrows[p]=s; mrw[p]=ws[(int64_t)s*K+kk]; p++; break;
+                            }
+                    }
+                    double t0=now_s();
+                    if(coli_metal_moe_block(nbb,D,I,mfmt,mfmt==4?mgs:0,MG,MU,MD,MGS,MUS,MDS,
+                                            mxg,xoffb,nrb,mrows,mrw,out,S)){
+                        metal_done=1; m->t_emm+=now_s()-t0;
+                        for(int bi=0;bi<nbb;bi++)
+                            ct_record(layer,uniq[base+ej[bi]],1,0,(uint32_t)((now_s()-t0)*1e6));
+                    } else m->t_emm+=now_s()-t0;
+                }
+                free(mxg); free(mrows); free(mrw);
+            }
+        }
+#endif
+        if(!metal_done) for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
@@ -2088,6 +2225,11 @@ static void profile_print(Model *m, double elapsed){
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-acc);
+#ifdef COLI_METAL
+    if(g_metal){ uint64_t mok=0,mfb=0,mex=0; coli_metal_moe_counts(&mok,&mfb,&mex);
+        printf("[metal] %llu MoE blocks on GPU, %llu CPU fallbacks, %llu experts\n",
+            (unsigned long long)mok,(unsigned long long)mfb,(unsigned long long)mex); }
+#endif
 }
 
 static void perf_report(Model *m){
@@ -2643,6 +2785,24 @@ int main(int argc, char **argv){
     int cap=argc>1?atoi(argv[1]):64;
     int ebits=argc>2?atoi(argv[2]):8;
     int dbits=argc>3?atoi(argv[3]):ebits;
+#ifdef COLI_METAL
+    { const char *me=getenv("COLI_METAL");
+      if(me&&atoi(me)&&!getenv("NOGPU")){
+          /* Residency set ON by default (Inkling/colibri): avoids per-buffer useResource churn. */
+          setenv("COLI_METAL_RESSET","1",0);
+          g_metal=coli_metal_init();
+          if(!g_metal){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
+          if(getenv("COLI_METAL_SPIN")&&atoi(getenv("COLI_METAL_SPIN"))) coli_metal_spin_start();
+          if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+          fprintf(stderr,"[metal] ready — batched expert MoE on the Apple GPU (attention CPU)\n");
+      }
+    }
+#else
+    if(getenv("COLI_METAL")&&atoi(getenv("COLI_METAL"))){
+        fprintf(stderr,"Metal was requested, but this binary is CPU-only; rebuild with: make hy3 METAL=1\n");
+        return 2;
+    }
+#endif
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
