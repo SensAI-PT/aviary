@@ -108,21 +108,42 @@ class PlacementSchedulerTest(unittest.TestCase):
         self.assertTrue(pref.get("vram_slow"))
         self.assertEqual(pref.get("max_tier"), 1)
 
-    def test_vram_slow_demote_pin(self):
+    def test_vram_slow_without_local_ram_samples(self):
+        """Full-GPU node: only tier-2 ECOST — still demote when slower than RAM prior."""
+        costs_t2 = [{"layer": i, "expert": 0, "tier": 2, "load_us": 0, "exec_us": 80_000} for i in range(12)]
+        # EMAP all VRAM (tier bits = 2 => 0x80)
         nodes = [{
             "node_id": "cuda", "status": "healthy", "inflight": 0,
-            "tiers": {"vram": 8, "vram_gb": 12, "ram": 32},
-            "emap": {"rows": 1, "cols": 1, "map": "80"},
-            "costs": (
-                [{"layer": i, "expert": 0, "tier": 1, "load_us": 0, "exec_us": 20_000} for i in range(10)]
-                + [{"layer": i, "expert": 0, "tier": 2, "load_us": 0, "exec_us": 50_000} for i in range(10)]
-            ),
+            "tiers": {"vram": 64, "vram_gb": 10, "ram": 0, "disk": 0},
+            "emap": {"rows": 2, "cols": 4, "map": "80" * 8},
+            "costs": costs_t2,
             "usage": [{"layer": 0, "expert": 0, "count": 100}],
         }]
         sched = PlacementScheduler()
         plan = sched.recompute(nodes, primary_hint="cuda")
+        pref = plan.node_tier_prefs.get("cuda", {})
+        self.assertTrue(pref.get("vram_slow"), pref)
+        self.assertEqual(pref.get("max_tier"), 1)
         pins = plan.pin_commands.get("cuda") or []
         self.assertTrue(any(t == 1 for _, _, t in pins))
+
+    def test_vram_probe_demote_when_unmeasured(self):
+        """Heavy VRAM residency with fast GPU vs prior — probe demotes a few to learn RAM cost."""
+        costs_t2 = [{"layer": i, "expert": 0, "tier": 2, "load_us": 0, "exec_us": 5_000} for i in range(12)]
+        nodes = [{
+            "node_id": "cuda", "status": "healthy", "inflight": 0,
+            "tiers": {"vram": 64, "vram_gb": 10, "ram": 0},
+            "emap": {"rows": 1, "cols": 4, "map": "80" * 4},
+            "costs": costs_t2,
+            "usage": [{"layer": 0, "expert": e, "count": 50} for e in range(4)],
+        }]
+        with mock.patch.object(p, "TIER_PROBE", 2):
+            sched = PlacementScheduler()
+            plan = sched.recompute(nodes, primary_hint="cuda")
+            pref = plan.node_tier_prefs.get("cuda", {})
+            self.assertFalse(pref.get("vram_slow"))
+            pins = plan.pin_commands.get("cuda") or []
+            self.assertGreaterEqual(sum(1 for _, _, t in pins if t == 1), 1)
 
     def test_hysteresis_keeps_block(self):
         nodes = [

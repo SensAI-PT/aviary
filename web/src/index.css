@@ -281,11 +281,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-subsection { margin-top: 18px; }
 .cluster-subsection h4 { margin: 0 0 10px; font-size: 11px; font-weight: 700; color: #839197; text-transform: uppercase; letter-spacing: .08em; }
 .cluster-subsection.heatmap .brain-page { padding: 0; min-height: 220px; }
-.cluster-subsection.heatmap.expanded .brain-page { min-height: min(65vh, 820px); }
-.cluster-subsection.heatmap.expanded .brain-canvas-wrap { min-height: min(65vh, 820px); }
-.cluster-subsection.heatmap.expanded.xl .brain-page,
-.cluster-subsection.heatmap.expanded.xl .brain-canvas-wrap { min-height: min(72vh, 920px); }
-.cluster-brain-large .brain-canvas-wrap { min-height: min(72vh, 920px); }
+.cluster-brain-large .brain-page { padding: 0; min-height: 0; overflow: hidden; }
+.cluster-brain-large .brain-canvas-wrap { height: min(55vh, 520px); min-height: 240px; overflow: auto; }
 .cluster-executors-layout { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
 .cluster-executors-layout .cluster-spark-split { flex: none; min-height: 560px; }
 .cluster-executors-layout .cluster-spark-detail.wide { max-width: none; }
@@ -298,13 +295,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-heatmap-body { padding: 12px 14px 16px; }
 .cluster-heatmap-coherence { margin: 0 0 10px; font-size: 11px; color: #8b9aa3; }
 .cluster-heatmap-coherence.warn { color: #e6c07a; }
-.cluster-heatmap-canvas-wrap { overflow-x: auto; overflow-y: visible; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: min(65vh, 820px); }
-.cluster-heatmap-canvas-wrap.large { min-height: min(72vh, 920px); }
-.cluster-heatmap-canvas-wrap canvas { image-rendering: pixelated; cursor: crosshair; align-self: flex-start; flex-shrink: 0; }
-.cluster-heatmap-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 10px; color: #839197; }
+/* Shared scroll viewport for every heatmap mode — fixed height, content scrolls inside. */
+.cluster-heatmap-scroll {
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #07090a;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 420px;
+  max-height: min(55vh, 520px);
+  min-height: 240px;
+}
+.cluster-heatmap-scroll.large { height: 480px; }
+.cluster-heatmap-scroll.compact { height: 280px; max-height: 320px; }
+.cluster-heatmap-scroll canvas { image-rendering: pixelated; cursor: crosshair; align-self: flex-start; flex-shrink: 0; }
+.cluster-heatmap-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 10px; color: #839197; position: sticky; top: 0; z-index: 1; background: #07090a; padding-bottom: 4px; }
 .cluster-heatmap-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 4px; vertical-align: -1px; }
 .cluster-heatmap-tip { position: fixed; z-index: 60; background: #0d1214; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 10px; pointer-events: none; display: grid; gap: 2px; }
-.cluster-layer-strips { overflow-x: auto; overflow-y: visible; display: grid; gap: 8px; padding: 6px 0; }
+.cluster-layer-strips { gap: 8px; }
 .cluster-layer-strips.large { gap: 10px; }
 .cluster-layer-strip .cluster-layer-cell { cursor: crosshair; }
 .cluster-expert-tip { z-index: 110; }
@@ -313,11 +325,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-layer-strip-cells { display: grid; gap: 1px; }
 .cluster-layer-cell { border-radius: 2px; border: 1px solid rgba(255,255,255,.04); }
 .cluster-layer-strip-meta { font-size: 9px; color: var(--muted-foreground); white-space: nowrap; }
-.cluster-layer-dominance-grid { overflow-x: auto; overflow-y: visible; display: grid; gap: 4px; }
+.cluster-layer-dominance-grid { display: grid; gap: 4px; }
 .cluster-layer-dominance-row { display: grid; grid-template-columns: 44px 1fr 72px; gap: 8px; align-items: center; }
 .cluster-layer-dominance-bar { display: flex; height: 18px; border-radius: 4px; overflow: hidden; background: #1a2228; }
-.cluster-heatmap-panel { grid-column: 1 / -1; overflow: visible; }
-.cluster-heatmap-panel .cluster-heatmap-canvas-wrap { min-height: min(72vh, 920px); }
+.cluster-heatmap-panel { grid-column: 1 / -1; }
 .cluster-heatmap-launch {
   width: 100%;
   display: flex;
@@ -389,8 +400,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   overflow: auto;
   padding: 12px 20px 20px;
 }
-.cluster-heatmap-modal .cluster-heatmap-canvas-wrap { min-height: min(68vh, 760px); }
-.cluster-heatmap-modal .cluster-brain-large .brain-canvas-wrap { min-height: min(68vh, 760px); }
+.cluster-heatmap-modal .cluster-heatmap-scroll { height: 560px; max-height: min(68vh, 640px); }
+.cluster-heatmap-modal .cluster-brain-large .brain-canvas-wrap { height: min(68vh, 640px); min-height: 0; overflow: auto; }
 .cluster-layer-dominance-bar span { min-width: 2px; }
 .cluster-layer-dominance-meta { font-size: 9px; color: var(--muted-foreground); text-align: right; }
 .cluster-expert-chips { display: flex; flex-wrap: wrap; gap: 6px; }

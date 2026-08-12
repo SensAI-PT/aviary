@@ -20,6 +20,7 @@ LAYER_BLOCKS = os.environ.get("AVIARY_LAYER_BLOCKS", "1") not in ("0", "")
 VRAM_SLOW_RATIO = float(os.environ.get("AVIARY_VRAM_SLOW_RATIO", "1.25"))
 BLOCK_MOVE_PCT = float(os.environ.get("AVIARY_BLOCK_MOVE_PCT", "0.15"))
 MIN_TIER_SAMPLES = int(os.environ.get("AVIARY_MIN_TIER_SAMPLES", "8"))
+TIER_PROBE = int(os.environ.get("AVIARY_TIER_PROBE", "8"))
 
 
 def blocks_from_planned(planned: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -154,19 +155,63 @@ def _node_tier_sample_count(sched: "PlacementScheduler", node_id: str, tier: int
                if t == tier and v.exec_us > 0)
 
 
+def _cluster_median_exec(sched: "PlacementScheduler", tier: int) -> float:
+    vals = [v.exec_us for b in sched._costs.values()
+            for (_, _, t), v in b.items() if t == tier and v.exec_us > 0]
+    if len(vals) >= MIN_TIER_SAMPLES:
+        return statistics.median(vals)
+    return sched._median_exec.get(tier, 50_000.0)
+
+
+def _vram_residency_frac(node: dict[str, Any]) -> float:
+    """Fraction of EMAP cells currently marked VRAM (tier 2)."""
+    inv = decode_emap(node.get("emap"))
+    if not inv:
+        tiers = node.get("tiers") or {}
+        vram = int(tiers.get("vram", 0) or 0)
+        ram = int(tiers.get("ram", 0) or 0)
+        disk = int(tiers.get("disk", 0) or 0)
+        total = vram + ram + disk
+        return (vram / total) if total else 0.0
+    n = len(inv)
+    if not n:
+        return 0.0
+    return sum(1 for c in inv.values() if c.get("tier", 0) >= 2) / n
+
+
 def preferred_max_tier(sched: "PlacementScheduler", node: dict[str, Any]) -> tuple[int, bool]:
-    """Return (max_tier, vram_slow) for a node from ECOST + capacity."""
+    """Return (max_tier, vram_slow) for a node from ECOST + capacity.
+
+    If the node is already fully on GPU, local RAM samples may be missing — compare
+    VRAM exec against cluster/prior RAM medians so demotion can still fire.
+    """
     nid = node["node_id"]
     tiers = node.get("tiers") or {}
     has_vram = int(tiers.get("vram", 0)) > 0 or float(tiers.get("vram_gb", 0) or 0) > 0
-    if not has_vram:
+    if not has_vram and _vram_residency_frac(node) < 0.05:
         return 1, False
-    exec1 = _node_median_exec(sched, nid, 1)
+
+    n1 = _node_tier_sample_count(sched, nid, 1)
+    n2 = _node_tier_sample_count(sched, nid, 2)
+    if n2 < MIN_TIER_SAMPLES:
+        # No measured GPU cost yet — keep VRAM allowed until we learn.
+        return (2 if has_vram or _vram_residency_frac(node) > 0 else 1), False
+
     exec2 = _node_median_exec(sched, nid, 2)
-    vram_slow = (_node_tier_sample_count(sched, nid, 1) >= MIN_TIER_SAMPLES
-                 and _node_tier_sample_count(sched, nid, 2) >= MIN_TIER_SAMPLES
-                 and exec1 > 0 and exec2 > exec1 * VRAM_SLOW_RATIO)
-    return (1, True) if vram_slow else (2, False)
+    if n1 >= MIN_TIER_SAMPLES:
+        exec1 = _node_median_exec(sched, nid, 1)
+    else:
+        exec1 = _cluster_median_exec(sched, 1)
+
+    vram_slow = exec1 > 0 and exec2 > exec1 * VRAM_SLOW_RATIO
+    # When the heatmap is almost all VRAM, also compare against the RAM prior so we
+    # do not wait forever for local tier-1 samples that cannot appear until we demote.
+    if not vram_slow and n1 < MIN_TIER_SAMPLES and _vram_residency_frac(node) >= 0.5:
+        prior = sched._median_exec.get(1, 50_000.0)
+        vram_slow = prior > 0 and exec2 > prior * VRAM_SLOW_RATIO
+    if vram_slow:
+        return 1, True
+    return 2, False
 
 
 def _node_median_load(sched: "PlacementScheduler", node_id: str, tier: int = 0) -> float:
@@ -222,7 +267,8 @@ def _merge_blocks(layer_owners: dict[int, str], layer_max_tier: dict[int, int]) 
 
 
 def _emit_tier_commands(plan: PlacementPlan, inventories: dict[str, dict],
-                        layer_max_tier: dict[int, int], hot: list[tuple[tuple[int, int], int]]) -> None:
+                        layer_max_tier: dict[int, int], hot: list[tuple[tuple[int, int], int]],
+                        probe_demote: dict[str, int] | None = None) -> None:
     plan.pin_commands = {}
     plan.evict_commands = {}
     for (layer, expert), freq in hot:
@@ -248,6 +294,27 @@ def _emit_tier_commands(plan: PlacementPlan, inventories: dict[str, dict],
             else:
                 plan.evict_commands.setdefault(owner, []).append((layer, expert))
 
+    # Probe: temporarily demote a few VRAM residents to gather RAM ECOST samples.
+    for owner, budget in (probe_demote or {}).items():
+        if budget <= 0:
+            continue
+        have = {(l, e) for l, e, _t in plan.pin_commands.get(owner, [])}
+        for (layer, expert), freq in hot:
+            if budget <= 0:
+                break
+            if plan.experts.get(f"{layer}:{expert}") != owner:
+                continue
+            if (layer, expert) in have:
+                continue
+            inv_tier = inventories.get(owner, {}).get((layer, expert), {"tier": 0})["tier"]
+            if inv_tier < 2:
+                continue
+            if layer_max_tier.get(layer, 2) < 2:
+                continue
+            plan.pin_commands.setdefault(owner, []).append((layer, expert, 1))
+            have.add((layer, expert))
+            budget -= 1
+
 
 def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
                        hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
@@ -269,7 +336,8 @@ def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
     plan.node_tier_prefs = {
         nid: {"max_tier": mt, "vram_slow": slow,
               "median_exec": {str(t): round(_node_median_exec(sched, nid, t))
-                              for t in (0, 1, 2)}}
+                              for t in (0, 1, 2)},
+              "vram_frac": round(_vram_residency_frac(next(n for n in healthy if n["node_id"] == nid)), 3)}
         for nid, (mt, slow) in node_max.items()
     }
 
@@ -308,7 +376,22 @@ def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
 
     plan.planned_blocks = _merge_blocks(layer_owners, layer_max_tier)
     plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
-    _emit_tier_commands(plan, inventories, layer_max_tier, hot)
+
+    probe: dict[str, int] = {}
+    for n in healthy:
+        nid = n["node_id"]
+        mt, slow = node_max[nid]
+        if slow or mt < 2:
+            continue
+        if TIER_PROBE <= 0:
+            continue
+        if _node_tier_sample_count(sched, nid, 1) >= MIN_TIER_SAMPLES:
+            continue
+        if _vram_residency_frac(n) < 0.5:
+            continue
+        probe[nid] = TIER_PROBE
+
+    _emit_tier_commands(plan, inventories, layer_max_tier, hot, probe_demote=probe)
 
 
 def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,

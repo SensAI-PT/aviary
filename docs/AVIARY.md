@@ -240,7 +240,9 @@ People expect “put experts on the GPU → faster.” For MoE that is often **f
 
 5. **Aviary measures and reacts.** After enough ECOST samples, if VRAM exec is clearly slower than RAM on a node (`AVIARY_VRAM_SLOW_RATIO`, default 1.25×), the Placement UI can show **VRAM slower than RAM** and Aviary caps that node at RAM (`max_tier=1`) so Colibri stops promoting those layers into CUDA.
 
-**What to do if CUDA hurts:** let Aviary demote after a few placement ticks, or force it with `CUDA_EXPERT_GB=0` / `--gpu none` while keeping a solid `--ram` pin. Prefer RAM when the dashboard says VRAM is slow — that is working as intended.
+**Important:** If Colibri already loaded *everything* into VRAM at startup, the engine used to report those runs as “RAM” timings (bug) and Aviary never saw a real RAM vs GPU comparison — so it kept the GPU placement. Fixed engines tag CUDA exec as tier 2. When the heatmap is mostly VRAM, Aviary also **probe-demotes** a few hot experts to RAM (`AVIARY_TIER_PROBE`, default 8) for a couple of placement ticks so it can measure RAM, then demote the rest if GPU loses.
+
+**What to do if CUDA hurts:** rebuild/restart agents after pulling this fix, run 2–3 prompts, watch Placement for **VRAM slower than RAM** and blocks switching to `· RAM`. Or force it with `CUDA_EXPERT_GB=0` / `--gpu none` while keeping a solid `--ram` pin.
 
 ## Environment
 
@@ -264,6 +266,7 @@ People expect “put experts on the GPU → faster.” For MoE that is often **f
 | `AVIARY_VRAM_SLOW_RATIO` | `1.25` | Cap node at RAM when median VRAM exec exceeds RAM exec by this factor |
 | `AVIARY_BLOCK_MOVE_PCT` | `0.15` | Hysteresis: keep a layer block unless moving saves ≥ this fraction |
 | `AVIARY_MIN_TIER_SAMPLES` | `8` | ECOST samples required before declaring VRAM-slow on a node |
+| `AVIARY_TIER_PROBE` | `8` | When heatmap is mostly VRAM, demote this many hot experts to RAM to measure a baseline |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.

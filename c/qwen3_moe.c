@@ -1399,7 +1399,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 static int expert_forward_row(Model *m, Layer *l, int layer, int eid, const float *x, float *out){
     Cfg *c=&m->c; int D=c->hidden, I=c->moe_inter;
     ESlot *e=NULL; int tier=1; uint32_t load_us=0;
-    for(int z=0;z<m->npin[layer];z++) if(m->pin[layer][z].eid==eid){ e=&m->pin[layer][z]; tier=2; break; }
+    for(int z=0;z<m->npin[layer];z++) if(m->pin[layer][z].eid==eid){
+        e=&m->pin[layer][z];
+        tier=1;
+#ifdef COLI_CUDA
+        if(e->g.cuda_eligible || e->u.cuda_eligible || e->d.cuda_eligible) tier=2;
+#endif
+        break;
+    }
     if(!e){ ESlot *Sl=m->ecache[layer];
         for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid){ e=&Sl[z]; Sl[z].used=++m->eclock; break; } }
     ESlot local={0}; int owned=0;
@@ -1605,7 +1612,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm+=now_s()-t0;
-            ct_record(layer,eid,1,0,(uint32_t)((now_s()-t0)*1e6));
+            int etier=1;
+#ifdef COLI_CUDA
+            if(g_cuda_enabled && e->g.cuda_eligible) etier=2;
+#endif
+            ct_record(layer,eid,etier,0,(uint32_t)((now_s()-t0)*1e6));
             cluster_emit_trace(layer, eid, "local", "-", (uint32_t)((now_s()-t0)*1e6));
         }
         ct_flush();

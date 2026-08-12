@@ -101,8 +101,10 @@ type HeatmapPanelProps = {
   t: (key: string, vars?: Record<string, string | number>) => string
 }
 
-const DEFAULT_HEATMAP_H = 680
-const LARGE_HEATMAP_H = 920
+/** Viewport height for the shared scrollable heatmap container (content may be larger). */
+const DEFAULT_HEATMAP_H = 420
+const LARGE_HEATMAP_H = 480
+const MODAL_HEATMAP_H = 560
 
 export function HeatmapModeToggle({ mode, onChange, t, modes }: {
   mode: HeatmapMode
@@ -159,29 +161,31 @@ export function ExpertHeatmapPanel({ mode, node, nodes, placement, compact, minH
             total: coherence.totalLayers,
           })}
         </p>
-        <div className="cluster-layer-dominance-grid" style={{ minHeight: height }}>
-          {stats.map((row) => (
-            <div key={row.layer} className="cluster-layer-dominance-row" title={`L${row.layer}: ${Object.keys(row.nodeCounts).length} nodes`}>
-              <code className="cluster-layer-label">L{row.layer}</code>
-              <div className="cluster-layer-dominance-bar">
-                {Object.entries(row.nodeCounts)
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([nid, count]) => (
-                    <span
-                      key={nid}
-                      style={{
-                        flex: count,
-                        background: nodeColor(nid, nodeIds),
-                      }}
-                      title={`${shortId(nid)}: ${count} (${Math.round((count / row.assigned) * 100)}%)`}
-                    />
-                  ))}
+        <div className={cn("cluster-heatmap-scroll", large && "large")} style={{ height }}>
+          <div className="cluster-layer-dominance-grid">
+            {stats.map((row) => (
+              <div key={row.layer} className="cluster-layer-dominance-row" title={`L${row.layer}: ${Object.keys(row.nodeCounts).length} nodes`}>
+                <code className="cluster-layer-label">L{row.layer}</code>
+                <div className="cluster-layer-dominance-bar">
+                  {Object.entries(row.nodeCounts)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([nid, count]) => (
+                      <span
+                        key={nid}
+                        style={{
+                          flex: count,
+                          background: nodeColor(nid, nodeIds),
+                        }}
+                        title={`${shortId(nid)}: ${count} (${Math.round((count / row.assigned) * 100)}%)`}
+                      />
+                    ))}
+                </div>
+                <span className="cluster-layer-dominance-meta">
+                  {row.dominant ? shortId(row.dominant) : "—"} · {Math.round(row.share * 100)}%
+                </span>
               </div>
-              <span className="cluster-layer-dominance-meta">
-                {row.dominant ? shortId(row.dominant) : "—"} · {Math.round(row.share * 100)}%
-              </span>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       </div>
     )
@@ -226,16 +230,16 @@ function CanvasHeatmap({ mode, node, nodes, placement, rows, cols, nodeIds, comp
     const el = wrapRef.current
     if (!el) return
     const ro = new ResizeObserver(() => {
-      setWrapSize({ w: el.clientWidth - 24, h: Math.max(minHeight, el.clientHeight - 24) })
+      setWrapSize({ w: Math.max(120, el.clientWidth - 24), h: Math.max(120, el.clientHeight - 24) })
     })
     ro.observe(el)
     return () => ro.disconnect()
   }, [minHeight])
 
-  // Size by width so cells stay readable; tall grids scroll with the page, not a nested box.
+  // Readable cells; overflow scrolls inside the fixed-height container.
   const cell = useMemo(() => {
     const minCell = large ? 8 : 6
-    const maxCell = large ? 22 : 16
+    const maxCell = large ? 18 : 14
     return Math.max(minCell, Math.min(maxCell, Math.floor(wrapSize.w / cols)))
   }, [large, wrapSize.w, cols])
 
@@ -298,7 +302,7 @@ function CanvasHeatmap({ mode, node, nodes, placement, rows, cols, nodeIds, comp
   }
 
   return (
-    <div className={cn("cluster-heatmap-canvas-wrap", compact && "compact", large && "large")} ref={wrapRef} style={{ minHeight }}>
+    <div className={cn("cluster-heatmap-scroll", compact && "compact", large && "large")} ref={wrapRef} style={{ height: minHeight }}>
       {!compact ? (
         <div className="cluster-heatmap-legend">
           {mode === "clusterOwner" ? nodeIds.map((nid, i) => (
@@ -336,7 +340,7 @@ function LayerStripHeatmap({ node, minHeight, large, t }: { node: ClusterNode; m
   useEffect(() => {
     const el = wrapRef.current
     if (!el) return
-    const ro = new ResizeObserver(() => setWrapSize({ w: el.clientWidth - 24, h: minHeight }))
+    const ro = new ResizeObserver(() => setWrapSize({ w: Math.max(120, el.clientWidth - 24), h: minHeight }))
     ro.observe(el)
     return () => ro.disconnect()
   }, [minHeight])
@@ -344,7 +348,7 @@ function LayerStripHeatmap({ node, minHeight, large, t }: { node: ClusterNode; m
   const { rows, cols, map } = node.emap!
   const cells = decodeEmap(map, rows, cols)
   const cellSize = useMemo(
-    () => Math.max(large ? 4 : 2, Math.min(large ? 14 : 10, Math.floor(wrapSize.w / cols))),
+    () => Math.max(large ? 4 : 2, Math.min(large ? 12 : 8, Math.floor(wrapSize.w / cols))),
     [wrapSize.w, cols, large],
   )
   const cellGap = cellSize >= 4 ? 1 : 0
@@ -354,7 +358,7 @@ function LayerStripHeatmap({ node, minHeight, large, t }: { node: ClusterNode; m
   }
 
   return (
-    <div ref={wrapRef} className={cn("cluster-layer-strips", large && "large")} style={{ minHeight }}>
+    <div ref={wrapRef} className={cn("cluster-heatmap-scroll", "cluster-layer-strips", large && "large")} style={{ height: minHeight }}>
       <div className="cluster-heatmap-legend">
         <span><i style={{ background: "#4ed6a5" }} /> {t("tier.vram")}</span>
         <span><i style={{ background: "#5a9bd8" }} /> {t("tier.ram")}</span>
@@ -464,8 +468,6 @@ export function ExpertHeatmapModal({ open, onClose, node, nodes, placement, base
     document.body,
   )
 }
-
-const MODAL_HEATMAP_H = 760
 
 export function ClusterHeatmapSection({ nodes, placement, selectedNode, t }: {
   nodes: ClusterNode[]
