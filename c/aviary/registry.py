@@ -43,6 +43,7 @@ class NodeRecord:
     profile: list[dict[str, Any]] = field(default_factory=list)
     expert_port: int = int(os.environ.get("AVIARY_EXPERT_PORT", "9003"))
     control_conn: Any = None
+    control_lock: threading.Lock = field(default_factory=threading.Lock)
     status: str = "healthy"
     missed_heartbeats: int = 0
 
@@ -369,3 +370,16 @@ class NodeRegistry:
         with self._lock:
             return {nid: rec.control_conn for nid, rec in self._nodes.items()
                     if rec.control_conn and rec.status == "healthy"}
+
+    def control_send(self, node_id: str, data: bytes) -> None:
+        """Serialize writes on the node's control socket (handler + placement ticker)."""
+        with self._lock:
+            record = self._nodes.get(node_id)
+            if not record or not record.control_conn or record.status != "healthy":
+                raise OSError("control connection unavailable")
+            conn, lock = record.control_conn, record.control_lock
+        with lock:
+            conn.sendall(data)
+
+    def control_write_line(self, node_id: str, line: str) -> None:
+        self.control_send(node_id, (line.rstrip("\n") + "\n").encode("utf-8"))

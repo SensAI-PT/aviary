@@ -48,8 +48,9 @@ static char g_peer_id[CLUSTER_MAX_PEERS][64];
 static char g_peer_addr[CLUSTER_MAX_PEERS][128];
 static int g_n_peers;
 
-/* expert placement: layer*10000+eid -> peer index (-1 = local) */
-#define CLUSTER_MAX_EXPERTS 8192
+/* expert placement: layer*256+eid -> peer index (-1 = local).
+ * 16384 covers 64 layers × stride 256 (Qwen3-30B-A3B: 48×128 experts). */
+#define CLUSTER_MAX_EXPERTS 16384
 static int g_expert_peer[CLUSTER_MAX_EXPERTS]; /* indexed by layer*256+eid */
 
 /* Aviary layer_caps: max residency tier (0=disk, 1=RAM, 2=VRAM) per layer */
@@ -103,7 +104,8 @@ static void cluster_load_placement(void){
     FILE *f = fopen(g_placement_path, "r");
     if(!f) return;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if(sz < 1 || sz > 65536){ fclose(f); return; }
+    /* Hot-expert plans for large MoE (Qwen3) routinely exceed 64 KiB. */
+    if(sz < 1 || sz > (1 << 20)){ fclose(f); return; }
     char *json = malloc((size_t)sz+1);
     if(!json){ fclose(f); return; }
     if(fread(json,1,(size_t)sz,f)!=(size_t)sz){ free(json); fclose(f); return; }

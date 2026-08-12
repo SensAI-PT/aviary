@@ -62,7 +62,7 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
                     try:
                         registry.register(node_id, peer_host, http_port, model_id, payload,
                                           control_conn=conn)
-                        write_line(conn, f"REGISTERED {node_id}")
+                        registry.control_write_line(node_id, f"REGISTERED {node_id}")
                     except ValueError as err:
                         code = str(err) if str(err) not in ("DUPLICATE",) else "DUPLICATE"
                         write_line(conn, f"ERROR {node_id} {code}")
@@ -82,7 +82,7 @@ class ControlPlaneHandler(socketserver.BaseRequestHandler):
                         if scheduler and payload.get("rpc_samples"):
                             for sample in payload["rpc_samples"]:
                                 scheduler.record_rpc(sample["src"], sample["dst"], float(sample["us"]))
-                        write_line(conn, f"HEARTBEAT_ACK {node_id}")
+                        registry.control_write_line(node_id, f"HEARTBEAT_ACK {node_id}")
                 elif kind == "DEREGISTER" and len(fields) >= 2:
                     node_id = fields[1]
                     registry.deregister(node_id)
@@ -386,7 +386,6 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
     if len(nodes) < 1:
         return
     plan = scheduler.recompute(nodes)
-    conns = registry.control_connections()
     from aviary.placement import MAX_PIN_PER_TICK
 
     sent_pins: set[tuple[str, int, int, int]] = set()
@@ -394,20 +393,22 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
     budget = MAX_PIN_PER_TICK
     for node in nodes:
         nid = node["node_id"]
-        conn = conns.get(nid)
-        if not conn:
+        if nid not in registry.control_connections():
             continue
         try:
             payload = scheduler.build_agent_payload(nid, nodes, int(node.get("expert_port", 9003)))
-            conn.sendall(placement_frame(payload).encode("utf-8"))
-            for layer, eid, tier in (plan.pin_commands.get(nid) or []):
+            registry.control_send(nid, placement_frame(payload).encode("utf-8"))
+            # Prefer demotions (lower tier) so VRAM-slow recovery is not starved by promotes.
+            pins = list(plan.pin_commands.get(nid) or [])
+            pins.sort(key=lambda pet: pet[2])  # lower target tier first
+            for layer, eid, tier in pins:
                 if budget <= 0:
                     break
                 key = (nid, layer, eid, tier)
                 if key in sent_pins:
                     continue
                 sent_pins.add(key)
-                conn.sendall(pin_frame(layer, eid, tier).encode("utf-8"))
+                registry.control_send(nid, pin_frame(layer, eid, tier).encode("utf-8"))
                 budget -= 1
             for layer, eid in (plan.evict_commands.get(nid) or []):
                 if budget <= 0:
@@ -416,7 +417,7 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
                 if key in sent_evicts:
                     continue
                 sent_evicts.add(key)
-                conn.sendall(evict_frame(layer, eid).encode("utf-8"))
+                registry.control_send(nid, evict_frame(layer, eid).encode("utf-8"))
                 budget -= 1
         except OSError as error:
             print(f"[aviary-master] placement push to {nid} failed: {error}", file=sys.stderr)

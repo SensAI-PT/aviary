@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import queue
 import signal
 import socket
 import sys
@@ -117,14 +118,29 @@ class ControlConnection:
         self._stop = threading.Event()
         self._sock = None
         self._sock_lock = threading.Lock()
+        # Apply RELOAD/PIN/LOAD/EVICT off the control thread so heartbeats keep flowing
+        # while the mux drains CLUSTER_* between tokens (can take > CONTROL_IDLE_TIMEOUT).
+        self._cmd_q: queue.SimpleQueue = queue.SimpleQueue()
         self._thread = threading.Thread(target=self._run, name="aviary-control", daemon=True)
+        self._cmd_thread = threading.Thread(target=self._cmd_worker, name="aviary-cluster-cmd",
+                                            daemon=True)
 
     def start(self):
+        self._cmd_thread.start()
         self._thread.start()
 
     def stop(self):
         self._stop.set()
         self._thread.join(timeout=5)
+        self._cmd_thread.join(timeout=5)
+
+    def _send(self, data: bytes | str) -> None:
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        with self._sock_lock:
+            sock = self._sock
+            if sock is None:
+                raise OSError("control socket closed")
+            sock.sendall(raw)
 
     def _write_placement(self, payload: dict) -> None:
         self.placement_path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,36 +148,33 @@ class ControlConnection:
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         tmp.replace(self.placement_path)
 
+    def _enqueue_cluster_cmd(self, cmd: str, layer: int = 0, eid: int = 0, tier: int = 0) -> None:
+        self._cmd_q.put((cmd, layer, eid, tier))
+
+    def _cmd_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                cmd, layer, eid, tier = self._cmd_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
+            if not exec_fn:
+                continue
+            try:
+                exec_fn(cmd, layer, eid, tier)
+            except (ValueError, TypeError) as error:
+                print(f"[aviary-agent] {cmd} failed: {error}", file=sys.stderr)
+
     def _handle_control(self, kind: str, fields: list[str], payload: dict | None) -> None:
         if kind == "PLACEMENT" and payload is not None:
             self._write_placement(payload)
-            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
-            if exec_fn:
-                try:
-                    exec_fn("RELOAD", 0, 0, 0)
-                except (ValueError, TypeError) as error:
-                    print(f"[aviary-agent] RELOAD failed: {error}", file=sys.stderr)
+            self._enqueue_cluster_cmd("RELOAD")
         elif kind == "PIN" and len(fields) >= 4:
-            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
-            if exec_fn:
-                try:
-                    exec_fn("PIN", int(fields[1]), int(fields[2]), int(fields[3]))
-                except (ValueError, TypeError) as error:
-                    print(f"[aviary-agent] PIN failed: {error}", file=sys.stderr)
+            self._enqueue_cluster_cmd("PIN", int(fields[1]), int(fields[2]), int(fields[3]))
         elif kind == "LOAD" and len(fields) >= 4:
-            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
-            if exec_fn:
-                try:
-                    exec_fn("LOAD", int(fields[1]), int(fields[2]), int(fields[3]))
-                except (ValueError, TypeError) as error:
-                    print(f"[aviary-agent] LOAD failed: {error}", file=sys.stderr)
+            self._enqueue_cluster_cmd("LOAD", int(fields[1]), int(fields[2]), int(fields[3]))
         elif kind == "EVICT" and len(fields) >= 3:
-            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
-            if exec_fn:
-                try:
-                    exec_fn("EVICT", int(fields[1]), int(fields[2]))
-                except (ValueError, TypeError) as error:
-                    print(f"[aviary-agent] EVICT failed: {error}", file=sys.stderr)
+            self._enqueue_cluster_cmd("EVICT", int(fields[1]), int(fields[2]))
 
     def _register_payload(self) -> dict:
         payload = {
@@ -235,15 +248,11 @@ class ControlConnection:
         events = self.trace_buffer.drain()
         if not events:
             return
-        with self._sock_lock:
-            sock = self._sock
-        if sock is None:
-            return
         try:
             snap = self.scheduler.snapshot()
             inflight = int(snap.get("active", 0)) + int(snap.get("queued", 0))
             frame = heartbeat_frame(self.node_id, inflight, {"trace_events": events})
-            sock.sendall(frame.encode("utf-8"))
+            self._send(frame)
         except OSError:
             pass
 
@@ -259,7 +268,7 @@ class ControlConnection:
                     self.advertise_host = _local_ip_for(sock.getpeername())
                 reg = register_frame(self.node_id, self.http_port, self.model_id,
                                      self._register_payload())
-                sock.sendall(reg.encode("utf-8"))
+                self._send(reg)
                 kind, fields, _ = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
                 if kind != "REGISTERED" or len(fields) < 2 or fields[1] != self.node_id:
                     time.sleep(2)
@@ -271,11 +280,11 @@ class ControlConnection:
                         snap = self.scheduler.snapshot()
                         inflight = int(snap.get("active", 0)) + int(snap.get("queued", 0))
                         frame = heartbeat_frame(self.node_id, inflight, self._telemetry_payload())
-                        sock.sendall(frame.encode("utf-8"))
+                        self._send(frame)
                         try:
                             kind, fields, payload = read_frame(sock, CONTROL_IDLE_TIMEOUT_MS)
                             if kind == "PING":
-                                write_line(sock, "PONG")
+                                self._send("PONG\n")
                             elif kind == "DRAIN":
                                 break
                             else:
@@ -289,7 +298,7 @@ class ControlConnection:
                         if kind == "EOF":
                             break
                         if kind == "PING":
-                            write_line(sock, "PONG")
+                            self._send("PONG\n")
                         elif kind == "DRAIN":
                             break
                         else:

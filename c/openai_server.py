@@ -2356,11 +2356,13 @@ class Engine:
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
-    def exec_expert(self, layer: int, eid: int, x_in: tuple[float, ...], timeout: float = 0.15):
+    def exec_expert(self, layer: int, eid: int, x_in: tuple[float, ...], timeout: float | None = None):
         """Run a single expert forward via mux EXEC_EXPERT (Aviary Phase 2)."""
         import struct
         import queue as queue_mod
 
+        if timeout is None:
+            timeout = float(os.environ.get("AVIARY_RPC_TIMEOUT_MS", "150")) / 1000.0
         if self.protocol != "mux" or self.closed:
             return None
         hidden = len(x_in)
