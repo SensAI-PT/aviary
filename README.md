@@ -71,7 +71,7 @@ Shipping base weights over the LAN has repeatedly proven cumbersome in other dis
 
 1. **Full replica on every node** — never ship weights during inference.
 2. **Usage-aware hot-loading** — experts migrate disk → RAM → VRAM from real routing heat (`.coli_usage`, EMAP).
-3. **Cluster-wide placement** — master aggregates ECOST/usage, assigns **layer blocks** to nodes, and caps each block’s max tier (disk/RAM/VRAM). Colibri REPIN picks which experts fill those slots locally.
+3. **Cluster-wide placement** — master aggregates ECOST/usage, assigns **layer blocks** to nodes, and caps each block’s max tier (disk/RAM/VRAM). Colibri REPIN picks which experts fill those slots locally. Equal RAM/VRAM budgets do **not** mean GPU is faster — MoE experts are tiny jobs; see [Why can GPU be slower than RAM?](docs/AVIARY.md#why-can-gpu-vram-be-slower-than-ram).
 4. **Cross-node expert RPC** — matmuls dispatch to whoever already has the expert hot.
 5. **Local fallback always works** — a slow or missing peer never blocks a token.
 
@@ -214,6 +214,7 @@ The **Cluster** tab shows:
 | topic | doc |
 |---|---|
 | Overview, env vars, benchmarks | [docs/AVIARY.md](docs/AVIARY.md) |
+| Why VRAM can be slower than RAM | [docs/AVIARY.md § Why can GPU be slower than RAM?](docs/AVIARY.md#why-can-gpu-vram-be-slower-than-ram) |
 | Upstream engine sync / drift | [docs/COLIBRI_SYNC.md](docs/COLIBRI_SYNC.md) |
 | Qwen3 convert + oracle | [docs/qwen3_moe.md](docs/qwen3_moe.md) |
 | Hy3 engine | [docs/hy3.md](docs/hy3.md) |

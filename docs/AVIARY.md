@@ -222,6 +222,26 @@ Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts
 
 When ECOST shows VRAM slower than RAM on a node (common on some CUDA setups), Aviary sets `max_tier=1` and demotes automatically after enough samples.
 
+### Why can GPU (VRAM) be slower than RAM?
+
+People expect “put experts on the GPU → faster.” For MoE that is often **false**, even when you give the same budget to both (e.g. 10 GB RAM and 10 GB VRAM).
+
+**Short version:** MoE does thousands of **small** expert multiplies per reply. A modern CPU is often better at that than a GPU that has to be fed over the bus for every tiny job. Same gigabytes does **not** mean the same speed.
+
+**Slightly longer:**
+
+1. **Same GB ≠ same job.** RAM budget keeps experts in host memory for CPU kernels. VRAM budget *copies* a hot subset onto the GPU. Those are different code paths, not “the same experts, just faster memory.”
+
+2. **Tiny jobs hurt GPUs.** Chat routing picks a few experts per layer, many times per token. That is a storm of small matmuls. GPUs shine on big batched work; CPU SIMD/OpenMP often wins on small irregular ones. Launching and syncing a GPU kernel can cost more than the multiply.
+
+3. **Shipping data to the GPU costs time.** Activations usually live on the CPU. Each CUDA expert path may pay a host↔device tax. The RAM path skips that.
+
+4. **Your laptop/WSL stack matters.** WSL2 CUDA goes through an extra Windows layer; Metal on a Mac can look great while the same model on a CUDA box looks worse. That is environment, not Aviary “preferring” RAM for fun.
+
+5. **Aviary measures and reacts.** After enough ECOST samples, if VRAM exec is clearly slower than RAM on a node (`AVIARY_VRAM_SLOW_RATIO`, default 1.25×), the Placement UI can show **VRAM slower than RAM** and Aviary caps that node at RAM (`max_tier=1`) so Colibri stops promoting those layers into CUDA.
+
+**What to do if CUDA hurts:** let Aviary demote after a few placement ticks, or force it with `CUDA_EXPERT_GB=0` / `--gpu none` while keeping a solid `--ram` pin. Prefer RAM when the dashboard says VRAM is slow — that is working as intended.
+
 ## Environment
 
 | variable | default | meaning |
