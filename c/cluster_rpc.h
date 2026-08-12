@@ -113,8 +113,8 @@ static void cluster_load_placement(void){
             if(*p!='"') break; p++;
             char addr[128]={0}; ii=0;
             while(*p && *p!='"' && ii<127) addr[ii++]=*p++;
-            strncpy(g_peer_id[g_n_peers], id, 63);
-            strncpy(g_peer_addr[g_n_peers], addr, 127);
+            snprintf(g_peer_id[g_n_peers], sizeof(g_peer_id[g_n_peers]), "%s", id);
+            snprintf(g_peer_addr[g_n_peers], sizeof(g_peer_addr[g_n_peers]), "%s", addr);
             g_n_peers++;
             if(*p=='"') p++;
         }
