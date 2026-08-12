@@ -76,6 +76,39 @@ class PickWithAffinityTest(unittest.TestCase):
         hot = {(0, 0), (0, 1)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
 
+    @mock.patch.dict(os.environ, {"AVIARY_ROUTE_COLD_MIN_RATIO": "1.0"})
+    @mock.patch("aviary.registry.random.random", return_value=0.0)
+    def test_zero_resident_fast_node_bootstrapped_over_warm_slow(self, _rand):
+        """Warm-lock escape: cold fast node gets traffic when peer has many residents."""
+        reg = NodeRegistry()
+        warm_map = _emap(*([1] * 64))
+        cold_map = _emap(*([0] * 64))
+        reg.register("fast", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": cold_map})
+        reg.register("slow", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": warm_map,
+            "profile": [{"wall_s": 120.0, "expert_wait_s": 30.0}],
+        })
+        hot = {(0, i) for i in range(8)}
+        self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
+
+    def test_warm_lock_escape_without_bootstrap_lottery(self):
+        """Deterministic escape when warm node profile is much slower than cold."""
+        reg = NodeRegistry()
+        warm_map = _emap(*([1] * 40))
+        cold_map = _emap(*([0] * 40))
+        reg.register("fast", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": cold_map,
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
+        reg.register("slow", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": warm_map,
+            "hwinfo": {"cores": 8, "ram_avail_gb": 1.2},
+            "profile": [{"wall_s": 200.0, "expert_wait_s": 50.0}],
+        })
+        hot = {(0, i) for i in range(8)}
+        with mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "0"}):
+            self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from aviary.tiers_util import sanitize_tiers
+
 
 DEFAULT_HEARTBEAT_SEC = float(os.environ.get("AVIARY_HEARTBEAT_SEC", "2"))
 DEFAULT_HEARTBEAT_MISS = int(os.environ.get("AVIARY_HEARTBEAT_MISS", "3"))
@@ -126,7 +128,7 @@ class NodeRegistry:
                 model_id=model_id,
                 endpoint=endpoint,
                 hwinfo=payload.get("hwinfo"),
-                tiers=payload.get("tiers"),
+                tiers=sanitize_tiers(payload.get("tiers")) or payload.get("tiers"),
                 emap=payload.get("emap"),
                 hits=payload.get("hits") or "",
                 hits_seq=int(payload.get("hits_seq") or 0),
@@ -160,7 +162,10 @@ class NodeRegistry:
             record.status = "healthy"
             for key in ("hwinfo", "tiers", "emap"):
                 if payload.get(key):
-                    setattr(record, key, payload[key])
+                    value = payload[key]
+                    if key == "tiers":
+                        value = sanitize_tiers(value) or value
+                    setattr(record, key, value)
             if "hits" in payload:
                 record.hits = payload.get("hits") or ""
             if "hits_seq" in payload:
@@ -226,6 +231,38 @@ class NodeRegistry:
             penalty += float(cost.get("exec_us", 0)) / 1_000_000
         return penalty
 
+    @staticmethod
+    def _emap_resident_count(n: NodeRecord) -> int:
+        from aviary.placement import decode_emap
+        inv = decode_emap(n.emap)
+        return sum(1 for v in inv.values() if v.get("tier", 0) >= 1)
+
+    @staticmethod
+    def _speed_hint(n: NodeRecord) -> float:
+        hw = n.hwinfo or {}
+        cores = float(hw.get("cores") or 0)
+        ram = float(hw.get("ram_avail_gb") or hw.get("ram_total_gb") or 0)
+        tiers = n.tiers or {}
+        ram_budget = float(tiers.get("ram_gb") or 0)
+        if ram_budget > 1024:
+            ram_budget = 0.0
+        return cores * 10.0 + ram + ram_budget - NodeRegistry._slow_penalty(n)
+
+    @staticmethod
+    def _effective_bootstrap_ratio(max_hits: int, min_hits: int,
+                                   residents: dict[str, int]) -> float:
+        ratio = float(os.environ.get("AVIARY_ROUTE_BOOTSTRAP_RATIO", "0.1"))
+        if max_hits <= 0:
+            return ratio
+        max_res = max(residents.values()) if residents else 0
+        min_res = min(residents.values()) if residents else 0
+        # Warm-lock escape: a cold fast node should receive traffic, not only ~10%.
+        if min_res == 0 and max_res >= 32:
+            ratio = max(ratio, float(os.environ.get("AVIARY_ROUTE_COLD_MIN_RATIO", "0.35")))
+        elif min_hits < max_hits * ratio:
+            ratio = max(ratio, float(os.environ.get("AVIARY_ROUTE_COLD_MIN_RATIO", "0.35")))
+        return ratio
+
     def pick_least_loaded(self, affinity_node: str | None = None) -> NodeRecord | None:
         nodes = self.healthy_nodes()
         if not nodes:
@@ -249,13 +286,30 @@ class NodeRegistry:
             return sum(1 for k in hot_experts if inv.get(k, {}).get("tier", 0) >= 1)
 
         hits = {n.node_id: hot_hits(n) for n in nodes}
+        residents = {n.node_id: self._emap_resident_count(n) for n in nodes}
         max_hits = max(hits.values())
         min_hits = min(hits.values())
+        max_res = max(residents.values()) if residents else 0
+        min_res = min(residents.values()) if residents else 0
+
+        # Severe warm-lock: one node never resident while peer holds dozens — prefer the
+        # faster cold node instead of always sending chat to the warm slow primary.
+        if max_res >= 32 and min_res == 0 and len(nodes) >= 2:
+            cold = [n for n in nodes if residents[n.node_id] == 0]
+            warm = [n for n in nodes if residents[n.node_id] > 0]
+            if cold and warm:
+                best_cold = max(cold, key=self._speed_hint)
+                best_warm = max(warm, key=lambda n: residents[n.node_id])
+                warm_slow = self._slow_penalty(best_warm)
+                cold_slow = self._slow_penalty(best_cold)
+                if (warm_slow > cold_slow + 1.0
+                        or self._speed_hint(best_cold) > self._speed_hint(best_warm) + 5.0):
+                    return min(cold, key=self._load_key)
 
         # Bootstrap cold executors: when one node has warmed hot experts and another
         # has almost none, occasionally route chat there so it can collect usage/ECOST
         # and pin experts. Fraction is AVIARY_ROUTE_BOOTSTRAP_RATIO (not 100%).
-        bootstrap_ratio = float(os.environ.get("AVIARY_ROUTE_BOOTSTRAP_RATIO", "0.1"))
+        bootstrap_ratio = self._effective_bootstrap_ratio(max_hits, min_hits, residents)
         if bootstrap_ratio > 0 and max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
             warm = [n for n in nodes if hits[n.node_id] > min_hits + 1]
             cold = [n for n in nodes if hits[n.node_id] <= min_hits + 1]
@@ -266,7 +320,11 @@ class NodeRegistry:
                     return min(cold, key=self._load_key)
 
         def score(n: NodeRecord) -> tuple[int, float, float, str]:
-            return (-hits[n.node_id], n.inflight + self._slow_penalty(n), -n.last_heartbeat, n.node_id)
+            hit_score = -hits[n.node_id]
+            # Do not let resident affinity permanently override a much faster cold peer.
+            if residents[n.node_id] == 0 and max(hits.values()) >= 4:
+                hit_score = max(hit_score, -min(4, max(hits.values()) // 4))
+            return (hit_score, n.inflight + self._slow_penalty(n), -n.last_heartbeat, n.node_id)
 
         return min(nodes, key=score)
 

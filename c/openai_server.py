@@ -3091,6 +3091,14 @@ class APIHandler(BaseHTTPRequestHandler):
                                     None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+        finally:
+            control = getattr(self.server, "control", None)
+            if control and hasattr(control, "push_trace_now"):
+                control.push_trace_now()
+            if eng:
+                eng.set_cluster_job(None)
+            if trace:
+                trace.set_job(None)
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200

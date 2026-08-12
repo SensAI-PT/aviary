@@ -60,7 +60,7 @@ static void cluster_set_job_id(const char *job_id){
 }
 
 static void cluster_emit_trace(int layer, int eid, const char *kind, const char *peer, uint32_t rpc_us){
-    if(!g_cluster_enabled) return;
+    if(!g_cluster_enabled && !g_cluster_job_id[0]) return;
     printf("TRACE %d %d %s %s %u\n", layer, eid, kind, peer && peer[0] ? peer : "-", rpc_us);
     fflush(stdout);
 }

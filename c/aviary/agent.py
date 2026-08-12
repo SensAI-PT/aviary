@@ -28,6 +28,7 @@ from aviary.protocol import (
 )
 from aviary.registry import CONTROL_IDLE_TIMEOUT_MS, DEFAULT_HEARTBEAT_SEC
 from aviary.trace import TraceBuffer
+from aviary.tiers_util import sanitize_tiers
 from aviary.usage import arch_engine_id, read_coli_usage, usage_delta
 
 try:
@@ -63,6 +64,32 @@ def _local_ip_for(peer: tuple[str, int]) -> str:
         return "127.0.0.1"
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    return (host or "").strip().lower() in ("127.0.0.1", "localhost", "::1")
+
+
+def _resolve_cluster_advertise_host(advertise: str | None, bind_host: str,
+                                    master_host: str, control_port: int) -> str:
+    """Under AVIARY_CLUSTER, peers must reach expert RPC on a LAN-routable address."""
+    cluster = os.environ.get("AVIARY_CLUSTER", "0") not in ("0", "")
+    if not cluster:
+        return advertise or bind_host
+    if advertise and not _is_loopback_host(advertise):
+        return advertise
+    peer = master_host if not _is_loopback_host(master_host) else ("8.8.8.8", 53)
+    if isinstance(peer, str):
+        peer = (peer, control_port)
+    resolved = _local_ip_for(peer)
+    if _is_loopback_host(resolved):
+        print("[aviary-agent] WARNING: cluster advertise host is loopback; "
+              "pass --advertise-host <LAN-IP> so peers can reach expert RPC",
+              file=sys.stderr)
+        return resolved
+    if advertise and _is_loopback_host(advertise):
+        print(f"[aviary-agent] cluster: replacing loopback advertise {advertise!r} "
+              f"with {resolved!r}", file=sys.stderr)
+    return resolved
+
 class ControlConnection:
     def __init__(self, node_id, master_host, control_port, http_port, model_id, model_path,
                  advertise_host, engine, scheduler, arch, expert_port, placement_path,
@@ -82,6 +109,8 @@ class ControlConnection:
         self.trace_buffer = trace_buffer
         self._usage_snapshot: list[dict] = []
         self._stop = threading.Event()
+        self._sock = None
+        self._sock_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="aviary-control", daemon=True)
 
     def start(self):
@@ -133,8 +162,9 @@ class ControlConnection:
         eng = self.engine
         if getattr(eng, "hwinfo", None):
             payload["hwinfo"] = eng.hwinfo
-        if getattr(eng, "tiers", None):
-            payload["tiers"] = eng.tiers
+        tiers = sanitize_tiers(getattr(eng, "tiers", None))
+        if tiers:
+            payload["tiers"] = tiers
         if discover_gpus and not payload.get("hwinfo"):
             try:
                 gpus = discover_gpus()
@@ -147,18 +177,6 @@ class ControlConnection:
                     "vram_total_gb": sum(g.get("memory_total_gb", 0) for g in gpus),
                     "cpu": "",
                     "gpu": gpus[0].get("name", "") if gpus else "",
-                }
-            except Exception:
-                pass
-        if analyze_model:
-            try:
-                plan = analyze_model(self.model_path)
-                payload["tiers"] = payload.get("tiers") or {
-                    "vram": plan.get("vram_experts", 0),
-                    "ram": plan.get("ram_experts", 0),
-                    "disk": plan.get("disk_experts", 0),
-                    "vram_gb": plan.get("vram_gb", 0),
-                    "ram_gb": plan.get("ram_gb", 0),
                 }
             except Exception:
                 pass
@@ -183,8 +201,9 @@ class ControlConnection:
         }
         if getattr(eng, "hwinfo", None):
             payload["hwinfo"] = eng.hwinfo
-        if getattr(eng, "tiers", None):
-            payload["tiers"] = eng.tiers
+        tiers = sanitize_tiers(getattr(eng, "tiers", None))
+        if tiers:
+            payload["tiers"] = tiers
         if getattr(eng, "emap", None):
             payload["emap"] = eng.emap
         payload["scheduler"] = snap
@@ -197,12 +216,33 @@ class ControlConnection:
                 server.rpc_samples.clear()
         return payload
 
+    def push_trace_now(self) -> None:
+        """Flush pending TRACE events to master without waiting for the next heartbeat."""
+        if not self.trace_buffer:
+            return
+        events = self.trace_buffer.drain()
+        if not events:
+            return
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
+            return
+        try:
+            snap = self.scheduler.snapshot()
+            inflight = int(snap.get("active", 0)) + int(snap.get("queued", 0))
+            frame = heartbeat_frame(self.node_id, inflight, {"trace_events": events})
+            sock.sendall(frame.encode("utf-8"))
+        except OSError:
+            pass
+
     def _run(self):
         self._started = time.time()
         while not self._stop.is_set():
             sock = None
             try:
                 sock = socket.create_connection((self.master_host, self.control_port), timeout=5)
+                with self._sock_lock:
+                    self._sock = sock
                 if not self.advertise_host or self.advertise_host == "0.0.0.0":
                     self.advertise_host = _local_ip_for(sock.getpeername())
                 reg = register_frame(self.node_id, self.http_port, self.model_id,
@@ -265,6 +305,8 @@ class ControlConnection:
                 print(f"[aviary-agent] control connection to {target} failed: "
                       f"{error}{hint}", file=sys.stderr)
             finally:
+                with self._sock_lock:
+                    self._sock = None
                 if sock:
                     try:
                         write_line(sock, f"DEREGISTER {self.node_id}")
@@ -307,6 +349,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     advertise = advertise_host or (host if host not in ("0.0.0.0", "::") else None)
     if not advertise and host in ("0.0.0.0", "::"):
         advertise = _local_ip_for((master_host, control_port))
+    advertise = _resolve_cluster_advertise_host(advertise, host, master_host, control_port)
     engine_bin = engine_path or str(default_engine())
     placement_path = Path(model) / ".aviary_placement.json"
 
@@ -339,6 +382,7 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
                                 advertise, runtime, server.scheduler, arch, expert_port,
                                 placement_path, server.trace_buffer)
+    server.control = control
     control.start()
 
     prefetch = None

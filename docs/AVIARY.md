@@ -135,6 +135,10 @@ COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 
   --advertise-host B
 ```
 
+**Cluster advertise host:** each agent must register a **LAN-routable** address (not
+`127.0.0.1`) so peers can reach its expert RPC port. With `AVIARY_CLUSTER=1`, agents
+auto-replace loopback `--advertise-host` with the detected LAN IP when possible.
+
 WSL2: if port 9003 is taken by Windows, add `--expert-port 9013`.
 
 ### 5. Use the cluster
@@ -172,6 +176,23 @@ If not, you still gain **N× concurrent chat capacity** from N full replicas.
 **Job trace kinds:** `local` (disk/RAM/VRAM on primary), `remote` (RPC to peer), `fallback`
 (remote miss → local load), `rpc_in` (peer served an inbound expert).
 
+### What the heatmap is (and is not)
+
+Aviary does **not** pipeline consecutive layers across machines. Every node keeps a **full
+model replica**; one chat runs on a single **primary** agent (dense, attention, LM head).
+Cross-node work is **per-hot-expert RPC** only.
+
+| UI label | Meaning |
+|---|---|
+| **assigned** | Scheduler ownership for a hot expert (~top 256 by usage) |
+| **resident** | Assigned experts with EMAP tier ≥ 1 (RAM/VRAM) on that node |
+| **layer blocks** | Contiguous layers that happen to own ≥1 assigned expert — display aggregation, not pipeline stages |
+
+**Chat latency ≈ primary node speed.** If routing picks a cold or slow primary, the whole
+request pays that cost (~seconds to minutes), not LAN RTT alone (expert RPC is typically a
+few ms). Prefer warming the fast node (`--advertise-host` + `--ram`) and check
+`/cluster/jobs` for which executor was primary.
+
 ## Correctness gate
 
 Remote expert RPC is an **optimization**, not a correctness requirement. For every parallel
@@ -198,6 +219,7 @@ Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts
 | `AVIARY_RPC_TIMEOUT_MS` | `150` | Expert RPC latency budget (ms) |
 | `AVIARY_PLACEMENT_SEC` | `4` | Placement scheduler recompute interval |
 | `AVIARY_ROUTE_BOOTSTRAP_RATIO` | `0.1` | When cold nodes have &lt; this fraction of the leader's hot-expert residents, **this fraction** of chat routes to cold (probabilistic, not 100%) |
+| `AVIARY_ROUTE_COLD_MIN_RATIO` | `0.35` | Floor for cold routing when one node has zero EMAP residents and another has many (warm-lock escape) |
 | `AVIARY_PREFETCH` | `0` | Enable Phase 4 best-effort shard prefetch daemon on agents |
 | `AVIARY_PREFETCH_SEC` | `10` | Prefetch poll interval (seconds) |
 | `AVIARY_PREFETCH_MAX` | `2` | Max concurrent shard downloads per agent |
