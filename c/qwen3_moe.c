@@ -1124,24 +1124,86 @@ static int cluster_expert_resident(Model *m, int layer, int eid){
     return 0;
 }
 
+static int cluster_evict_expert(Model *m, int layer, int eid);
+
+static void eslot_demote_cuda(ESlot *s){
+#ifdef COLI_CUDA
+    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+#endif
+}
+
+static int eslot_try_vram(ESlot *s, int layer){
+    if(cluster_layer_max_tier(layer) < 2) return 0;
+#ifdef COLI_CUDA
+    if(s->g.cuda_eligible || s->u.cuda_eligible || s->d.cuda_eligible){
+        if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)) return 1;
+        eslot_demote_cuda(s);
+        return 0;
+    }
+    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+        return 1;
+    }
+    eslot_demote_cuda(s);
+#endif
+    return 0;
+}
+
 static int cluster_pin_expert(Model *m, int layer, int eid, int tier){
-    (void)tier;
     if(layer<0||layer>=m->c.n_layers||!m->L[layer].sparse) return 0;
-    if(cluster_expert_resident(m,layer,eid)) return 1;
-    ESlot slot={0}; expert_load(m,layer,eid,&slot);
+    int cap = cluster_layer_max_tier(layer);
+    if(tier > cap) tier = cap;
+    if(tier <= 0) return cluster_evict_expert(m, layer, eid);
+    for(int z=0;z<m->npin[layer];z++){
+        if(m->pin[layer][z].eid==eid){
+            ESlot *s=&m->pin[layer][z];
+            if(tier < 2) eslot_demote_cuda(s);
+            else eslot_try_vram(s, layer);
+            return 1;
+        }
+    }
     ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
+    for(int z=0;z<*nn;z++){
+        if(Sl[z].eid==eid){
+            if(tier < 2) eslot_demote_cuda(&Sl[z]);
+            else eslot_try_vram(&Sl[z], layer);
+            Sl[z].used=++m->eclock;
+            return 1;
+        }
+    }
+    ESlot slot={0};
+    expert_load(m,layer,eid,&slot);
+    if(tier >= 2) eslot_try_vram(&slot, layer);
+    else eslot_demote_cuda(&slot);
     if(*nn<m->ecap){ Sl[(*nn)++]=slot; Sl[*nn-1].used=++m->eclock; return 1; }
     int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z;
-    Sl[lru]=slot; Sl[lru].used=++m->eclock; return 1;
+    eslot_release(&Sl[lru]);
+    Sl[lru]=slot; Sl[lru].used=++m->eclock;
+    return 1;
 }
 
 static int cluster_evict_expert(Model *m, int layer, int eid){
     if(layer<0||layer>=m->c.n_layers) return 0;
     ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
     for(int z=0;z<*nn;z++){
-        if(Sl[z].eid==eid){ Sl[z]=Sl[*nn-1]; (*nn)--; return 1; }
+        if(Sl[z].eid==eid){
+            eslot_release(&Sl[z]);
+            Sl[z]=Sl[*nn-1]; (*nn)--;
+            return 1;
+        }
     }
-    return cluster_expert_resident(m,layer,eid)?0:1;
+    for(int z=0;z<m->npin[layer];z++){
+        if(m->pin[layer][z].eid==eid){
+            ESlot *s=&m->pin[layer][z];
+            eslot_demote_cuda(s);
+            eslot_release(s);
+            m->pin[layer][z]=m->pin[layer][m->npin[layer]-1];
+            m->npin[layer]--;
+            return 1;
+        }
+    }
+    return 1;
 }
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
@@ -1828,6 +1890,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
         if(budget>safe_total) budget=safe_total;
         for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
+            if(cluster_layer_max_tier(li) < 2) continue;
             for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
                 ESlot *s=&m->pin[li][z];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
@@ -1894,7 +1957,7 @@ static void repin_pass(Model *m){
         int old=s->eid;
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
 #ifdef COLI_CUDA
-        int gpu=s->g.cuda_eligible;
+        int gpu=s->g.cuda_eligible && cluster_layer_max_tier(cd[b].l) >= 2;
         int64_t old_gpu=gpu ? (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
@@ -2314,6 +2377,15 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
             free(line);
             if(cluster_evict_expert(m,layer,eid)) printf("CLUSTER_OK %s\n",req_id);
             else printf("CLUSTER_MISS %s\n",req_id);
+            fflush(stdout); return 0;
+        }
+    }
+    if(!strncmp(line,"CLUSTER_RELOAD ",15)){
+        char req_id[64];
+        if(sscanf(line,"CLUSTER_RELOAD %63s",req_id)==1){
+            free(line);
+            cluster_reload();
+            printf("CLUSTER_OK %s\n",req_id);
             fflush(stdout); return 0;
         }
     }

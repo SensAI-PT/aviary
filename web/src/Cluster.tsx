@@ -44,6 +44,12 @@ function statusClass(status: string) {
   return ""
 }
 
+function tierLabel(tier: number, t: (key: string) => string) {
+  if (tier >= 2) return t("tier.vram")
+  if (tier >= 1) return t("tier.ram")
+  return t("tier.disk")
+}
+
 function layerBlocksForNode(placement: ClusterPlacementResponse | null, nodeId: string) {
   return placement?.blocks?.[nodeId] || []
 }
@@ -470,13 +476,18 @@ function PlacementPanel({ nodes, placement, selectedNodeId, onSelectNode, t }: {
             <div className="cluster-placement-stats">
               <span>{inbound} {t("cluster.assignedExperts")}</span>
               <span>{experts.filter((e) => e.tier >= 1).length} {t("cluster.residentExperts")}</span>
+              {placement?.node_tier_prefs?.[node.node_id]?.vram_slow ? (
+                <span className="cluster-vram-slow">{t("cluster.vramSlow")}</span>
+              ) : null}
               {layerBlocksForNode(placement, node.node_id).length ? (
                 <span>{layerBlocksForNode(placement, node.node_id).length} {t("cluster.layerBlocks")}</span>
               ) : null}
             </div>
             <div className="cluster-layer-blocks">
               {layerBlocksForNode(placement, node.node_id).map((b) => (
-                <span key={`${b.start}-${b.end}`} className="cluster-layer-block">L{b.start}–{b.end}</span>
+                <span key={`${b.start}-${b.end}`} className="cluster-layer-block" title={b.max_tier != null ? tierLabel(b.max_tier, t) : undefined}>
+                  L{b.start}–{b.end}{b.max_tier != null ? ` · ${tierLabel(b.max_tier, t)}` : ""}
+                </span>
               ))}
             </div>
             <div className="cluster-expert-chips compact">

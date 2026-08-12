@@ -16,6 +16,23 @@ DEFAULT_RECOMPUTE_SEC = float(os.environ.get("AVIARY_PLACEMENT_SEC", "4"))
 EXPLORE_RATE = float(os.environ.get("AVIARY_EXPLORE_RATE", "0.01"))
 MAX_PIN_PER_TICK = int(os.environ.get("AVIARY_PIN_BATCH", "32"))
 LAYER_COHERENT = os.environ.get("AVIARY_LAYER_COHERENT", "0") not in ("0", "")
+LAYER_BLOCKS = os.environ.get("AVIARY_LAYER_BLOCKS", "1") not in ("0", "")
+VRAM_SLOW_RATIO = float(os.environ.get("AVIARY_VRAM_SLOW_RATIO", "1.25"))
+BLOCK_MOVE_PCT = float(os.environ.get("AVIARY_BLOCK_MOVE_PCT", "0.15"))
+MIN_TIER_SAMPLES = int(os.environ.get("AVIARY_MIN_TIER_SAMPLES", "8"))
+
+
+def blocks_from_planned(planned: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group planned layer blocks by owning node."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for block in planned or []:
+        nid = block["node_id"]
+        out.setdefault(nid, []).append({
+            "start": block["start"],
+            "end": block["end"],
+            "max_tier": block.get("max_tier", 2),
+        })
+    return out
 
 
 def blocks_from_experts(experts: dict[str, str], node_ids: list[str]) -> dict[str, list[dict[str, int]]]:
@@ -96,6 +113,20 @@ def decode_emap(emap: dict[str, Any] | None) -> dict[tuple[int, int], dict[str, 
     return out
 
 
+def _layer_owners_from_plan(plan: "PlacementPlan | None") -> dict[int, str]:
+    if not plan:
+        return {}
+    owners: dict[int, str] = {}
+    for block in plan.planned_blocks or []:
+        for layer in range(int(block["start"]), int(block["end"]) + 1):
+            owners[layer] = block["node_id"]
+    for key, nid in (plan.experts or {}).items():
+        if ":" not in key:
+            continue
+        owners[int(key.split(":", 1)[0])] = nid
+    return owners
+
+
 def _expert_cost(sched: "PlacementScheduler", primary: str, nid: str, layer: int, expert: int,
                  inventories: dict[str, dict], tier_hint: int | None = None) -> float:
     inv = inventories.get(nid, {}).get((layer, expert), {"tier": 0})
@@ -110,6 +141,176 @@ def _expert_cost(sched: "PlacementScheduler", primary: str, nid: str, layer: int
     return c
 
 
+def _node_median_exec(sched: "PlacementScheduler", node_id: str, tier: int) -> float:
+    vals = [v.exec_us for (_, _, t), v in sched._costs.get(node_id, {}).items()
+            if t == tier and v.exec_us > 0]
+    if vals:
+        return statistics.median(vals)
+    return sched._median_exec.get(tier, 50_000.0)
+
+
+def _node_tier_sample_count(sched: "PlacementScheduler", node_id: str, tier: int) -> int:
+    return sum(1 for (_, _, t), v in sched._costs.get(node_id, {}).items()
+               if t == tier and v.exec_us > 0)
+
+
+def preferred_max_tier(sched: "PlacementScheduler", node: dict[str, Any]) -> tuple[int, bool]:
+    """Return (max_tier, vram_slow) for a node from ECOST + capacity."""
+    nid = node["node_id"]
+    tiers = node.get("tiers") or {}
+    has_vram = int(tiers.get("vram", 0)) > 0 or float(tiers.get("vram_gb", 0) or 0) > 0
+    if not has_vram:
+        return 1, False
+    exec1 = _node_median_exec(sched, nid, 1)
+    exec2 = _node_median_exec(sched, nid, 2)
+    vram_slow = (_node_tier_sample_count(sched, nid, 1) >= MIN_TIER_SAMPLES
+                 and _node_tier_sample_count(sched, nid, 2) >= MIN_TIER_SAMPLES
+                 and exec1 > 0 and exec2 > exec1 * VRAM_SLOW_RATIO)
+    return (1, True) if vram_slow else (2, False)
+
+
+def _node_median_load(sched: "PlacementScheduler", node_id: str, tier: int = 0) -> float:
+    vals = [v.load_us for (_, _, t), v in sched._costs.get(node_id, {}).items()
+            if t == tier and v.load_us > 0]
+    if vals:
+        return statistics.median(vals)
+    return sched._median_exec.get(0, 500_000.0)
+
+
+def _layer_exec_us(sched: "PlacementScheduler", node_id: str, max_tier: int) -> float:
+    opts = [_node_median_exec(sched, node_id, t) for t in range(1, min(max_tier, 2) + 1)]
+    if max_tier < 1:
+        opts.append(_node_median_exec(sched, node_id, 0) + _node_median_load(sched, node_id))
+    return min(opts) if opts else _node_median_exec(sched, node_id, 1)
+
+
+def _layer_cost_on_node(sched: "PlacementScheduler", primary: str, nid: str, layer: int,
+                        layer_freq: int, inventories: dict[str, dict], max_tier: int,
+                        prev_owner: str | None,
+                        layer_experts: list[tuple[int, int]] | None = None) -> float:
+    if layer_experts:
+        cost = sum(_expert_cost(sched, primary, nid, layer, expert, inventories, None)
+                   for expert, _ in layer_experts)
+    else:
+        cost = layer_freq * _layer_exec_us(sched, nid, max_tier)
+    if prev_owner and prev_owner != nid:
+        cost += sched._rpc_cost(primary, nid)
+    if random.random() < EXPLORE_RATE and nid != primary:
+        cost *= 0.5
+    return cost
+
+
+def _merge_blocks(layer_owners: dict[int, str], layer_max_tier: dict[int, int]) -> list[dict[str, Any]]:
+    if not layer_owners:
+        return []
+    layers = sorted(layer_owners)
+    blocks: list[dict[str, Any]] = []
+    start = prev = layers[0]
+    nid = layer_owners[start]
+    max_t = layer_max_tier.get(start, 2)
+    for layer in layers[1:]:
+        if layer == prev + 1 and layer_owners[layer] == nid:
+            prev = layer
+            max_t = max(max_t, layer_max_tier.get(layer, 2))
+            continue
+        blocks.append({"start": start, "end": prev, "node_id": nid, "max_tier": max_t})
+        start = prev = layer
+        nid = layer_owners[layer]
+        max_t = layer_max_tier.get(layer, 2)
+    blocks.append({"start": start, "end": prev, "node_id": nid, "max_tier": max_t})
+    return blocks
+
+
+def _emit_tier_commands(plan: PlacementPlan, inventories: dict[str, dict],
+                        layer_max_tier: dict[int, int], hot: list[tuple[tuple[int, int], int]]) -> None:
+    plan.pin_commands = {}
+    plan.evict_commands = {}
+    for (layer, expert), freq in hot:
+        if freq < 1:
+            continue
+        key = f"{layer}:{expert}"
+        owner = plan.experts.get(key)
+        if not owner:
+            continue
+        max_tier = layer_max_tier.get(layer, 1)
+        inv_tier = inventories.get(owner, {}).get((layer, expert), {"tier": 0})["tier"]
+        plan.expert_tiers[key] = inv_tier
+        if max_tier <= 0:
+            if inv_tier >= 1:
+                plan.evict_commands.setdefault(owner, []).append((layer, expert))
+            continue
+        target = min(max_tier, 2)
+        if inv_tier < target:
+            plan.pin_commands.setdefault(owner, []).append((layer, expert, target))
+        elif inv_tier > target:
+            if target >= 1:
+                plan.pin_commands.setdefault(owner, []).append((layer, expert, target))
+            else:
+                plan.evict_commands.setdefault(owner, []).append((layer, expert))
+
+
+def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
+                       hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
+                       inventories: dict[str, dict], primary: str,
+                       prev_owners: dict[int, str]) -> None:
+    """Assign contiguous layer blocks to nodes; prefer measured tier per owner."""
+    by_layer: dict[int, int] = {}
+    by_layer_experts: dict[int, list[tuple[int, int]]] = {}
+    for (layer, expert), freq in hot:
+        if freq < 1:
+            continue
+        by_layer[layer] = by_layer.get(layer, 0) + freq
+        by_layer_experts.setdefault(layer, []).append((expert, freq))
+
+    if not by_layer:
+        return
+
+    node_max: dict[str, tuple[int, bool]] = {n["node_id"]: preferred_max_tier(sched, n) for n in healthy}
+    plan.node_tier_prefs = {
+        nid: {"max_tier": mt, "vram_slow": slow,
+              "median_exec": {str(t): round(_node_median_exec(sched, nid, t))
+                              for t in (0, 1, 2)}}
+        for nid, (mt, slow) in node_max.items()
+    }
+
+    layer_owners: dict[int, str] = {}
+    layer_max_tier: dict[int, int] = {}
+    prev_node: str | None = None
+
+    for layer in sorted(by_layer):
+        freq = by_layer[layer]
+        best_node, best_cost = primary, float("inf")
+        for n in healthy:
+            nid = n["node_id"]
+            max_t, _ = node_max[nid]
+            cost = _layer_cost_on_node(sched, primary, nid, layer, freq, inventories, max_t,
+                                       prev_node, by_layer_experts.get(layer))
+            if cost < best_cost:
+                best_cost, best_node = cost, nid
+
+        prev_nid = prev_owners.get(layer)
+        if prev_nid and prev_nid != best_node and prev_nid in node_max:
+            max_t, _ = node_max[prev_nid]
+            prev_cost = _layer_cost_on_node(sched, primary, prev_nid, layer, freq, inventories,
+                                            max_t, prev_owners.get(layer - 1),
+                                            by_layer_experts.get(layer))
+            if prev_cost <= best_cost * (1.0 + BLOCK_MOVE_PCT):
+                best_node = prev_nid
+
+        max_t, _ = node_max[best_node]
+        layer_owners[layer] = best_node
+        layer_max_tier[layer] = max_t
+        prev_node = best_node
+
+        for expert, _efreq in by_layer_experts.get(layer, []):
+            key = f"{layer}:{expert}"
+            plan.experts[key] = best_node
+
+    plan.planned_blocks = _merge_blocks(layer_owners, layer_max_tier)
+    plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
+    _emit_tier_commands(plan, inventories, layer_max_tier, hot)
+
+
 def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,
                           hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
                           inventories: dict[str, dict], primary: str) -> None:
@@ -119,7 +320,8 @@ def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,
         if freq < 1:
             continue
         by_layer.setdefault(layer, []).append((expert, freq))
-    plan.pin_commands = {}
+    node_max = {n["node_id"]: preferred_max_tier(sched, n)[0] for n in healthy}
+    layer_max_tier: dict[int, int] = {}
     for layer, items in by_layer.items():
         best_node, best_total = primary, float("inf")
         for n in healthy:
@@ -127,13 +329,11 @@ def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,
             total = sum(_expert_cost(sched, primary, nid, layer, expert, inventories) for expert, _ in items)
             if total < best_total:
                 best_total, best_node = total, nid
+        layer_max_tier[layer] = node_max.get(best_node, 1)
         for expert, _freq in items:
-            key = f"{layer}:{expert}"
-            plan.experts[key] = best_node
-            tier = inventories.get(best_node, {}).get((layer, expert), {"tier": 0})["tier"]
-            plan.expert_tiers[key] = tier
-            if tier < 1:
-                plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
+            plan.experts[f"{layer}:{expert}"] = best_node
+    plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
+    _emit_tier_commands(plan, inventories, layer_max_tier, hot)
 
 
 @dataclass
@@ -151,12 +351,17 @@ class CostSample:
 @dataclass
 class PlacementPlan:
     """Cluster-wide routing table and per-node pin commands."""
-    experts: dict[str, str] = field(default_factory=dict)  # "layer:eid" -> node_id
+    experts: dict[str, str] = field(default_factory=dict)
     expert_tiers: dict[str, int] = field(default_factory=dict)
     pin_commands: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict)
+    evict_commands: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     rpc_matrix_us: dict[str, dict[str, float]] = field(default_factory=dict)
     computed_at: float = 0.0
     layer_coherent: bool = False
+    layer_blocks: bool = False
+    planned_blocks: list[dict[str, Any]] = field(default_factory=list)
+    layer_caps: dict[str, int] = field(default_factory=dict)
+    node_tier_prefs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class PlacementScheduler:
@@ -180,7 +385,7 @@ class PlacementScheduler:
             bucket[key] = cs
             tier = int(s.get("tier", 1))
             if cs.exec_us > 0:
-                vals = [v.exec_us for b in self._costs.values() for (l, e, t), v in b.items() if t == tier]
+                vals = [v.exec_us for b in self._costs.values() for (_, _, t), v in b.items() if t == tier]
                 if vals:
                     self._median_exec[tier] = statistics.median(vals)
 
@@ -200,7 +405,7 @@ class PlacementScheduler:
         best = min((v.exec_us for b in self._costs.values()
                     for (l, e, t), v in b.items() if l == layer and e == expert and v.exec_us > 0),
                    default=0.0)
-        return best or self._median_exec.get(tier, 50_000.0)
+        return best or _node_median_exec(self, node_id, tier)
 
     def _load_cost(self, node_id: str, layer: int, expert: int, tier: int) -> float:
         if tier >= 1:
@@ -233,10 +438,18 @@ class PlacementScheduler:
         hot = sorted(self._usage.items(), key=lambda kv: -kv[1])[:256]
         primary = primary_hint or (min(healthy, key=lambda n: n.get("inflight", 0))["node_id"]
                                     if healthy else node_ids[0])
+        prev_owners = _layer_owners_from_plan(self._last_plan)
 
-        if LAYER_COHERENT:
+        if LAYER_BLOCKS:
+            apply_layer_blocks(self, plan, hot, healthy, inventories, primary, prev_owners)
+            plan.layer_blocks = True
+            plan.layer_coherent = True
+        elif LAYER_COHERENT:
             apply_layer_coherence(self, plan, hot, healthy, inventories, primary)
+            plan.layer_coherent = True
         else:
+            node_max = {n["node_id"]: preferred_max_tier(self, n)[0] for n in healthy}
+            layer_max_tier: dict[int, int] = {}
             for (layer, expert), freq in hot:
                 if freq < 1:
                     continue
@@ -259,18 +472,14 @@ class PlacementScheduler:
                         if tier < 1:
                             c += self._load_cost(nid, layer, expert, 0)
                     if random.random() < EXPLORE_RATE and nid != primary:
-                        c *= 0.5  # ε-greedy exploration toward unknown nodes
+                        c *= 0.5
                     if c < best_cost:
                         best_cost, best_node = c, nid
 
                 plan.experts[key] = best_node
-                plan.expert_tiers[key] = inventories.get(best_node, {}).get(
-                    (layer, expert), {"tier": 0})["tier"]
-
-                if best_node and plan.expert_tiers[key] < 1:
-                    plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
-
-        plan.layer_coherent = LAYER_COHERENT
+                layer_max_tier[layer] = node_max.get(best_node, 1)
+            plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
+            _emit_tier_commands(plan, inventories, layer_max_tier, hot)
 
         plan.rpc_matrix_us = {k: dict(v) for k, v in self._rpc_us.items()}
         if self._prev_experts:
@@ -288,7 +497,13 @@ class PlacementScheduler:
         peers = {n["node_id"]: f"{n.get('host', '127.0.0.1')}:{expert_port}"
                  for n in nodes if n.get("status") == "healthy" and n["node_id"] != node_id}
         experts = {k: v for k, v in plan.experts.items() if v != node_id}
-        return {"node_id": node_id, "peers": peers, "experts": experts}
+        return {
+            "node_id": node_id,
+            "peers": peers,
+            "experts": experts,
+            "layer_caps": plan.layer_caps,
+            "blocks": plan.planned_blocks,
+        }
 
     @property
     def last_plan(self) -> PlacementPlan | None:
@@ -298,6 +513,7 @@ class PlacementScheduler:
         plan = self._last_plan
         experts = dict(plan.experts) if plan else {}
         ids = node_ids or sorted({nid for nid in experts.values()})
+        blocks = blocks_from_planned(plan.planned_blocks) if plan and plan.planned_blocks else blocks_from_experts(experts, ids)
         return {
             "experts": experts,
             "expert_tiers": dict(plan.expert_tiers) if plan else {},
@@ -306,9 +522,13 @@ class PlacementScheduler:
             "usage_top": [{"layer": l, "expert": e, "count": c}
                              for (l, e), c in sorted(self._usage.items(),
                                                      key=lambda kv: -kv[1])[:32]],
-            "blocks": blocks_from_experts(experts, ids),
+            "blocks": blocks,
+            "planned_blocks": plan.planned_blocks if plan else [],
+            "layer_caps": dict(plan.layer_caps) if plan else {},
+            "node_tier_prefs": dict(plan.node_tier_prefs) if plan else {},
             "layer_coherence": layer_coherence_stats(experts),
             "layer_coherent": bool(plan and getattr(plan, "layer_coherent", False)),
+            "layer_blocks": bool(plan and getattr(plan, "layer_blocks", False)),
             "reassignments": self._reassignments,
             "rpc_histogram": self.rpc_histogram.snapshot(),
         }

@@ -52,6 +52,18 @@ static int g_n_peers;
 #define CLUSTER_MAX_EXPERTS 8192
 static int g_expert_peer[CLUSTER_MAX_EXPERTS]; /* indexed by layer*256+eid */
 
+/* Aviary layer_caps: max residency tier (0=disk, 1=RAM, 2=VRAM) per layer */
+static int g_layer_cap[256];
+
+static void cluster_reset_layer_caps(void){
+    for(int i = 0; i < 256; i++) g_layer_cap[i] = 2;
+}
+
+static int cluster_layer_max_tier(int layer){
+    if(layer < 0 || layer >= 256) return 2;
+    return g_layer_cap[layer];
+}
+
 static int cluster_expert_key(int layer, int eid){ return layer * 256 + eid; }
 
 static void cluster_set_job_id(const char *job_id){
@@ -86,6 +98,7 @@ static const char *cluster_json_str(const char *json, const char *key, char *buf
 static void cluster_load_placement(void){
     for(int i = 0; i < CLUSTER_MAX_EXPERTS; i++) g_expert_peer[i] = -1;
     g_n_peers = 0;
+    cluster_reset_layer_caps();
     if(!g_placement_path[0]) return;
     FILE *f = fopen(g_placement_path, "r");
     if(!f) return;
@@ -145,6 +158,25 @@ static void cluster_load_placement(void){
                 }
             }
             if(*p=='"') p++;
+        }
+    }
+    const char *caps = strstr(json, "\"layer_caps\"");
+    if(caps){
+        const char *p = strchr(caps, '{');
+        if(p) for(p++; *p && *p != '}'; ){
+            while(*p==' '||*p==',') p++;
+            if(*p!='"') break;
+            p++;
+            char key[16]={0}; int ki=0;
+            while(*p && *p!='"' && ki<15) key[ki++]=*p++;
+            if(*p!='"') break; p++;
+            while(*p && *p!=':') p++;
+            if(*p==':') p++;
+            while(*p && (*p==' '||*p=='\t')) p++;
+            int cap = atoi(p);
+            int layer = atoi(key);
+            if(layer >= 0 && layer < 256) g_layer_cap[layer] = cap;
+            while(*p && *p!=',' && *p!='}') p++;
         }
     }
     free(json);

@@ -71,7 +71,7 @@ Shipping base weights over the LAN has repeatedly proven cumbersome in other dis
 
 1. **Full replica on every node** — never ship weights during inference.
 2. **Usage-aware hot-loading** — experts migrate disk → RAM → VRAM from real routing heat (`.coli_usage`, EMAP).
-3. **Cluster-wide placement** — master aggregates costs and assigns ownership; agents may RPC peers.
+3. **Cluster-wide placement** — master aggregates ECOST/usage, assigns **layer blocks** to nodes, and caps each block’s max tier (disk/RAM/VRAM). Colibri REPIN picks which experts fill those slots locally.
 4. **Cross-node expert RPC** — matmuls dispatch to whoever already has the expert hot.
 5. **Local fallback always works** — a slow or missing peer never blocks a token.
 
@@ -111,6 +111,7 @@ Architecture is auto-detected from `config.json` when you point `COLI_MODEL` at 
 |---|---|---|
 | **`COLI_MODEL`** | **every agent** | Absolute path to the model directory (same checkpoint on every node) |
 | **`AVIARY_CLUSTER`** | **every agent** | Set to `1` to enable cross-node expert RPC + placement |
+| **`AVIARY_LAYER_BLOCKS`** | master (via agent heartbeats) | Default `1` — assigns contiguous layer blocks and picks disk/RAM/VRAM per node from ECOST |
 | **`COLI_API_KEY`** | **master + every agent** | Optional shared bearer secret (same value everywhere) |
 
 Master does **not** load weights — it only needs `COLI_API_KEY` if you enable auth. Agents need `COLI_MODEL` and `AVIARY_CLUSTER=1`.

@@ -135,6 +135,12 @@ class ControlConnection:
     def _handle_control(self, kind: str, fields: list[str], payload: dict | None) -> None:
         if kind == "PLACEMENT" and payload is not None:
             self._write_placement(payload)
+            exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
+            if exec_fn:
+                try:
+                    exec_fn("RELOAD", 0, 0, 0)
+                except (ValueError, TypeError) as error:
+                    print(f"[aviary-agent] RELOAD failed: {error}", file=sys.stderr)
         elif kind == "PIN" and len(fields) >= 4:
             exec_fn = getattr(self.engine, "exec_cluster_cmd", None)
             if exec_fn:

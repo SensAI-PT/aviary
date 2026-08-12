@@ -118,6 +118,13 @@ export interface ClusterJobsResponse {
 export interface ClusterLayerBlock {
   start: number
   end: number
+  max_tier?: number
+}
+
+export interface ClusterNodeTierPref {
+  max_tier: number
+  vram_slow?: boolean
+  median_exec?: Record<string, number>
 }
 
 export interface ClusterRpcHistogram {
@@ -143,6 +150,10 @@ export interface ClusterPlacementResponse {
   computed_at: number
   usage_top: Array<{ layer: number; expert: number; count: number }>
   blocks?: Record<string, ClusterLayerBlock[]>
+  planned_blocks?: ClusterLayerBlock[]
+  layer_caps?: Record<string, number>
+  node_tier_prefs?: Record<string, ClusterNodeTierPref>
+  layer_blocks?: boolean
   layer_coherence?: ClusterLayerCoherence
   layer_coherent?: boolean
   reassignments?: number

@@ -186,7 +186,7 @@ Cross-node work is **per-hot-expert RPC** only.
 |---|---|
 | **assigned** | Scheduler ownership for a hot expert (~top 256 by usage) |
 | **resident** | Assigned experts with EMAP tier ≥ 1 (RAM/VRAM) on that node |
-| **layer blocks** | Contiguous layers that happen to own ≥1 assigned expert — display aggregation, not pipeline stages |
+| **layer blocks** | Contiguous layer ranges assigned to one executor; `max_tier` caps disk (0) / RAM (1) / VRAM (2) from measured ECOST |
 
 **Chat latency ≈ primary node speed.** If routing picks a cold or slow primary, the whole
 request pays that cost (~seconds to minutes), not LAN RTT alone (expert RPC is typically a
@@ -213,6 +213,15 @@ Today:
 
 Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts float equality.
 
+### Aviary vs Colibri (placement)
+
+| Layer | Owns |
+|---|---|
+| **Aviary** | Which **node** owns each layer block; **max tier** (disk/RAM/VRAM) per layer via `layer_caps` in `.aviary_placement.json`; PIN/EVICT to enforce |
+| **Colibri** | Which **experts** within a layer occupy RAM/VRAM slots (REPIN, heat) — subject to Aviary caps |
+
+When ECOST shows VRAM slower than RAM on a node (common on some CUDA setups), Aviary sets `max_tier=1` and demotes automatically after enough samples.
+
 ## Environment
 
 | variable | default | meaning |
@@ -229,8 +238,12 @@ Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts
 | `AVIARY_PREFETCH` | `0` | Enable Phase 4 best-effort shard prefetch daemon on agents |
 | `AVIARY_PREFETCH_SEC` | `10` | Prefetch poll interval (seconds) |
 | `AVIARY_PREFETCH_MAX` | `2` | Max concurrent shard downloads per agent |
-| `AVIARY_PIN_BATCH` | `32` | Max PIN commands pushed per placement tick |
-| `AVIARY_LAYER_COHERENT` | `0` | Assign all hot experts in a layer to one executor (reduces per-layer RPC hops) |
+| `AVIARY_PIN_BATCH` | `32` | Max PIN/EVICT commands pushed per placement tick |
+| `AVIARY_LAYER_BLOCKS` | `1` | Assign hot layers as contiguous blocks across nodes (reduces RPC hops) |
+| `AVIARY_LAYER_COHERENT` | `0` | Legacy: one node per layer when `AVIARY_LAYER_BLOCKS=0` |
+| `AVIARY_VRAM_SLOW_RATIO` | `1.25` | Cap node at RAM when median VRAM exec exceeds RAM exec by this factor |
+| `AVIARY_BLOCK_MOVE_PCT` | `0.15` | Hysteresis: keep a layer block unless moving saves ≥ this fraction |
+| `AVIARY_MIN_TIER_SAMPLES` | `8` | ECOST samples required before declaring VRAM-slow on a node |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.

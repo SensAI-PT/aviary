@@ -2391,7 +2391,7 @@ class Engine:
         if self.protocol != "mux" or self.closed:
             return False
         cmd = cmd.upper()
-        if cmd not in ("PIN", "LOAD", "EVICT"):
+        if cmd not in ("PIN", "LOAD", "EVICT", "RELOAD"):
             return False
         mux = f"CLUSTER_{cmd}"
         with self.rpc_lock:
@@ -2401,6 +2401,8 @@ class Engine:
             self.rpc_pending[rid] = events
         if cmd == "EVICT":
             frame = f"{mux} {rid} {layer} {eid}\n".encode()
+        elif cmd == "RELOAD":
+            frame = f"{mux} {rid}\n".encode()
         else:
             frame = f"{mux} {rid} {layer} {eid} {tier}\n".encode()
         try:

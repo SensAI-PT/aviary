@@ -414,6 +414,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-rpc-bar.hist { background: linear-gradient(90deg, #6b8f71, #8fbc8f); }
 .cluster-layer-blocks { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 12px; }
 .cluster-layer-block { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); font: 600 10px ui-monospace, SFMono-Regular, monospace; color: var(--muted-foreground); }
+.cluster-vram-slow { color: #e6c07a; font-size: 10px; font-weight: 600; }
 .cluster-gantt { display: grid; gap: 6px; margin-top: 8px; }
 .cluster-gantt-primary, .cluster-gantt-seg { padding: 6px 8px; border-radius: 8px; font-size: 10px; border: 1px solid var(--border); background: var(--card); }
 .cluster-gantt-seg.remote { border-color: rgba(90,155,216,.35); }

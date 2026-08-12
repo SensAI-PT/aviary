@@ -390,6 +390,8 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
     from aviary.placement import MAX_PIN_PER_TICK
 
     sent_pins: set[tuple[str, int, int, int]] = set()
+    sent_evicts: set[tuple[str, int, int]] = set()
+    budget = MAX_PIN_PER_TICK
     for node in nodes:
         nid = node["node_id"]
         conn = conns.get(nid)
@@ -398,12 +400,24 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
         try:
             payload = scheduler.build_agent_payload(nid, nodes, int(node.get("expert_port", 9003)))
             conn.sendall(placement_frame(payload).encode("utf-8"))
-            for layer, eid, tier in (plan.pin_commands.get(nid) or [])[:MAX_PIN_PER_TICK]:
+            for layer, eid, tier in (plan.pin_commands.get(nid) or []):
+                if budget <= 0:
+                    break
                 key = (nid, layer, eid, tier)
                 if key in sent_pins:
                     continue
                 sent_pins.add(key)
                 conn.sendall(pin_frame(layer, eid, tier).encode("utf-8"))
+                budget -= 1
+            for layer, eid in (plan.evict_commands.get(nid) or []):
+                if budget <= 0:
+                    break
+                key = (nid, layer, eid)
+                if key in sent_evicts:
+                    continue
+                sent_evicts.add(key)
+                conn.sendall(evict_frame(layer, eid).encode("utf-8"))
+                budget -= 1
         except OSError as error:
             print(f"[aviary-master] placement push to {nid} failed: {error}", file=sys.stderr)
 
