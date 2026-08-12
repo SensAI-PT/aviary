@@ -200,6 +200,10 @@ typedef struct {
 #include "route_trace.h"   /* shared .coli_usage / ROUTE_TRACE (#700) */
 #include "cluster_telemetry.h"
 #include "cluster_rpc.h"
+/* telemetry.h::hwinfo_emit reads these; declare before the include (see colibri.c). */
+#ifdef COLI_CUDA
+static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
+#endif
 #include "telemetry.h"
 #include "decode_batch.h"
 
@@ -210,7 +214,6 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_attn;
-static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
@@ -492,7 +495,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
         fprintf(stderr,COLI_ACCEL_TAG " tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);

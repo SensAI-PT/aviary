@@ -33,9 +33,25 @@ pathological repetitive prompts an early token can flip. Turn it on when prefill
 matters more than exact CPU parity; prompts past the single-dispatch thread cap fall
 back to the CPU automatically.
 
+**Platform:** macOS / Apple Silicon only. `make … METAL=1` is refused on Linux
+(including WSL) with `METAL=1 is supported only on macOS` — use `CUDA=1` there
+instead. No Xcode app is required (the Metal shader compiles at runtime);
+`xcode-select --install` is enough for the clang toolchain.
+
+**OpenMP:** Apple clang does not ship `omp.h`. Metal builds `#include <omp.h>`
+(for `omp_in_parallel` guards around GPU dispatch), so without Homebrew
+libomp the compile fails with `omp.h file not found`. Install once:
+
+```bash
+brew install libomp
+```
+
+A plain CPU build can limp along single-threaded without libomp; `METAL=1`
+cannot.
+
 ```bash
 cd c
-make colibri METAL=1          # macOS only; no Xcode needed (shader compiles at runtime)
+make colibri METAL=1          # macOS + libomp; shader compiles at runtime
 make hy3 METAL=1              # MoE + GEMM; GQA attention on CPU
 make qwen3_moe METAL=1        # same as hy3
                               # any macOS SDK builds; the COLI_METAL_RESSET residency-set
