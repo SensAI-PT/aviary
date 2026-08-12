@@ -202,6 +202,7 @@ Optional dev flag: `AVIARY_ORACLE=1` (future) dual-runs remote+local and asserts
 | `AVIARY_PREFETCH_SEC` | `10` | Prefetch poll interval (seconds) |
 | `AVIARY_PREFETCH_MAX` | `2` | Max concurrent shard downloads per agent |
 | `AVIARY_PIN_BATCH` | `32` | Max PIN commands pushed per placement tick |
+| `AVIARY_LAYER_COHERENT` | `0` | Assign all hot experts in a layer to one executor (reduces per-layer RPC hops) |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.

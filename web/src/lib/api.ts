@@ -129,6 +129,13 @@ export interface ClusterRpcHistogram {
   window_sec: number
 }
 
+export interface ClusterLayerCoherence {
+  score: number
+  multi_node_layers: number
+  total_layers: number
+  layers?: Array<{ layer: number; dominant: string; share: number; assigned: number; nodes: number }>
+}
+
 export interface ClusterPlacementResponse {
   experts: Record<string, string>
   expert_tiers: Record<string, number>
@@ -136,6 +143,8 @@ export interface ClusterPlacementResponse {
   computed_at: number
   usage_top: Array<{ layer: number; expert: number; count: number }>
   blocks?: Record<string, ClusterLayerBlock[]>
+  layer_coherence?: ClusterLayerCoherence
+  layer_coherent?: boolean
   reassignments?: number
   rpc_histogram?: ClusterRpcHistogram
 }

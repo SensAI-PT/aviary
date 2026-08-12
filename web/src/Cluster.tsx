@@ -20,7 +20,7 @@ import {
   type ClusterOverviewResponse,
   type ClusterPlacementResponse,
 } from "@/lib/api"
-import { Brain } from "./Brain"
+import { ClusterHeatmapSection, ExpertHeatmapModal } from "./ClusterHeatmap"
 import { Badge } from "@/components/ui/badge"
 import { useLocale } from "./i18n"
 import { cn } from "@/lib/utils"
@@ -340,91 +340,106 @@ function ExecutorsPanel({ nodes, placement, selectedNode, selectedJob, onSelectN
   connected: boolean
   t: (key: string, vars?: Record<string, string | number>) => string
 }) {
+  const [heatmapOpen, setHeatmapOpen] = useState(false)
   const owned = selectedNode ? expertsForNode(placement, selectedNode.node_id) : []
   const remotes = selectedNode ? remoteExpertsForNode(placement, selectedNode.node_id).slice(0, 16) : []
+  useEffect(() => { setHeatmapOpen(false) }, [selectedNode?.node_id])
   return (
-    <div className="cluster-spark-split">
-      <div className="cluster-executor-list">
-        {nodes.map((node) => (
-          <button key={node.node_id} type="button" className={cn("cluster-executor-row", selectedNode?.node_id === node.node_id && "selected", node.status)} onClick={() => onSelectNode(node.node_id)}>
-            <div className="cluster-executor-row-top">
-              <strong>{shortId(node.node_id)}</strong>
-              <Badge className={statusClass(node.status)}>{node.status}</Badge>
-            </div>
-            <div className="cluster-executor-row-meta">{node.endpoint}</div>
-            <div className="cluster-executor-row-stats">
-              <span><Activity className="size-3" /> {node.inflight}</span>
-              <span><HardDrive className="size-3" /> {node.tiers ? `${node.tiers.ram} RAM` : "—"}</span>
-              <span><Layers className="size-3" /> {expertsForNode(placement, node.node_id).length} hot</span>
-            </div>
-          </button>
-        ))}
-      </div>
-      <div className="cluster-spark-detail wide">
-        {!selectedNode ? (
-          <p className="cluster-empty">{t("cluster.selectExecutor")}</p>
-        ) : (
-          <>
-            <header className="cluster-detail-head">
-              <div>
-                <h3>{shortId(selectedNode.node_id)}</h3>
-                <p>{selectedNode.endpoint}</p>
+    <div className="cluster-executors-layout">
+      <div className="cluster-spark-split">
+        <div className="cluster-executor-list">
+          {nodes.map((node) => (
+            <button key={node.node_id} type="button" className={cn("cluster-executor-row", selectedNode?.node_id === node.node_id && "selected", node.status)} onClick={() => onSelectNode(node.node_id)}>
+              <div className="cluster-executor-row-top">
+                <strong>{shortId(node.node_id)}</strong>
+                <Badge className={statusClass(node.status)}>{node.status}</Badge>
               </div>
-              {selectedJob?.node_id === selectedNode.node_id ? (
-                <Badge className="badge-speed"><Zap className="size-3" /> {t("cluster.servingJob")} {shortId(selectedJob.job_id)}</Badge>
+              <div className="cluster-executor-row-meta">{node.endpoint}</div>
+              <div className="cluster-executor-row-stats">
+                <span><Activity className="size-3" /> {node.inflight}</span>
+                <span><HardDrive className="size-3" /> {node.tiers ? `${node.tiers.ram} RAM` : "—"}</span>
+                <span><Layers className="size-3" /> {expertsForNode(placement, node.node_id).length} hot</span>
+              </div>
+            </button>
+          ))}
+        </div>
+        <div className="cluster-spark-detail wide">
+          {!selectedNode ? (
+            <p className="cluster-empty">{t("cluster.selectExecutor")}</p>
+          ) : (
+            <>
+              <header className="cluster-detail-head">
+                <div>
+                  <h3>{shortId(selectedNode.node_id)}</h3>
+                  <p>{selectedNode.endpoint}</p>
+                </div>
+                {selectedJob?.node_id === selectedNode.node_id ? (
+                  <Badge className="badge-speed"><Zap className="size-3" /> {t("cluster.servingJob")} {shortId(selectedJob.job_id)}</Badge>
+                ) : null}
+              </header>
+
+              <div className="cluster-detail-grid">
+                <div><span>{t("cluster.col.arch")}</span><strong>{selectedNode.arch || "—"}</strong></div>
+                <div><span>{t("cluster.inflight")}</span><strong>{selectedNode.inflight}</strong></div>
+                <div><span>{t("cluster.uptime")}</span><strong>{Math.round(selectedNode.uptime_sec)}s</strong></div>
+                <div><span>{t("cluster.heartbeat")}</span><strong>{selectedNode.last_heartbeat_age_sec.toFixed(1)}s</strong></div>
+              </div>
+
+              {selectedNode.hwinfo ? (
+                <div className="cluster-detail-hw">
+                  <span><Cpu className="size-3" /> {selectedNode.hwinfo.cpu || t("cluster.unknown")}</span>
+                  <span><MemoryStick className="size-3" /> {selectedNode.hwinfo.ram_avail_gb.toFixed(0)}/{selectedNode.hwinfo.ram_total_gb.toFixed(0)} GB</span>
+                  {selectedNode.tiers ? <span><HardDrive className="size-3" /> {selectedNode.tiers.ram} RAM · {selectedNode.tiers.disk} disk</span> : null}
+                </div>
               ) : null}
-            </header>
 
-            <div className="cluster-detail-grid">
-              <div><span>{t("cluster.col.arch")}</span><strong>{selectedNode.arch || "—"}</strong></div>
-              <div><span>{t("cluster.inflight")}</span><strong>{selectedNode.inflight}</strong></div>
-              <div><span>{t("cluster.uptime")}</span><strong>{Math.round(selectedNode.uptime_sec)}s</strong></div>
-              <div><span>{t("cluster.heartbeat")}</span><strong>{selectedNode.last_heartbeat_age_sec.toFixed(1)}s</strong></div>
-            </div>
-
-            {selectedNode.hwinfo ? (
-              <div className="cluster-detail-hw">
-                <span><Cpu className="size-3" /> {selectedNode.hwinfo.cpu || t("cluster.unknown")}</span>
-                <span><MemoryStick className="size-3" /> {selectedNode.hwinfo.ram_avail_gb.toFixed(0)}/{selectedNode.hwinfo.ram_total_gb.toFixed(0)} GB</span>
-                {selectedNode.tiers ? <span><HardDrive className="size-3" /> {selectedNode.tiers.ram} RAM · {selectedNode.tiers.disk} disk</span> : null}
-              </div>
-            ) : null}
-
-            <section className="cluster-subsection">
-              <h4>{t("cluster.ownedExperts")} ({owned.length})</h4>
-              <div className="cluster-expert-chips">
-                {owned.length ? owned.slice(0, 48).map((e) => (
-                  <span key={e.key} className={cn("cluster-expert-chip", e.tier >= 2 ? "vram" : e.tier >= 1 ? "ram" : "disk")}>{e.key}</span>
-                )) : <span className="cluster-empty-inline">{t("cluster.noOwnedExperts")}</span>}
-              </div>
-            </section>
-
-            {remotes.length ? (
               <section className="cluster-subsection">
-                <h4>{t("cluster.remoteTargets")}</h4>
+                <h4>{t("cluster.ownedExperts")} ({owned.length})</h4>
                 <div className="cluster-expert-chips">
-                  {remotes.map((e) => (
-                    <span key={e.key} className="cluster-expert-chip remote">{e.key} → {shortId(e.nodeId)}</span>
-                  ))}
+                  {owned.length ? owned.slice(0, 48).map((e) => (
+                    <span key={e.key} className={cn("cluster-expert-chip", e.tier >= 2 ? "vram" : e.tier >= 1 ? "ram" : "disk")}>{e.key}</span>
+                  )) : <span className="cluster-empty-inline">{t("cluster.noOwnedExperts")}</span>}
                 </div>
               </section>
-            ) : null}
 
-            {selectedNode.emap?.rows ? (
-              <section className="cluster-subsection heatmap">
-                <h4>{t("cluster.expertHeatmap")}</h4>
-                <Brain baseUrl={baseUrl} apiKey={apiKey} connected={connected} staticData={{
-                  rows: selectedNode.emap.rows,
-                  cols: selectedNode.emap.cols,
-                  map: selectedNode.emap.map,
-                  hits: selectedNode.hits || "",
-                  seq: selectedNode.hits_seq || 0,
-                }} />
-              </section>
-            ) : null}
-          </>
-        )}
+              {remotes.length ? (
+                <section className="cluster-subsection">
+                  <h4>{t("cluster.remoteTargets")}</h4>
+                  <div className="cluster-expert-chips">
+                    {remotes.map((e) => (
+                      <span key={e.key} className="cluster-expert-chip remote">{e.key} → {shortId(e.nodeId)}</span>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+
+              {selectedNode.emap?.rows ? (
+                <section className="cluster-subsection">
+                  <button type="button" className="cluster-heatmap-launch" onClick={() => setHeatmapOpen(true)}>
+                    <div>
+                      <h4>{t("cluster.expertHeatmap")}</h4>
+                      <p>{t("cluster.heatmap.openHint")}</p>
+                    </div>
+                    <ChevronRight className="size-4" />
+                  </button>
+                  <ExpertHeatmapModal
+                    open={heatmapOpen}
+                    onClose={() => setHeatmapOpen(false)}
+                    node={selectedNode}
+                    nodes={nodes}
+                    placement={placement}
+                    baseUrl={baseUrl}
+                    apiKey={apiKey}
+                    connected={connected}
+                    t={t}
+                  />
+                </section>
+              ) : null}
+            </>
+          )}
+        </div>
       </div>
+      <ClusterHeatmapSection nodes={nodes} placement={placement} selectedNode={selectedNode} t={t} />
     </div>
   )
 }
@@ -443,6 +458,7 @@ function PlacementPanel({ nodes, placement, selectedNodeId, onSelectNode, t }: {
   }))
   return (
     <div className="cluster-spark-body">
+      <ClusterHeatmapSection nodes={nodes} placement={placement} t={t} />
       <div className="cluster-placement-grid">
         {byNode.map(({ node, experts, inbound }) => (
           <section key={node.node_id} className={cn("cluster-placement-card", selectedNodeId === node.node_id && "selected")} onClick={() => onSelectNode(node.node_id)}>

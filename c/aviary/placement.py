@@ -15,6 +15,7 @@ from aviary.rpc_hist import RpcHistogram
 DEFAULT_RECOMPUTE_SEC = float(os.environ.get("AVIARY_PLACEMENT_SEC", "4"))
 EXPLORE_RATE = float(os.environ.get("AVIARY_EXPLORE_RATE", "0.01"))
 MAX_PIN_PER_TICK = int(os.environ.get("AVIARY_PIN_BATCH", "32"))
+LAYER_COHERENT = os.environ.get("AVIARY_LAYER_COHERENT", "0") not in ("0", "")
 
 
 def blocks_from_experts(experts: dict[str, str], node_ids: list[str]) -> dict[str, list[dict[str, int]]]:
@@ -47,6 +48,37 @@ def blocks_from_experts(experts: dict[str, str], node_ids: list[str]) -> dict[st
     return out
 
 
+def layer_coherence_stats(experts: dict[str, str]) -> dict[str, Any]:
+    """Share of hot expert assignments on each layer's dominant node."""
+    by_layer: dict[int, dict[str, int]] = {}
+    for key, nid in experts.items():
+        if ":" not in key:
+            continue
+        layer = int(key.split(":", 1)[0])
+        counts = by_layer.setdefault(layer, {})
+        counts[nid] = counts.get(nid, 0) + 1
+    layers = []
+    weighted = total = 0
+    multi = 0
+    for layer in sorted(by_layer):
+        counts = by_layer[layer]
+        assigned = sum(counts.values())
+        dominant = max(counts.items(), key=lambda kv: kv[1])[0] if counts else ""
+        share = counts[dominant] / assigned if assigned and dominant else 0.0
+        if len(counts) > 1:
+            multi += 1
+        weighted += share * assigned
+        total += assigned
+        layers.append({"layer": layer, "dominant": dominant, "share": round(share, 3),
+                       "assigned": assigned, "nodes": len(counts)})
+    return {
+        "score": round(weighted / total, 3) if total else 0.0,
+        "multi_node_layers": multi,
+        "total_layers": len(layers),
+        "layers": layers[:64],
+    }
+
+
 def decode_emap(emap: dict[str, Any] | None) -> dict[tuple[int, int], dict[str, int]]:
     """Decode EMAP hex into {(layer, expert): {tier, heat}}."""
     if not emap or not emap.get("map"):
@@ -62,6 +94,46 @@ def decode_emap(emap: dict[str, Any] | None) -> dict[tuple[int, int], dict[str, 
         layer, expert = i // cols, i % cols
         out[(layer, expert)] = {"tier": byte >> 6, "heat": byte & 0x3F}
     return out
+
+
+def _expert_cost(sched: "PlacementScheduler", primary: str, nid: str, layer: int, expert: int,
+                 inventories: dict[str, dict], tier_hint: int | None = None) -> float:
+    inv = inventories.get(nid, {}).get((layer, expert), {"tier": 0})
+    tier = tier_hint if tier_hint is not None else inv["tier"]
+    if nid == primary:
+        tp = tier
+        return sched._load_cost(primary, layer, expert, tp) + sched._exec_cost(primary, layer, expert, max(tp, 1))
+    exec_t = max(tier, 1) if tier >= 1 else 1
+    c = sched._rpc_cost(primary, nid) + sched._exec_cost(nid, layer, expert, exec_t)
+    if tier < 1:
+        c += sched._load_cost(nid, layer, expert, 0)
+    return c
+
+
+def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,
+                          hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
+                          inventories: dict[str, dict], primary: str) -> None:
+    """Assign all hot experts in a layer to one executor (fewer RPC hops per forward pass)."""
+    by_layer: dict[int, list[tuple[int, int]]] = {}
+    for (layer, expert), freq in hot:
+        if freq < 1:
+            continue
+        by_layer.setdefault(layer, []).append((expert, freq))
+    plan.pin_commands = {}
+    for layer, items in by_layer.items():
+        best_node, best_total = primary, float("inf")
+        for n in healthy:
+            nid = n["node_id"]
+            total = sum(_expert_cost(sched, primary, nid, layer, expert, inventories) for expert, _ in items)
+            if total < best_total:
+                best_total, best_node = total, nid
+        for expert, _freq in items:
+            key = f"{layer}:{expert}"
+            plan.experts[key] = best_node
+            tier = inventories.get(best_node, {}).get((layer, expert), {"tier": 0})["tier"]
+            plan.expert_tiers[key] = tier
+            if tier < 1:
+                plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
 
 
 @dataclass
@@ -84,6 +156,7 @@ class PlacementPlan:
     pin_commands: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict)
     rpc_matrix_us: dict[str, dict[str, float]] = field(default_factory=dict)
     computed_at: float = 0.0
+    layer_coherent: bool = False
 
 
 class PlacementScheduler:
@@ -161,39 +234,43 @@ class PlacementScheduler:
         primary = primary_hint or (min(healthy, key=lambda n: n.get("inflight", 0))["node_id"]
                                     if healthy else node_ids[0])
 
-        for (layer, expert), freq in hot:
-            if freq < 1:
-                continue
-            key = f"{layer}:{expert}"
-            inv_p = inventories.get(primary, {}).get((layer, expert), {"tier": 0})
-            tier_p = inv_p["tier"]
-            cost_local = self._load_cost(primary, layer, expert, tier_p) + self._exec_cost(
-                primary, layer, expert, max(tier_p, 1))
+        if LAYER_COHERENT:
+            apply_layer_coherence(self, plan, hot, healthy, inventories, primary)
+        else:
+            for (layer, expert), freq in hot:
+                if freq < 1:
+                    continue
+                key = f"{layer}:{expert}"
+                inv_p = inventories.get(primary, {}).get((layer, expert), {"tier": 0})
+                tier_p = inv_p["tier"]
+                cost_local = self._load_cost(primary, layer, expert, tier_p) + self._exec_cost(
+                    primary, layer, expert, max(tier_p, 1))
 
-            best_node, best_cost = primary, cost_local
-            for n in healthy:
-                nid = n["node_id"]
-                inv = inventories.get(nid, {}).get((layer, expert), {"tier": 0})
-                tier = inv["tier"]
-                if nid == primary:
-                    c = cost_local
-                else:
-                    exec_t = max(tier, 1) if tier >= 1 else 1
-                    c = self._rpc_cost(primary, nid) + self._exec_cost(nid, layer, expert, exec_t)
-                    if tier < 1:
-                        c += self._load_cost(nid, layer, expert, 0)
-                if random.random() < EXPLORE_RATE and nid != primary:
-                    c *= 0.5  # ε-greedy exploration toward unknown nodes
-                if c < best_cost:
-                    best_cost, best_node = c, nid
+                best_node, best_cost = primary, cost_local
+                for n in healthy:
+                    nid = n["node_id"]
+                    inv = inventories.get(nid, {}).get((layer, expert), {"tier": 0})
+                    tier = inv["tier"]
+                    if nid == primary:
+                        c = cost_local
+                    else:
+                        exec_t = max(tier, 1) if tier >= 1 else 1
+                        c = self._rpc_cost(primary, nid) + self._exec_cost(nid, layer, expert, exec_t)
+                        if tier < 1:
+                            c += self._load_cost(nid, layer, expert, 0)
+                    if random.random() < EXPLORE_RATE and nid != primary:
+                        c *= 0.5  # ε-greedy exploration toward unknown nodes
+                    if c < best_cost:
+                        best_cost, best_node = c, nid
 
-            plan.experts[key] = best_node
-            plan.expert_tiers[key] = inventories.get(best_node, {}).get(
-                (layer, expert), {"tier": 0})["tier"]
+                plan.experts[key] = best_node
+                plan.expert_tiers[key] = inventories.get(best_node, {}).get(
+                    (layer, expert), {"tier": 0})["tier"]
 
-            # Pin hot experts on their preferred node when tier < RAM
-            if best_node and plan.expert_tiers[key] < 1:
-                plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
+                if best_node and plan.expert_tiers[key] < 1:
+                    plan.pin_commands.setdefault(best_node, []).append((layer, expert, 1))
+
+        plan.layer_coherent = LAYER_COHERENT
 
         plan.rpc_matrix_us = {k: dict(v) for k, v in self._rpc_us.items()}
         if self._prev_experts:
@@ -230,6 +307,8 @@ class PlacementScheduler:
                              for (l, e), c in sorted(self._usage.items(),
                                                      key=lambda kv: -kv[1])[:32]],
             "blocks": blocks_from_experts(experts, ids),
+            "layer_coherence": layer_coherence_stats(experts),
+            "layer_coherent": bool(plan and getattr(plan, "layer_coherent", False)),
             "reassignments": self._reassignments,
             "rpc_histogram": self.rpc_histogram.snapshot(),
         }

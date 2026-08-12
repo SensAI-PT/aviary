@@ -2,7 +2,7 @@
 
 import unittest
 
-from aviary.placement import PlacementScheduler, blocks_from_experts, decode_emap
+from aviary.placement import PlacementScheduler, blocks_from_experts, decode_emap, layer_coherence_stats
 
 
 class DecodeEmapTest(unittest.TestCase):
@@ -53,6 +53,28 @@ class PlacementSchedulerTest(unittest.TestCase):
         blocks = blocks_from_experts({"0:1": "a", "1:2": "a", "3:4": "b"}, ["a", "b"])
         self.assertEqual(blocks["a"], [{"start": 0, "end": 1}])
         self.assertEqual(blocks["b"], [{"start": 3, "end": 3}])
+
+    def test_layer_coherence_stats(self):
+        stats = layer_coherence_stats({"0:1": "a", "0:2": "a", "1:1": "b", "1:2": "c"})
+        self.assertEqual(stats["multi_node_layers"], 1)
+        self.assertLess(stats["score"], 1.0)
+
+    def test_layer_coherent_mode(self):
+        import os
+        from unittest import mock
+        import aviary.placement as p
+        nodes = [
+            {"node_id": "a", "status": "healthy", "inflight": 0,
+             "emap": {"rows": 2, "cols": 2, "map": "0000"},
+             "usage": [{"layer": 0, "expert": 0, "count": 10}, {"layer": 0, "expert": 1, "count": 10}]},
+            {"node_id": "b", "status": "healthy", "inflight": 0,
+             "emap": {"rows": 2, "cols": 2, "map": "0000"}, "usage": []},
+        ]
+        with mock.patch.object(p, "LAYER_COHERENT", True):
+            sched = p.PlacementScheduler(recompute_sec=1)
+            plan = sched.recompute(nodes, primary_hint="a")
+            self.assertEqual(plan.experts.get("0:0"), plan.experts.get("0:1"))
+            self.assertTrue(plan.layer_coherent)
 
 
 if __name__ == "__main__":
