@@ -218,8 +218,10 @@ class NodeRegistry:
             return [n for n in self._nodes.values() if n.status == "healthy"]
 
     @staticmethod
-    def _load_key(n: NodeRecord) -> tuple[float, float, str]:
-        return (n.inflight + NodeRegistry._slow_penalty(n), -n.last_heartbeat, n.node_id)
+    def _load_key(n: NodeRecord) -> tuple[float, float, float, str]:
+        # Prefer faster hardware when load/penalty ties (avoid UUID lottery).
+        return (n.inflight + NodeRegistry._slow_penalty(n),
+                -NodeRegistry._speed_hint(n), -n.last_heartbeat, n.node_id)
 
     @staticmethod
     def _slow_penalty(n: NodeRecord) -> float:
@@ -292,39 +294,45 @@ class NodeRegistry:
         max_res = max(residents.values()) if residents else 0
         min_res = min(residents.values()) if residents else 0
 
-        # Severe warm-lock: one node never resident while peer holds dozens — prefer the
-        # faster cold node instead of always sending chat to the warm slow primary.
+        # All cold: no resident affinity signal — pick by hardware speed, not UUID.
+        if max_res == 0 and max_hits == 0 and len(nodes) >= 2:
+            return min(nodes, key=self._load_key)
+
+        # Severe warm-lock: warm node is slow, cold node is faster — break affinity so the
+        # fast box can take chat. Never the reverse (do not yank traffic off a warm fast node).
         if max_res >= 32 and min_res == 0 and len(nodes) >= 2:
             cold = [n for n in nodes if residents[n.node_id] == 0]
             warm = [n for n in nodes if residents[n.node_id] > 0]
             if cold and warm:
                 best_cold = max(cold, key=self._speed_hint)
                 best_warm = max(warm, key=lambda n: residents[n.node_id])
-                warm_slow = self._slow_penalty(best_warm)
-                cold_slow = self._slow_penalty(best_cold)
-                if (warm_slow > cold_slow + 1.0
-                        or self._speed_hint(best_cold) > self._speed_hint(best_warm) + 5.0):
+                if self._speed_hint(best_cold) > self._speed_hint(best_warm) + 5.0:
                     return min(cold, key=self._load_key)
 
-        # Bootstrap cold executors: when one node has warmed hot experts and another
-        # has almost none, occasionally route chat there so it can collect usage/ECOST
-        # and pin experts. Fraction is AVIARY_ROUTE_BOOTSTRAP_RATIO (not 100%).
+        # Bootstrap cold executors only when the cold peer is a plausible upgrade (faster /
+        # less penalized). Sending chat to a slower cold box just to warm it is how a
+        # 30s primary becomes a 5-minute one after the first successful turn.
         bootstrap_ratio = self._effective_bootstrap_ratio(max_hits, min_hits, residents)
         if bootstrap_ratio > 0 and max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
             warm = [n for n in nodes if hits[n.node_id] > min_hits + 1]
             cold = [n for n in nodes if hits[n.node_id] <= min_hits + 1]
-            warm_min = min((n.inflight for n in warm), default=0)
-            cold = [n for n in cold if n.inflight <= warm_min + 1]
-            if cold and (not warm or min(n.inflight for n in cold) <= warm_min + 1):
-                if random.random() < bootstrap_ratio:
+            if warm and cold:
+                best_warm = max(warm, key=lambda n: (hits[n.node_id], self._speed_hint(n)))
+                # Keep only cold peers that look faster than the warm leader.
+                cold = [n for n in cold
+                        if self._speed_hint(n) > self._speed_hint(best_warm) + 5.0]
+                warm_min = min((n.inflight for n in warm), default=0)
+                cold = [n for n in cold if n.inflight <= warm_min + 1]
+                if cold and random.random() < bootstrap_ratio:
                     return min(cold, key=self._load_key)
 
-        def score(n: NodeRecord) -> tuple[int, float, float, str]:
+        def score(n: NodeRecord) -> tuple[int, float, float, float, str]:
             hit_score = -hits[n.node_id]
             # Do not let resident affinity permanently override a much faster cold peer.
             if residents[n.node_id] == 0 and max(hits.values()) >= 4:
                 hit_score = max(hit_score, -min(4, max(hits.values()) // 4))
-            return (hit_score, n.inflight + self._slow_penalty(n), -n.last_heartbeat, n.node_id)
+            return (hit_score, n.inflight + self._slow_penalty(n),
+                    -self._speed_hint(n), -n.last_heartbeat, n.node_id)
 
         return min(nodes, key=score)
 

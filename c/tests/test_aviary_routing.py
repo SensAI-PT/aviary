@@ -22,21 +22,56 @@ class PickWithAffinityTest(unittest.TestCase):
     @mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "1.0"})
     @mock.patch("aviary.registry.random.random", return_value=0.0)
     def test_cold_node_bootstrapped_when_peer_is_warmed(self, _rand):
-        """Cold executor receives traffic when bootstrap triggers (ratio=1)."""
+        """Cold executor receives traffic only when it is the faster node."""
         reg = NodeRegistry()
         warm_map = _emap(*([1] * 8))
         cold_map = _emap(*([0] * 8))
-        reg.register("warm", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": warm_map})
-        reg.register("cold", "10.0.0.2", 8001, "m", {"host": "10.0.0.2", "emap": cold_map})
+        # Warm = slow hardware, cold = fast — bootstrap should help the fast box.
+        reg.register("warm", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": warm_map,
+            "hwinfo": {"cores": 8, "ram_avail_gb": 2.0},
+        })
+        reg.register("cold", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": cold_map,
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
         hot = {(0, i) for i in range(8)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "cold")
+
+    @mock.patch.dict(os.environ, {
+        "AVIARY_ROUTE_BOOTSTRAP_RATIO": "1.0",
+        "AVIARY_ROUTE_COLD_MIN_RATIO": "1.0",
+    })
+    @mock.patch("aviary.registry.random.random", return_value=0.0)
+    def test_do_not_bootstrap_onto_slower_cold_peer(self, _rand):
+        """Warm fast primary must keep traffic; do not lottery to a slow cold peer."""
+        reg = NodeRegistry()
+        warm_map = _emap(*([1] * 64))
+        cold_map = _emap(*([0] * 64))
+        reg.register("fast", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": warm_map,
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
+        reg.register("slow", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": cold_map,
+            "hwinfo": {"cores": 8, "ram_avail_gb": 1.0},
+        })
+        hot = {(0, i) for i in range(8)}
+        self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
 
     @mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "0.1"})
     @mock.patch("aviary.registry.random.random")
     def test_bootstrap_is_probabilistic_not_exclusive(self, rand):
         reg = NodeRegistry()
-        reg.register("warm", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": _emap(1, 1, 1, 1)})
-        reg.register("cold", "10.0.0.2", 8001, "m", {"host": "10.0.0.2", "emap": _emap(0, 0, 0, 0)})
+        # Cold must be faster than warm or bootstrap is skipped entirely.
+        reg.register("warm", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": _emap(1, 1, 1, 1),
+            "hwinfo": {"cores": 8, "ram_avail_gb": 2.0},
+        })
+        reg.register("cold", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": _emap(0, 0, 0, 0),
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
         hot = {(0, i) for i in range(4)}
         rand.side_effect = [0.05, 0.5, 0.05, 0.5]
         picks = [reg.pick_with_affinity(hot).node_id for _ in range(4)]
@@ -47,9 +82,18 @@ class PickWithAffinityTest(unittest.TestCase):
     @mock.patch("aviary.registry.random.random", return_value=0.0)
     def test_least_loaded_among_cold_peers(self, _rand):
         reg = NodeRegistry()
-        reg.register("a", "10.0.0.1", 8001, "m", {"host": "10.0.0.1", "emap": _emap(1, 1)})
-        reg.register("b", "10.0.0.2", 8001, "m", {"host": "10.0.0.2", "emap": _emap(0, 0)})
-        reg.register("c", "10.0.0.3", 8001, "m", {"host": "10.0.0.3", "emap": _emap(0, 0)})
+        reg.register("a", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": _emap(1, 1),
+            "hwinfo": {"cores": 4, "ram_avail_gb": 2.0},
+        })
+        reg.register("b", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": _emap(0, 0),
+            "hwinfo": {"cores": 16, "ram_avail_gb": 40.0},
+        })
+        reg.register("c", "10.0.0.3", 8001, "m", {
+            "host": "10.0.0.3", "emap": _emap(0, 0),
+            "hwinfo": {"cores": 32, "ram_avail_gb": 60.0},
+        })
         reg.increment_inflight("b", 3)
         hot = {(0, 0), (0, 1)}
         self.assertEqual(reg.pick_with_affinity(hot).node_id, "c")
@@ -108,6 +152,22 @@ class PickWithAffinityTest(unittest.TestCase):
         hot = {(0, i) for i in range(8)}
         with mock.patch.dict(os.environ, {"AVIARY_ROUTE_BOOTSTRAP_RATIO": "0"}):
             self.assertEqual(reg.pick_with_affinity(hot).node_id, "fast")
+
+    def test_all_cold_prefers_faster_hardware_not_uuid(self):
+        """When nobody has residents, do not fall through to node_id lottery."""
+        reg = NodeRegistry()
+        cold = _emap(*([0] * 8))
+        # Lexicographically smaller UUID is the *slow* node — old code picked it.
+        reg.register("4f9668ff-slow", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2", "emap": cold,
+            "hwinfo": {"cores": 8, "ram_avail_gb": 1.0},
+        })
+        reg.register("5a2a179f-fast", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1", "emap": cold,
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
+        hot = {(0, i) for i in range(8)}
+        self.assertEqual(reg.pick_with_affinity(hot).node_id, "5a2a179f-fast")
 
 
 if __name__ == "__main__":

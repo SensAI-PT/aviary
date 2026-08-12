@@ -193,6 +193,12 @@ request pays that cost (~seconds to minutes), not LAN RTT alone (expert RPC is t
 few ms). Prefer warming the fast node (`--advertise-host` + `--ram`) and check
 `/cluster/jobs` for which executor was primary.
 
+**How both machines are used together:** one chat still has a single **primary** (dense +
+attn + LM head). Peers help only via **per-expert RPC** when placement says they own a hot
+expert. That shows up in the Jobs trace as `remote` / `rpc_in` / `fallback`. It is not
+pipeline-parallel layers. Cold bootstrap will not send chat to a *slower* cold peer just to
+warm it — only to a cold peer that looks faster than the current warm leader.
+
 ## Correctness gate
 
 Remote expert RPC is an **optimization**, not a correctness requirement. For every parallel

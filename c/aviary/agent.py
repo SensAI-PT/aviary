@@ -70,23 +70,29 @@ def _is_loopback_host(host: str | None) -> bool:
 
 def _resolve_cluster_advertise_host(advertise: str | None, bind_host: str,
                                     master_host: str, control_port: int) -> str:
-    """Under AVIARY_CLUSTER, peers must reach expert RPC on a LAN-routable address."""
+    """Peers and master must reach this agent on a LAN-routable address.
+
+    Replaces loopback advertise when binding on all interfaces, even if the
+    operator forgot AVIARY_CLUSTER=1 (otherwise the registry shows 127.0.0.1).
+    """
     cluster = os.environ.get("AVIARY_CLUSTER", "0") not in ("0", "")
-    if not cluster:
-        return advertise or bind_host
-    if advertise and not _is_loopback_host(advertise):
-        return advertise
+    chosen = advertise or (bind_host if bind_host not in ("0.0.0.0", "::") else None)
+    if chosen and not _is_loopback_host(chosen):
+        return chosen
+    # Loopback / unbound: resolve a LAN IP whenever we bind publicly or cluster is on.
+    if not cluster and bind_host not in ("0.0.0.0", "::") and not _is_loopback_host(bind_host):
+        return chosen or bind_host
     peer = master_host if not _is_loopback_host(master_host) else ("8.8.8.8", 53)
     if isinstance(peer, str):
         peer = (peer, control_port)
     resolved = _local_ip_for(peer)
     if _is_loopback_host(resolved):
-        print("[aviary-agent] WARNING: cluster advertise host is loopback; "
-              "pass --advertise-host <LAN-IP> so peers can reach expert RPC",
+        print("[aviary-agent] WARNING: advertise host is loopback; "
+              "pass --advertise-host <LAN-IP> so peers can reach this agent",
               file=sys.stderr)
         return resolved
-    if advertise and _is_loopback_host(advertise):
-        print(f"[aviary-agent] cluster: replacing loopback advertise {advertise!r} "
+    if chosen and _is_loopback_host(chosen):
+        print(f"[aviary-agent] replacing loopback advertise {chosen!r} "
               f"with {resolved!r}", file=sys.stderr)
     return resolved
 
