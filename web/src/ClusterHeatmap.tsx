@@ -232,14 +232,12 @@ function CanvasHeatmap({ mode, node, nodes, placement, rows, cols, nodeIds, comp
     return () => ro.disconnect()
   }, [minHeight])
 
+  // Size by width so cells stay readable; tall grids scroll with the page, not a nested box.
   const cell = useMemo(() => {
     const minCell = large ? 8 : 6
     const maxCell = large ? 22 : 16
-    if (mode === "resident" || mode === "clusterOwner" || mode === "clusterResident") {
-      return Math.max(minCell, Math.min(maxCell, Math.floor(Math.min(wrapSize.w / cols, wrapSize.h / rows))))
-    }
     return Math.max(minCell, Math.min(maxCell, Math.floor(wrapSize.w / cols)))
-  }, [mode, wrapSize, cols, rows, large])
+  }, [large, wrapSize.w, cols])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -346,8 +344,8 @@ function LayerStripHeatmap({ node, minHeight, large, t }: { node: ClusterNode; m
   const { rows, cols, map } = node.emap!
   const cells = decodeEmap(map, rows, cols)
   const cellSize = useMemo(
-    () => Math.max(2, Math.floor(Math.min(wrapSize.w / cols, wrapSize.h / rows))),
-    [wrapSize, cols, rows],
+    () => Math.max(large ? 4 : 2, Math.min(large ? 14 : 10, Math.floor(wrapSize.w / cols))),
+    [wrapSize.w, cols, large],
   )
   const cellGap = cellSize >= 4 ? 1 : 0
 

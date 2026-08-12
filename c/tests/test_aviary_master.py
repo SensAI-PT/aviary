@@ -100,6 +100,40 @@ class MasterHttpRoutingTest(unittest.TestCase):
             http.shutdown()
             agent.shutdown()
 
+    def test_experts_and_profile_from_registry_telemetry(self):
+        """Brain/Profiling tabs hit /experts and /profile on the master — not 404."""
+        registry = NodeRegistry()
+        emap = {"rows": 2, "cols": 2, "map": "4080c0ff"}
+        turn = {
+            "wall_s": 1.0, "expert_wait_s": 0.1, "expert_matmul_s": 0.4,
+            "attention_s": 0.2, "lm_head_s": 0.1, "expert_disk_s": 0.0,
+            "prompt_tokens": 8, "completion_tokens": 4, "forwards": 4,
+        }
+        registry.register(
+            "node-a", "127.0.0.1", 8001, "hy3-colibri",
+            {"host": "127.0.0.1", "emap": emap, "hits": "01", "hits_seq": 7,
+             "profile": [turn]},
+        )
+        http = MasterHTTPServer(("127.0.0.1", 0), registry, PlacementScheduler(), JobTracker())
+        http_port = http.server_address[1]
+        http_thread = threading.Thread(target=http.serve_forever, daemon=True)
+        http_thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{http_port}/experts", timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(body["rows"], 2)
+            self.assertEqual(body["cols"], 2)
+            self.assertEqual(body["map"], "4080c0ff")
+            self.assertEqual(body["seq"], 7)
+            self.assertEqual(body["node_id"], "node-a")
+
+            with urlopen(f"http://127.0.0.1:{http_port}/profile", timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(len(body["turns"]), 1)
+            self.assertEqual(body["turns"][0]["completion_tokens"], 4)
+        finally:
+            http.shutdown()
+
 
 class _FakeStreamingAgentHandler(BaseHTTPRequestHandler):
     """Mimics the engine's real SSE framing: no Content-Length, Connection: close

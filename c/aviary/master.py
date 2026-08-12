@@ -148,6 +148,86 @@ class MasterHTTPHandler(APIHandler):
             conn.close()
             raise RuntimeError(str(error)) from error
 
+    def _proxy_get_bytes(self, path: str):
+        """Proxy a GET to a routed agent; returns (status, headers, body)."""
+        node = self._pick_node()
+        status, resp_headers, resp = self._proxy_raw(node, "GET", path)
+        try:
+            return status, resp_headers, resp.read(), node
+        finally:
+            resp.close()
+
+    def _dashboard_node(self):
+        """Prefer a healthy node that already pushed EMAP/profile via heartbeat."""
+        registry = self.server.registry  # type: ignore[attr-defined]
+        healthy = registry.healthy_nodes()
+        if not healthy:
+            return None
+        with_emap = [n for n in healthy if (n.emap or {}).get("rows") and (n.emap or {}).get("map")]
+        if with_emap:
+            return max(with_emap, key=lambda n: (int(n.hits_seq or 0), len(n.profile or []), -n.inflight))
+        with_prof = [n for n in healthy if n.profile]
+        if with_prof:
+            return max(with_prof, key=lambda n: (len(n.profile or []), -n.inflight))
+        return registry.pick_least_loaded()
+
+    def _serve_experts(self):
+        """Brain tab: EMAP/HITS from heartbeat telemetry, else proxied agent /experts."""
+        node = self._dashboard_node()
+        if node is not None:
+            emap = node.emap or {}
+            if emap.get("rows") and emap.get("map"):
+                self.send_json(200, {
+                    "rows": int(emap["rows"]),
+                    "cols": int(emap.get("cols") or 0),
+                    "map": emap["map"],
+                    "hits": node.hits or "",
+                    "seq": int(node.hits_seq or 0),
+                    "node_id": node.node_id,
+                })
+                return
+        try:
+            status, resp_headers, data, node = self._proxy_get_bytes("/experts")
+            self.send_response(status)
+            for key, value in resp_headers.items():
+                if key.lower() not in ("transfer-encoding", "connection"):
+                    self.send_header(key, value)
+            if node is not None:
+                self.send_header("X-Aviary-Node-Id", node.node_id)
+            self.end_headers()
+            self.wfile.write(data)
+        except RuntimeError:
+            self.send_json(200, {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0})
+
+    def _serve_profile(self):
+        """Profiling tab: prefer live agent /profile; fall back to heartbeat snapshots."""
+        try:
+            status, resp_headers, data, node = self._proxy_get_bytes("/profile")
+            if status == 200:
+                try:
+                    payload = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict) and payload.get("turns"):
+                    self.send_response(status)
+                    for key, value in resp_headers.items():
+                        if key.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(key, value)
+                    if node is not None:
+                        self.send_header("X-Aviary-Node-Id", node.node_id)
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+        except RuntimeError:
+            pass
+        node = self._dashboard_node()
+        turns = list((node.profile if node else None) or [])
+        self.send_json(200, {
+            "seq": len(turns),
+            "turns": turns,
+            **({"node_id": node.node_id} if node else {}),
+        })
+
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/cluster/health":
@@ -189,14 +269,17 @@ class MasterHTTPHandler(APIHandler):
             self.send_json(200, {"status": "ok", "scheduler": snap, "cluster": True,
                                  "placement": self.server.scheduler.snapshot()})  # type: ignore[attr-defined]
             return
+        if path == "/experts":
+            self._serve_experts()
+            return
+        if path == "/profile":
+            self._serve_profile()
+            return
         if self.serve_static(path):
             return
         if path == "/v1/models":
             try:
-                node = self._pick_node()
-                status, resp_headers, resp = self._proxy_raw(node, "GET", "/v1/models")
-                data = resp.read()
-                resp.close()
+                status, resp_headers, data, _node = self._proxy_get_bytes("/v1/models")
                 self.send_response(status)
                 for key, value in resp_headers.items():
                     if key.lower() not in ("transfer-encoding", "connection"):

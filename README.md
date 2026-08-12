@@ -9,24 +9,45 @@
 ```
 
 <p align="center">
-  <strong>Run large MoE language models across a cluster of commodity machines — as fast as possible.</strong>
+  <strong>Apache Spark–like control plane for MoE inference — commodity boxes, full weights on every node, activations over the LAN.</strong>
 </p>
 
 <p align="center">
   <a href="docs/AVIARY.md"><b>Docs</b></a> ·
-  <a href="docs/qwen3_moe.md"><b>Test model</b></a> ·
+  <a href="docs/qwen3_moe.md"><b>Qwen3</b></a> ·
+  <a href="docs/hy3.md"><b>Hy3</b></a> ·
   <a href="docs/cluster_protocol.md"><b>Protocol</b></a> ·
   <a href="docs/COLIBRI_SYNC.md"><b>Upstream sync</b></a>
 </p>
 
-## What is Aviary?
+## Mission
 
-**Aviary is a cluster control plane for sparse MoE inference.**
+**Run large Mixture-of-Experts language models across a cluster of ordinary machines — as fast as possible.**
 
-Wire together the boxes you already have — fast NVMe, ample RAM, optional GPUs — and Aviary
-decides **where each expert lives** and **which node serves each token's work**. Point any
-OpenAI-compatible client (or the built-in dashboard) at one master URL; it routes chat across
-the flock while tracking expert heat, placement, and per-request expert paths.
+Frontier MoEs are huge, but only a thin slice of experts is active per token. Datacenter GPU racks are one answer; another is the hardware many teams already own: several boxes with fast NVMe, plenty of RAM, and maybe a GPU each.
+
+Aviary is the **cluster control plane** for that world. It borrows Apache Spark’s mental model — a **master**, **executors (agents)**, **jobs**, and a placement view — and applies it to sparse MoE inference:
+
+| Spark idea | Aviary |
+|---|---|
+| Master | Registry, chat routing, placement scheduler, Cluster dashboard |
+| Executors | One MoE engine per machine (agent) |
+| Jobs | Each chat / completions request, with expert hop traces |
+| Placement | Which node should own which hot expert |
+
+Point any OpenAI-compatible client (or the built-in dashboard) at one master URL. The flock routes work, tracks expert heat, and decides when a peer’s hot expert beats a local disk load.
+
+### Why full weights on every agent?
+
+Aviary assumes the **same checkpoint lives on every agent’s disk**. During inference the network carries **activations and control**, not model shards.
+
+Shipping base weights over the LAN has repeatedly proven cumbersome in other distributed-inference projects: checkpoint RTT, bandwidth contention, and cold-start pain dominate before you ever win on compute. Aviary’s bet is different:
+
+1. **Copy once** — put the full model on each node’s NVMe (rsync, `hf download`, USB, whatever).
+2. **Infer many times** — keep weights local; RPC only the expert matmuls that are already hot elsewhere.
+3. **Never block on the cluster** — miss / timeout / down peer → local load. Correctness never depends on the network.
+
+**Capacity model:** N nodes ≈ N× concurrent chat throughput, not one virtual GPU with pooled VRAM. Each agent holds a complete replica; the cluster wins on concurrency and on whether **activation + RTT** beats **disk load on one box**.
 
 ```
   Client / Web UI
@@ -46,39 +67,55 @@ the flock while tracking expert heat, placement, and per-request expert paths.
          full model weights on disk at every node — network carries activations, not checkpoints
 ```
 
-| component | role |
-|---|---|
-| **master** | Node registry, chat routing, placement scheduler, Cluster dashboard |
-| **agent** | One MoE engine per machine; reports usage, costs, expert heat |
-| **Cluster UI** | Jobs, executors, placement map, RPC latency — Spark-style observability |
-
 ### Design principles
 
-1. **Full replica on every node** — copy the same checkpoint to each agent's disk. Aviary never
-   ships weights over the network during inference; the LAN carries activations and control only.
-2. **Usage-aware hot-loading** — each agent tracks expert heat (`.coli_usage`, EMAP); experts
-   migrate between disk, RAM, and VRAM based on what routing actually needs.
-3. **Cluster-wide placement** — the master aggregates costs and pushes decisions: which node
-   should own which hot expert, and when remote RPC beats local disk load.
-4. **Cross-node expert RPC** — inside a forward pass, matmuls dispatch to whichever node already
-   has the expert hot; miss or timeout always falls back to local load.
-5. **Correctness never depends on the cluster** — a slow, missing, or disabled peer never
-   blocks inference; the local path always works.
+1. **Full replica on every node** — never ship weights during inference.
+2. **Usage-aware hot-loading** — experts migrate disk → RAM → VRAM from real routing heat (`.coli_usage`, EMAP).
+3. **Cluster-wide placement** — master aggregates costs and assigns ownership; agents may RPC peers.
+4. **Cross-node expert RPC** — matmuls dispatch to whoever already has the expert hot.
+5. **Local fallback always works** — a slow or missing peer never blocks a token.
 
-**Capacity model:** N nodes ≈ N× concurrent chat throughput, not one virtual GPU with pooled
-VRAM. Each agent holds a complete model replica.
+## Cluster UI
 
-### The experiment we're running
+Open the master’s URL and use the **Cluster** tab (Spark-style: Overview, Jobs, Executors, Placement, RPC).
 
-| setup | what happens |
-|---|---|
-| **Baseline** | One node; experts cold-loaded from NVMe per routing decision |
-| **Cluster** | Same weights everywhere; primary agent RPCs experts hot on a peer |
-| **Question** | Is **activation + RTT** across the LAN faster than **disk load on one box**? |
-| **Measure** | tokens/s, p50/p95 latency, expert_wait_s, Cluster RPC histogram, disk I/O |
+<p align="center">
+  <img src="docs/media/aviary_cluster_view.png" width="900" alt="Aviary Cluster — Placement view with per-node expert ownership heatmaps">
+</p>
+<p align="center"><em><strong>Placement</strong> — scheduler ownership across agents (here: Qwen3 MoE on two healthy executors). Heatmaps show which node owns which experts; node cards list assigned / resident counts and layer blocks.</em></p>
 
-[`c/tools/cluster_bench.py`](c/tools/cluster_bench.py) runs repeatable load tests. See
-[`docs/AVIARY.md`](docs/AVIARY.md) for interpretation.
+<p align="center">
+  <img src="docs/media/aviary_job_view.png" width="900" alt="Aviary Cluster — Jobs view with expert path summary and layer hops">
+</p>
+<p align="center"><em><strong>Jobs</strong> — each chat is a job on an executor. Drill in for duration, local / remote / fallback expert counts, and per-layer hop traces (RPC µs included).</em></p>
+
+## Supported models
+
+Aviary runs the same engine families as [Colibri](https://github.com/JustVugg/colibri), plus **Hy3** and **Qwen3 MoE** added in this tree:
+
+| model | params (approx.) | notes |
+|---|---|---|
+| **GLM-5.2** | 744B MoE | Colibri flagship; int4 streaming |
+| **Inkling** | 975B | Colibri |
+| **Kimi K3** | 2.8T | Colibri (`kimi_k3`) |
+| **DeepSeek V4 Flash** | 284B | Colibri |
+| **OLMoE** | 7B | Colibri; small MoE for smoke tests |
+| **Hy3** (Tencent) | 295B / ~21B active | **Aviary+** — [`docs/hy3.md`](docs/hy3.md), [int4 container](https://huggingface.co/UnderstandLing/Hy3-colibri-int4) |
+| **Qwen3 MoE** | 30B / ~3.3B active | **Aviary+** — recommended cluster test model; [`docs/qwen3_moe.md`](docs/qwen3_moe.md), [int4 container](https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4) |
+
+Architecture is auto-detected from `config.json` when you point `COLI_MODEL` at a container directory.
+
+## Environment variables
+
+| variable | where | role |
+|---|---|---|
+| **`COLI_MODEL`** | **every agent** | Absolute path to the model directory (same checkpoint on every node) |
+| **`AVIARY_CLUSTER`** | **every agent** | Set to `1` to enable cross-node expert RPC + placement |
+| **`COLI_API_KEY`** | **master + every agent** | Optional shared bearer secret (same value everywhere) |
+
+Master does **not** load weights — it only needs `COLI_API_KEY` if you enable auth. Agents need `COLI_MODEL` and `AVIARY_CLUSTER=1`.
+
+Full list: [`docs/AVIARY.md`](docs/AVIARY.md) · [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 
 ## Quick start — 1 master + 2 agents
 
@@ -90,57 +127,77 @@ git clone https://github.com/SensAI-PT/aviary.git && cd aviary/c
 ./coli info    # sanity check
 ```
 
-### 2. API key (optional)
+### 2. Shared API key (optional, but recommended)
+
+Set the **same** value on the master machine and on every agent:
 
 ```bash
-export COLI_API_KEY=your-secret   # same value on master and all agents
+export COLI_API_KEY=your-secret
 ```
 
-### 3. Model on every node
+### 3. Model on every agent
 
-Download **[Qwen3-30B-A3B int4](https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4)** to the
-**same path on every machine** (or copy the directory after downloading once):
+Download (or convert) once, then copy the directory to the **same path on each agent**:
 
 ```bash
+# example: Qwen3-30B-A3B int4 (good cluster test size)
 pip install -U "huggingface_hub[cli]"
 hf download UnderstandLing/Qwen3_30B_A3B_i4 --local-dir /path/to/qwen3_i4
 cd c && make qwen3_moe
 ```
 
-DIY convert from the upstream Qwen checkpoint: [`docs/qwen3_moe.md`](docs/qwen3_moe.md).
+Hy3: [`docs/hy3.md`](docs/hy3.md). DIY Qwen3 convert: [`docs/qwen3_moe.md`](docs/qwen3_moe.md).
 
-### 4. Start the cluster
+### 4. Start master, then agents
 
-| component | command | ports |
-|---|---|---|
-| master | `./coli master --host 0.0.0.0 --port 9000` | HTTP `9000`, control `9002` |
-| agent | `AVIARY_CLUSTER=1 COLI_MODEL=… ./coli agent --master URL` | HTTP `8001`, expert RPC `9003` |
+| role | machine | command | ports |
+|---|---|---|---|
+| **Master** | A | `./coli master --host 0.0.0.0 --port 9000` | HTTP `9000`, control `9002` |
+| **Agent 1** | A (or another host) | `AVIARY_CLUSTER=1 COLI_MODEL=… ./coli agent --master http://A:9000 …` | HTTP `8001`, expert RPC `9003` |
+| **Agent 2** | B | same, with `--advertise-host B` if needed | HTTP `8001`, expert RPC `9003` |
 
 ```bash
-# machine A — master
+# ── machine A — MASTER (no COLI_MODEL; optional COLI_API_KEY) ──
+export COLI_API_KEY=your-secret          # optional
 ./coli master --host 0.0.0.0 --port 9000
 
-# machine A — agent 1
+# ── machine A — AGENT 1 ──
+export COLI_API_KEY=your-secret          # same as master if set
 export AVIARY_CLUSTER=1
-COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
+export COLI_MODEL=/path/to/qwen3_i4
+./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001
 
-# machine B — agent 2
+# ── machine B — AGENT 2 ──
+export COLI_API_KEY=your-secret
 export AVIARY_CLUSTER=1
-COLI_MODEL=/path/to/qwen3_i4 ./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
+export COLI_MODEL=/path/to/qwen3_i4      # same weights path as agent 1
+./coli agent --master http://A:9000 --host 0.0.0.0 --port 8001 \
   --advertise-host B
 ```
 
-**WSL2:** if port 9003 is blocked by Windows, add `--expert-port 9013`.
+**WSL2:** if Windows blocks port `9003`, add `--expert-port 9013`.
 
 ### 5. Chat and observe
 
-Open **http://A:9000**. Point the web UI at the **master**, not an individual agent.
+Open **http://A:9000** — point clients at the **master**, not an individual agent.
 
 The **Cluster** tab shows:
-- **Jobs** — which node served each chat + layer/expert hop table per request
+
+- **Jobs** — which executor served each chat + layer/expert hop table
 - **Executors** — per-node heatmaps, profile, owned experts
-- **Placement** — scheduler's expert ownership (~4s refresh)
+- **Placement** — scheduler ownership (~4s refresh)
 - **RPC** — latency matrix between expert ports
+
+### The experiment we're running
+
+| setup | what happens |
+|---|---|
+| **Baseline** | One node; experts cold-loaded from NVMe |
+| **Cluster** | Same weights everywhere; primary agent RPCs experts hot on a peer |
+| **Question** | Is **activation + RTT** across the LAN faster than **disk load on one box**? |
+| **Measure** | tokens/s, p50/p95 latency, expert_wait_s, Cluster RPC histogram, disk I/O |
+
+[`c/tools/cluster_bench.py`](c/tools/cluster_bench.py) runs repeatable load tests. Interpretation: [`docs/AVIARY.md`](docs/AVIARY.md).
 
 ## Status
 
@@ -151,22 +208,6 @@ The **Cluster** tab shows:
 | **3** | Per-request traces, RPC histograms, job timelines | in progress |
 | **4** | Cross-node weight prefetch (`AVIARY_PREFETCH=1`) | done |
 
-Enable cluster mode on agents: `export AVIARY_CLUSTER=1`
-
-Key env vars: [`docs/AVIARY.md`](docs/AVIARY.md) · wire format: [`docs/cluster_protocol.md`](docs/cluster_protocol.md)
-
-## Recommended test model
-
-**[Qwen3-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507)** — 48 layers,
-128 experts, top-8 routing. Large enough for real multi-node placement; small enough to copy to
-several nodes and iterate.
-
-| | |
-|---|---|
-| Total params | ~30.5B |
-| Active per token | ~3.3B |
-| Ready int4 container | [UnderstandLing/Qwen3_30B_A3B_i4](https://huggingface.co/UnderstandLing/Qwen3_30B_A3B_i4) |
-
 ## Documentation
 
 | topic | doc |
@@ -174,6 +215,7 @@ several nodes and iterate.
 | Overview, env vars, benchmarks | [docs/AVIARY.md](docs/AVIARY.md) |
 | Upstream engine sync / drift | [docs/COLIBRI_SYNC.md](docs/COLIBRI_SYNC.md) |
 | Qwen3 convert + oracle | [docs/qwen3_moe.md](docs/qwen3_moe.md) |
+| Hy3 engine | [docs/hy3.md](docs/hy3.md) |
 | Master⇄agent wire format | [docs/cluster_protocol.md](docs/cluster_protocol.md) |
 | OpenAI API + web dashboard | [docs/api.md](docs/api.md) |
 
@@ -186,9 +228,11 @@ c/
 ├── coli             CLI: master, agent, chat, serve
 ├── openai_server.py OpenAI HTTP gateway
 ├── qwen3_moe.c      recommended cluster test engine
+├── hy3.c            Hy3 engine
 └── tools/           cluster_bench.py, sync_drift.sh, sync_port.sh
 web/src/Cluster.tsx  Cluster dashboard tab
 docs/                Aviary docs + engine references
+docs/media/          Cluster UI screenshots
 ```
 
 Check upstream drift anytime:
@@ -199,16 +243,12 @@ Check upstream drift anytime:
 
 ## Why "Aviary"?
 
-A hummingbird is tiny, fast, and runs on almost nothing. An **aviary** is where you keep many
-of them — one engine per node, one roof over the cluster. **Many modest machines cooperating**
-through a shared scheduler, not one giant GPU monolith.
+A hummingbird is tiny, fast, and runs on almost nothing. An **aviary** is where you keep many of them — one engine per node, one roof over the cluster. **Many modest machines cooperating** through a shared scheduler, not one giant GPU monolith.
 
 ## Acknowledgements
 
-Inference engines ship from the [Colibri](https://github.com/JustVugg/colibri) project (sync
-procedure in [`docs/COLIBRI_SYNC.md`](docs/COLIBRI_SYNC.md)). Community discussion:
-[Colibri #911](https://github.com/JustVugg/colibri/issues/911).
+Inference engines ship from the [Colibri](https://github.com/JustVugg/colibri) project (sync procedure in [`docs/COLIBRI_SYNC.md`](docs/COLIBRI_SYNC.md)). Hy3 / Qwen3 engines build on [`ErikTromp/colibri-hy3`](https://github.com/ErikTromp/colibri-hy3). Community discussion: [Colibri #911](https://github.com/JustVugg/colibri/issues/911).
 
 ## License
 
-Apache 2.0. Model weights are subject to each publisher's license.
+Apache 2.0. Model weights are subject to each publisher's source license.

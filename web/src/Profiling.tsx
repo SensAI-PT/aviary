@@ -78,6 +78,7 @@ function TurnColumns({ turns, stacked, height, format, footLabel, footLabelOne }
 export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey: string; connected: boolean }) {
   const { t } = useLocale()
   const [turns, setTurns] = useState<Turn[]>([])
+  const [probeErr, setProbeErr] = useState(false)
 
   useEffect(() => {
     if (!connected) return
@@ -86,8 +87,13 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
       if (document.visibilityState === "hidden") return
       try {
         const result = await getProfile(baseUrl, apiKey)
-        if (!disposed) setTurns(result.turns.map(derive))
-      } catch { /* engine busy or restarting — keep the last snapshot */ }
+        if (!disposed) {
+          setTurns(result.turns.map(derive))
+          setProbeErr(false)
+        }
+      } catch {
+        if (!disposed) setProbeErr(true) /* keep the last snapshot on transient failures */
+      }
     }
     void poll()
     const timer = window.setInterval(() => void poll(), 2000)
@@ -108,7 +114,11 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
       </div>
 
       {!latest ? (
-        <p className="runtime-unavailable">{connected ? t("profile.empty") : t("profile.connectHint")}</p>
+        <p className="runtime-unavailable">
+          {!connected ? t("profile.connectHint")
+            : probeErr ? t("profile.probeError")
+              : t("profile.empty")}
+        </p>
       ) : (
         <>
           <div className="prof-tiles">

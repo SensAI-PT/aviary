@@ -69,7 +69,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .locale-switcher select { background: transparent; border: 1px solid var(--border); border-radius: 4px; color: inherit; font-size: 10px; padding: 2px 4px; cursor: pointer; }
 
 .chat-panel { min-width: 0; height: 100vh; display: grid; grid-template-rows: 72px minmax(0, 1fr) auto; }
-.chat-panel:has(.cluster-spark) { grid-template-rows: 72px minmax(0, 1fr); }
+.chat-panel:has(.cluster-spark),
+.chat-panel:has(.brain-page),
+.chat-panel:has(.prof-page) { grid-template-rows: 72px minmax(0, 1fr); }
 .topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 32px; border-bottom: 1px solid var(--border); }
 .topbar > div:first-child { min-width: 0; display: grid; gap: 3px; }.topbar strong { overflow: hidden; font: 500 14px ui-monospace, SFMono-Regular, monospace; text-overflow: ellipsis; white-space: nowrap; }.eyebrow { color: #718086; font-size: 9px; font-weight: 800; letter-spacing: .16em; }
 .top-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }.top-actions [data-slot=badge] { gap: 5px; }
@@ -131,13 +133,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .view-tabs { display: flex; gap: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 3px; }
 .view-tabs button { display: flex; align-items: center; gap: 6px; padding: 5px 14px; font-size: 12px; font-weight: 600; color: var(--muted-foreground); background: none; border: none; border-radius: 7px; cursor: pointer; }
 .view-tabs button.active { background: var(--primary); color: #08110d; }
-.brain-page { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 18px 22px; overflow: auto; }
+.brain-page { min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 18px 22px; overflow: auto; }
 .brain-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
 .brain-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 11px; color: #839197; align-items: center; }
 .brain-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
 .brain-pulse-hint { color: var(--primary); }
-.brain-canvas-wrap { flex: 1; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 10px; }
-.brain-canvas-wrap canvas { image-rendering: pixelated; max-width: 100%; cursor: crosshair; }
+.brain-canvas-wrap { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 10px; }
+.brain-canvas-wrap canvas { image-rendering: pixelated; cursor: crosshair; align-self: flex-start; flex-shrink: 0; }
 .brain-tip { position: fixed; z-index: 50; background: #0d1214; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: var(--foreground); pointer-events: none; max-width: 280px; box-shadow: 0 8px 24px rgba(0,0,0,.5); display: grid; gap: 4px; }
 .brain-tip-title { display: flex; align-items: center; gap: 5px; font-weight: 700; color: var(--primary); }
 .brain-tip-role { color: #8b9aa3; font-style: italic; line-height: 1.4; border-top: 1px solid var(--border); padding-top: 5px; margin-top: 2px; }
@@ -157,7 +159,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .brain-tip-aff { font-size: 10px; }
 
 /* ---- Profiling page ---- */
-.prof-page { flex: 1; display: flex; flex-direction: column; gap: 16px; padding: 18px 22px; overflow: auto; }
+.prof-page { min-height: 0; display: flex; flex-direction: column; gap: 16px; padding: 18px 22px; overflow: auto; }
 .prof-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
 .prof-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: #a5b0b4; align-items: center; }
 .prof-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
@@ -219,7 +221,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-spark-nav button { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border: none; border-radius: 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .cluster-spark-nav button.active { background: var(--secondary); color: var(--foreground); box-shadow: inset 0 0 0 1px var(--border); }
 .cluster-nav-count { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: rgba(78,214,165,.15); color: var(--primary); font: 700 10px ui-monospace, monospace; line-height: 18px; text-align: center; }
-.cluster-spark-body { flex: 1; overflow: auto; padding: 16px 22px 24px; display: grid; gap: 16px; align-content: start; }
+.cluster-spark-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 22px 24px; display: grid; gap: 16px; align-content: start; }
 .cluster-spark-split { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 320px; overflow: hidden; }
 .cluster-spark-main { overflow: auto; border-right: 1px solid var(--border); }
 .cluster-spark-detail { overflow: auto; padding: 18px; background: rgba(13,18,21,.45); }
@@ -296,14 +298,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-heatmap-body { padding: 12px 14px 16px; }
 .cluster-heatmap-coherence { margin: 0 0 10px; font-size: 11px; color: #8b9aa3; }
 .cluster-heatmap-coherence.warn { color: #e6c07a; }
-.cluster-heatmap-canvas-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: min(65vh, 820px); }
+.cluster-heatmap-canvas-wrap { overflow-x: auto; overflow-y: visible; border: 1px solid var(--border); border-radius: 12px; background: #07090a; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: min(65vh, 820px); }
 .cluster-heatmap-canvas-wrap.large { min-height: min(72vh, 920px); }
 .cluster-heatmap-canvas-wrap canvas { image-rendering: pixelated; cursor: crosshair; align-self: flex-start; flex-shrink: 0; }
 .cluster-heatmap-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 10px; color: #839197; }
 .cluster-heatmap-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 4px; vertical-align: -1px; }
 .cluster-heatmap-tip { position: fixed; z-index: 60; background: #0d1214; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 10px; pointer-events: none; display: grid; gap: 2px; }
-.cluster-layer-strips { overflow: auto; display: grid; gap: 8px; padding: 6px 0; max-height: min(75vh, 960px); }
-.cluster-layer-strips.large { gap: 10px; max-height: min(80vh, 1000px); }
+.cluster-layer-strips { overflow-x: auto; overflow-y: visible; display: grid; gap: 8px; padding: 6px 0; }
+.cluster-layer-strips.large { gap: 10px; }
 .cluster-layer-strip .cluster-layer-cell { cursor: crosshair; }
 .cluster-expert-tip { z-index: 110; }
 .cluster-layer-strip { display: grid; grid-template-columns: 52px 1fr auto; gap: 12px; align-items: center; }
@@ -311,10 +313,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .cluster-layer-strip-cells { display: grid; gap: 1px; }
 .cluster-layer-cell { border-radius: 2px; border: 1px solid rgba(255,255,255,.04); }
 .cluster-layer-strip-meta { font-size: 9px; color: var(--muted-foreground); white-space: nowrap; }
-.cluster-layer-dominance-grid { overflow: auto; display: grid; gap: 4px; }
+.cluster-layer-dominance-grid { overflow-x: auto; overflow-y: visible; display: grid; gap: 4px; }
 .cluster-layer-dominance-row { display: grid; grid-template-columns: 44px 1fr 72px; gap: 8px; align-items: center; }
 .cluster-layer-dominance-bar { display: flex; height: 18px; border-radius: 4px; overflow: hidden; background: #1a2228; }
-.cluster-heatmap-panel { grid-column: 1 / -1; }
+.cluster-heatmap-panel { grid-column: 1 / -1; overflow: visible; }
 .cluster-heatmap-panel .cluster-heatmap-canvas-wrap { min-height: min(72vh, 920px); }
 .cluster-heatmap-launch {
   width: 100%;
@@ -388,7 +390,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   padding: 12px 20px 20px;
 }
 .cluster-heatmap-modal .cluster-heatmap-canvas-wrap { min-height: min(68vh, 760px); }
-.cluster-heatmap-modal .cluster-layer-strips { max-height: min(72vh, 820px); }
 .cluster-heatmap-modal .cluster-brain-large .brain-canvas-wrap { min-height: min(68vh, 760px); }
 .cluster-layer-dominance-bar span { min-width: 2px; }
 .cluster-layer-dominance-meta { font-size: 9px; color: var(--muted-foreground); text-align: right; }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { BrainCircuit, Flame, Layers } from "lucide-react"
 
-import { endpoint } from "@/lib/api"
+import { serverEndpoint } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
@@ -65,13 +65,16 @@ export function Brain({ baseUrl, apiKey, connected, staticData }: {
     }
     if (!connected) return
     let disposed = false
-    const base = baseUrl.replace(/\/v1\/?$/, "")
     const poll = async () => {
       try {
-        const res = await fetch(endpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+        const res = await fetch(serverEndpoint(baseUrl, "experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
         if (!res.ok) throw new Error(`/experts ${res.status}`)
         const next = (await res.json()) as ExpertMap
-        if (disposed || !next.rows) return
+        if (disposed) return
+        if (!next.rows || !next.cols || !next.map) {
+          setProbeErr(false)
+          return
+        }
         setData(next)
         setProbeErr(false)
         if (next.seq !== lastSeq.current && next.hits) {
@@ -84,7 +87,7 @@ export function Brain({ baseUrl, apiKey, connected, staticData }: {
             if (byte & (1 << (i & 7))) p[i] = 1
           }
         }
-      } catch { if (!disposed) setProbeErr(true) /* surface repeated failures; keep the last frame */ }
+      } catch { if (!disposed) setProbeErr(true) /* keep the last frame on transient failures */ }
     }
     void poll()
     const t = window.setInterval(() => void poll(), 1500)
@@ -164,8 +167,15 @@ export function Brain({ baseUrl, apiKey, connected, staticData }: {
         </div>
       </div>
       <div className="brain-canvas-wrap" ref={wrapRef}>
-        <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
-        {!connected && <p className="runtime-unavailable">{t("brain.connectHint")}</p>}
+        {data ? (
+          <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
+        ) : (
+          <p className="runtime-unavailable">
+            {!connected ? t("brain.connectHint")
+              : probeErr ? t("brain.probeError")
+                : t("brain.empty")}
+          </p>
+        )}
       </div>
       {tip && data && (() => {
         const isMtp = tip.row === data.rows - 1
