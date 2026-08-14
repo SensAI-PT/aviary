@@ -32,6 +32,7 @@ export function ClusterBenchPanel({
   const [busy, setBusy] = useState(false)
   const [wipeUsage, setWipeUsage] = useState(true)
   const [localOnly, setLocalOnly] = useState(false)
+  const [dropCachesNote, setDropCachesNote] = useState(false)
   const [requests, setRequests] = useState(8)
   const [workers, setWorkers] = useState(4)
   const [maxTokens, setMaxTokens] = useState(32)
@@ -71,6 +72,7 @@ export function ClusterBenchPanel({
         preset,
         wipe_usage: wipeOverride ?? (preset === "suite" ? undefined : wipeUsage),
         local_only: localOnly,
+        drop_caches_note: dropCachesNote,
         requests,
         workers,
         max_tokens: maxTokens,
@@ -124,6 +126,10 @@ export function ClusterBenchPanel({
             <input type="checkbox" checked={localOnly} onChange={(e) => setLocalOnly(e.target.checked)} disabled={running} />
             {t("cluster.bench.localOnly")}
           </label>
+          <label className="cluster-bench-toggle">
+            <input type="checkbox" checked={dropCachesNote} onChange={(e) => setDropCachesNote(e.target.checked)} disabled={running} />
+            {t("cluster.bench.dropCaches")}
+          </label>
           <label>
             {t("cluster.bench.requests")}
             <input type="number" min={1} max={64} value={requests} onChange={(e) => setRequests(Number(e.target.value))} disabled={running} />
@@ -139,6 +145,7 @@ export function ClusterBenchPanel({
         </div>
 
         <p className="cluster-bench-note">{t("cluster.bench.usageNote")}</p>
+        <p className="cluster-bench-note">{t("cluster.bench.dropCachesNote")}</p>
 
         {(running || bench?.progress?.last_error) && (
           <div className={cn("cluster-bench-progress", running && "live")}>

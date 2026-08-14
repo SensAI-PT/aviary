@@ -203,6 +203,7 @@ export interface ClusterBenchResult {
     preset: string
     wipe_usage?: boolean
     local_only: boolean
+    drop_caches_note?: boolean
     requests: number
     workers: number
     max_tokens: number
@@ -232,6 +233,7 @@ export type ClusterBenchStartRequest = {
   preset: "cold_sequential" | "warm_sequential" | "concurrent" | "suite"
   wipe_usage?: boolean
   local_only?: boolean
+  drop_caches_note?: boolean
   requests?: number
   workers?: number
   max_tokens?: number

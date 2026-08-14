@@ -45,7 +45,22 @@ def percentile(sorted_vals: list[float], pct: float) -> float | None:
     return sorted_vals[idx]
 
 
+def hop_kind(has_peer: bool, rpc_ok: bool = False) -> str:
+    """One TRACE kind per expert. Fallback is not a cache miss.
+
+    - no peer in placement: ``local`` (do not attempt RPC)
+    - peer and RPC succeeds: ``remote``
+    - peer and RPC fails: ``fallback`` (local exec emits no second event)
+    """
+    return "local" if not has_peer else ("remote" if rpc_ok else "fallback")
+
+
 def hop_mix(traces: list[dict[str, Any]]) -> dict[str, float]:
+    """Percent of TRACE events by kind (local / remote / fallback).
+
+    Kinds follow ``hop_kind``: fallback is an assigned-peer RPC miss, not
+    "cluster mode on with no donor." Solo/fat with empty placement is 100% local.
+    """
     counts: dict[str, int] = {"local": 0, "remote": 0, "fallback": 0}
     for job in traces:
         for ev in job.get("trace") or []:
@@ -143,10 +158,15 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines += [
         f"- Preset: **{meta.get('preset', '?')}**",
         f"- Requests: {meta.get('requests', '?')} · workers: {meta.get('workers', '?')} · max_tokens: {meta.get('max_tokens', '?')}",
-        f"- Wipe usage: {meta.get('wipe_usage')} · local-only: {meta.get('local_only')}",
+        f"- Wipe usage: {meta.get('wipe_usage')} · local-only: {meta.get('local_only')} · drop_caches claimed: {meta.get('drop_caches_note', False)}",
         f"- Finished: {result.get('finished_at', '')}",
         "",
     ]
+    if meta.get("drop_caches_note"):
+        lines += [
+            "- Operator claimed Linux `drop_caches` between cold steps (master does not drop caches remotely).",
+            "",
+        ]
     cluster = result.get("cluster") or {}
     cohort = cluster.get("cohort") or {}
     if cohort.get("model_id") or cohort.get("arch"):
@@ -248,6 +268,7 @@ class BenchConfig:
     preset: str = "cold_sequential"
     wipe_usage: bool | None = None
     local_only: bool = False
+    drop_caches_note: bool = False
     requests: int = 8
     workers: int = 4
     max_tokens: int = 32
@@ -508,6 +529,7 @@ class BenchRunner:
                     "preset": cfg.preset,
                     "wipe_usage": cfg.wipe_usage,
                     "local_only": cfg.local_only,
+                    "drop_caches_note": cfg.drop_caches_note,
                     "requests": cfg.requests,
                     "workers": cfg.workers,
                     "max_tokens": cfg.max_tokens,

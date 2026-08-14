@@ -1514,7 +1514,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         /* Drain PIPE waits before RPC/Metal/CPU so every slot is finalized. */
         for(int j=0;j<nb;j++)
             if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
-        /* Per-expert completion: RPC remotes first, then Metal-batch locals, then CPU. */
+        /* Per-expert completion: RPC only if cluster_has_peer, then Metal-batch locals, then CPU.
+         * One TRACE: remote | fallback (peer miss) | local (no peer). */
         unsigned char done[64], traced[64]; memset(done,0,(size_t)nb); memset(traced,0,(size_t)nb);
         cluster_init();
         if(g_cluster_enabled){
@@ -1523,6 +1524,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                     if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
                 if(!nr){ done[j]=1; continue; }
+                if(!cluster_has_peer(layer,eid)) continue; /* no donor: local emit later */
                 int remote_ok=1;
                 for(int r=0;r<nr && remote_ok;r++){
                     float rpc_out[D];

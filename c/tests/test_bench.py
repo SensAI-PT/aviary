@@ -9,6 +9,7 @@ from aviary.bench import (
     build_scoreboard,
     compute_epa,
     donor_primary_warnings,
+    hop_kind,
     hop_mix,
     render_markdown,
     summarize_latencies,
@@ -22,6 +23,13 @@ class TestBenchMath(unittest.TestCase):
     def test_epa_missing_inputs(self):
         self.assertIsNone(compute_epa(None, 20.0))
         self.assertIsNone(compute_epa(40.0, 0.0))
+
+    def test_hop_kind_contract(self):
+        """No peer is local; fallback is only an assigned-peer RPC miss."""
+        self.assertEqual(hop_kind(False), "local")
+        self.assertEqual(hop_kind(False, rpc_ok=True), "local")
+        self.assertEqual(hop_kind(True, rpc_ok=True), "remote")
+        self.assertEqual(hop_kind(True, rpc_ok=False), "fallback")
 
     def test_hop_mix_percentages(self):
         jobs = [
@@ -66,6 +74,19 @@ class TestBenchMath(unittest.TestCase):
         self.assertIn("| epa | 1.0 |", md)
         self.assertIn("cold_sequential", md)
         self.assertIn("p50=30.0s", md)
+        self.assertIn("drop_caches claimed: False", md)
+
+    def test_markdown_records_drop_caches_claim(self):
+        result = {
+            "finished_at": "2026-08-14T16:00:00Z",
+            "meta": {"preset": "cold_sequential", "wipe_usage": True, "local_only": False,
+                     "drop_caches_note": True, "requests": 8, "workers": 1, "max_tokens": 32},
+            "scoreboard": {},
+            "steps": [],
+        }
+        md = render_markdown(result)
+        self.assertIn("drop_caches claimed: True", md)
+        self.assertIn("master does not drop caches remotely", md)
 
     def test_donor_primary_warning(self):
         nodes = [{"node_id": "mac-donor", "coordinator_eligible": False, "donor_only_reason": "missing_tiers"}]

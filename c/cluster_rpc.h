@@ -2,7 +2,8 @@
 #define COLIBRI_CLUSTER_RPC_H
 /* Cross-node expert RPC for Aviary Phase 2. See docs/cluster_protocol.md.
  *
- * When AVIARY_CLUSTER=1, moe() may call cluster_try_remote() before local load.
+ * When AVIARY_CLUSTER=1, moe() calls cluster_has_peer() then cluster_rpc_expert()
+ * only if a donor is assigned. No peer → local TRACE, no RPC.
  * Placement table: JSON at AVIARY_PLACEMENT (written by aviary-agent).
  *
  * Peer table shape:
@@ -216,6 +217,17 @@ static int cluster_lookup(int layer, int eid, char *host_out, int host_sz, int *
     memcpy(host_out, addr, hlen); host_out[hlen] = 0;
     *port_out = atoi(colon+1);
     return 1;
+}
+
+/* Hop kind contract — one TRACE event per expert (see hop_kind() in aviary/bench.py):
+ *   cluster_has_peer==0  -> do not RPC; emit "local" after local exec
+ *   peer + RPC success   -> "remote" (emitted in cluster_rpc_expert)
+ *   peer + RPC failure   -> "fallback" once; local exec emits nothing
+ * Do not treat fallback% as a cache miss: it is only "assigned peer missed".
+ */
+static int cluster_has_peer(int layer, int eid){
+    char host[128]; int port = 0;
+    return cluster_lookup(layer, eid, host, sizeof(host), &port);
 }
 
 static cluster_sock_t cluster_connect(const char *host, int port){

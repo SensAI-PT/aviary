@@ -324,6 +324,7 @@ class MasterHTTPHandler(APIHandler):
                     preset=str(payload.get("preset") or "cold_sequential"),
                     wipe_usage=payload.get("wipe_usage") if "wipe_usage" in payload else None,
                     local_only=bool(payload.get("local_only", False)),
+                    drop_caches_note=bool(payload.get("drop_caches_note", False)),
                     requests=max(1, int(payload.get("requests") or 8)),
                     workers=max(1, int(payload.get("workers") or 4)),
                     max_tokens=max(1, int(payload.get("max_tokens") or 32)),

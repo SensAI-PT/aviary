@@ -175,8 +175,10 @@ If not, you still gain **N× concurrent chat capacity** from N full replicas.
 | **RPC** | PING latency between expert ports | No — infrastructure health |
 | **Executors → profile** | Recent turn `wall_s`, `expert_wait_s` per node | Per-node, not job-linked |
 
-**Job trace kinds:** `local` (disk/RAM/VRAM on primary), `remote` (RPC to peer), `fallback`
-(remote miss → local load), `rpc_in` (peer served an inbound expert).
+**Job trace kinds** (one event per expert): `local` (no peer in placement — disk/RAM/VRAM
+on the primary; do not attempt RPC), `remote` (RPC to an assigned peer succeeded),
+`fallback` (assigned peer missed or timed out, then local exec — **not** a cache miss),
+`rpc_in` (this node served an inbound expert). Solo/fat with empty placement is 100% `local`.
 
 ### What the heatmap is (and is not)
 
@@ -319,7 +321,7 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 
 - Cluster config table: `--ram` / `--vram` **flags**, occupied `TIERS`, `coordinator_eligible`
 - p50 / p95 wall seconds (cold vs warm vs concurrent step)
-- Primary `node_id` mix vs donor hop mix (do not treat fallback% as a cache miss)
+- Primary `node_id` mix vs donor hop mix (`fallback` is an assigned-peer RPC miss, not a cache miss; no-peer work is `local`)
 - Warning if a `donor_only` node served chat as primary
 - Planned blocks + `node_tier_prefs` after the run
 - **EPA** = `p50_cold / p50_warm - 1` (warm vs cold on the same cluster)
@@ -329,13 +331,23 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 
 - **Wipe usage** — default on for Cold / Suite cold step; sends `RESET_USAGE` to agents and clears master scheduler usage. Engine in-memory heat is *not* cleared (restart agents for a fully cold engine).
 - **Local-only** — pushes placement with empty `experts` so the primary runs every expert locally (SSD→RAM story without stopping peers).
+- **Caches dropped (operator claim)** — records whether the operator ran Linux `drop_caches` before the run. The master **never** drops caches remotely. `--ram 2` is pin-store starve, not disk starve: a 64 GB host will still serve the ~18 GB checkpoint from page cache.
+
+**True starve (Linux only, optional)**
+
+`--ram 2` vs `--ram 50` changes the pin store, not “the model does not fit.” Wiping `.coli_usage` is not cold. To prove donor RPC vs Linux disk:
+
+1. On the **Linux agent** (root): `echo 3 > /proc/sys/vm/drop_caches` **between cold steps**, or use a model that does not fit in page cache.
+2. Check **Caches dropped** on the Bench tab so the claim is stored in `meta.drop_caches_note`.
+3. Success gate for starved+Mac after a real drop: Linux **100% primary**, **remote hops > 0** if Mac RAM exec + rpc < Linux disk load, p50 **not** 8 s, no donor-as-primary warning.
+4. If Mac RAM+rpc is still worse than Linux SSD after `drop_caches`, that is a valid measured no-op — write it down, do not force donation.
 
 Paste `docs/bench/latest.md` into a dated experiment note after a run — not a single “cluster EPA” README cell.
 
 Measured Qwen3-MoE matrix (solo fat / GPU / starved, fat+Mac, starved+Mac, Mac alone), before and after coordinator+donor routing:
 [`experiments/qwen3-moe-aviary-bench-2026-08-14.md`](experiments/qwen3-moe-aviary-bench-2026-08-14.md).
 
-On that hardware, after the fix: Linux fat RAM **0.32 s** warm / **3.0 RPS@4**; fat+Mac matches it with the Mac **donor-only and unused**; starved+Mac warm **0.43 s** (was **8.0 s** when the Mac was primary); Mac alone **1.39 s** (~4× slower — why it must not coordinate); `--vram 14` occupied **0.3 GB** and added a **+43%** wall tax. `.coli_usage` wipe is not a cold page cache.
+On that hardware (wave 2, 14:08Z): Linux fat RAM **0.33 s** / **3.0 RPS@4**; fat+Mac and starved+Mac match solo Linux with the Mac **`slow_hw` donor-only, 0% primary, 0% remote**; Mac alone **1.41 s** (~4×). `--vram 14` now occupies **10.9 GB** (`clamp=safe_free`) and is still **+59%** slower than RAM; placement then sets `vram_slow`. `.coli_usage` wipe is not a cold page cache.
 
 | variable | default | meaning |
 |---|---|---|
