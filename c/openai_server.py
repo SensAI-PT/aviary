@@ -2170,6 +2170,7 @@ class Engine:
         self.kv_slots = kv_slots
         self.serialize_lock = threading.Lock()
         self.tiers = None
+        self.gpu_tier = None
         self.hwinfo = None
         self.emap = None
         self.hits = None
@@ -2288,6 +2289,13 @@ class Engine:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "GPU_TIER" and len(fields) >= 5:
+                    self.gpu_tier = {
+                        "requested_gb": float(fields[1]),
+                        "occupied_gb": float(fields[2]),
+                        "safe_gb": float(fields[3]),
+                        "clamp": fields[4],
+                    }
                 elif kind == "ECOST" and len(fields) >= 2:
                     n = int(fields[1])
                     samples = []

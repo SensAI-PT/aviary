@@ -43,6 +43,7 @@ class NodeRecord:
     usage: list[dict[str, Any]] = field(default_factory=list)
     costs: list[dict[str, Any]] = field(default_factory=list)
     profile: list[dict[str, Any]] = field(default_factory=list)
+    gpu_tier: dict[str, Any] | None = None
     expert_port: int = int(os.environ.get("AVIARY_EXPERT_PORT", "9003"))
     control_conn: Any = None
     control_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -74,6 +75,7 @@ class NodeRecord:
             "vram_config_gb": tc.get("vram_gb"),
             "ram_occ_gb": t.get("ram_gb"),
             "vram_occ_gb": t.get("vram_gb"),
+            "gpu_tier": self.gpu_tier,
             "coordinator_eligible": eligible,
             "donor_only_reason": reason,
             "emap": self.emap,
@@ -152,6 +154,7 @@ class NodeRegistry:
                 usage=list(payload.get("usage") or []),
                 costs=list(payload.get("costs") or []),
                 profile=list(payload.get("profile") or []),
+                gpu_tier=dict(payload["gpu_tier"]) if payload.get("gpu_tier") else None,
                 expert_port=int(payload.get("expert_port") or os.environ.get("AVIARY_EXPERT_PORT", "9003")),
                 control_conn=control_conn,
             )
@@ -174,7 +177,7 @@ class NodeRegistry:
             record.last_heartbeat = time.time()
             record.missed_heartbeats = 0
             record.status = "healthy"
-            for key in ("hwinfo", "tiers", "emap", "tiers_config"):
+            for key in ("hwinfo", "tiers", "emap", "tiers_config", "gpu_tier"):
                 if payload.get(key):
                     value = payload[key]
                     if key == "tiers":
@@ -288,10 +291,15 @@ class NodeRegistry:
         healthy = nodes if nodes is not None else self.healthy_nodes()
         execs = {n.node_id: self._median_ram_exec_us(n) for n in healthy}
         leader_exec = min((v for v in execs.values() if v), default=None)
+        hw = {n.node_id: self._speed_hint(n) for n in healthy if (n.hwinfo or {}).get("cores")}
+        leader_hw = max(hw.values(), default=0.0)
         roles: dict[str, tuple[bool, str]] = {}
         for n in healthy:
             if not self._has_tier_signal(n) and not (n.costs or []):
                 roles[n.node_id] = (False, "missing_tiers")
+                continue
+            if leader_hw and n.node_id in hw and hw[n.node_id] * COORD_SLOW_RATIO < leader_hw:
+                roles[n.node_id] = (False, "slow_hw")
                 continue
             exec_us = execs.get(n.node_id)
             if leader_exec and exec_us and exec_us > leader_exec * COORD_SLOW_RATIO:

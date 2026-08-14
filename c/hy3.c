@@ -2153,6 +2153,98 @@ static void pin_wire(Model *m){
     if(wired>0) fprintf(stderr,"[PIN] mlock: %.1f GB wired%s in %.0fs\n",
         wired/1e9, failed?" (some failed; try ulimit -l unlimited)":"", now_s()-t0);
 }
+#ifdef COLI_CUDA
+static char g_cuda_clamp[32]="none";
+static double g_cuda_safe_gb;
+
+static int cuda_upload_slot(ESlot *s, double *remaining, double *placed_b, int *placed_n){
+    if(s->g.cuda_eligible && s->g.cuda) return 1;
+    int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+    int tried[COLI_CUDA_MAX_DEVICES]={0};
+    for(int attempt=0;attempt<g_cuda_ndev;attempt++){
+        int best=-1;
+        for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
+            (best<0||placed_b[i]<placed_b[best])) best=i;
+        if(best<0) break;
+        tried[best]=1;
+        s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+        if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                          +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                          +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+            remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
+            return 1;
+        }
+        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+        remaining[best]=0;
+        snprintf(g_cuda_clamp,sizeof(g_cuda_clamp),"upload_fail");
+    }
+    return 0;
+}
+
+static void cuda_fill_pinned(Model *m){
+    if(!g_cuda_enabled || g_cuda_expert_gb<=0) return;
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
+    int placed_n[COLI_CUDA_MAX_DEVICES]={0};
+    double budget=g_cuda_expert_gb*1e9, safe_total=0, reserve=5.12e8;
+    int skipped_cap=0;
+    for(int i=0;i<g_cuda_ndev;i++){
+        size_t free_b=0,total_b=0;
+        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-reserve;
+            if(remaining[i]<0) remaining[i]=0;
+            safe_total+=remaining[i];
+        }
+    }
+    g_cuda_safe_gb=safe_total/1e9;
+    if(budget>safe_total){
+        fprintf(stderr,COLI_ACCEL_TAG " VRAM budget clamped: requested %.1f GB, safe free %.1f GB\n",
+            g_cuda_expert_gb,safe_total/1e9);
+        snprintf(g_cuda_clamp,sizeof(g_cuda_clamp),"safe_free");
+        budget=safe_total;
+    } else if(strcmp(g_cuda_clamp,"upload_fail")!=0)
+        snprintf(g_cuda_clamp,sizeof(g_cuda_clamp),"none");
+    Cfg *c=&m->c;
+    for(int li=0;li<c->n_layers && m->gpu_expert_bytes<budget;li++){
+        if(cluster_layer_max_tier(li)<2){ skipped_cap++; continue; }
+        for(int z=0;z<(m->npin?m->npin[li]:0) && m->gpu_expert_bytes<budget;z++){
+            ESlot *s=&m->pin[li][z];
+            if(s->g.cuda_eligible && s->g.cuda) continue;
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(m->gpu_expert_bytes+need>budget) continue;
+            if(cuda_upload_slot(s,remaining,placed_b,placed_n)){
+                m->gpu_expert_count++;
+                m->gpu_expert_bytes+=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                    +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                    +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+            }
+        }
+        for(int z=0;z<(m->ecn?m->ecn[li]:0) && m->gpu_expert_bytes<budget;z++){
+            ESlot *s=&m->ecache[li][z];
+            if(s->g.cuda_eligible && s->g.cuda) continue;
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(m->gpu_expert_bytes+need>budget) continue;
+            if(cuda_upload_slot(s,remaining,placed_b,placed_n)){
+                m->gpu_expert_count++;
+                m->gpu_expert_bytes+=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                    +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                    +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+            }
+        }
+    }
+    if(skipped_cap && m->gpu_expert_count==0)
+        snprintf(g_cuda_clamp,sizeof(g_cuda_clamp),"aviary_cap");
+    int npin=0; for(int i=0;i<c->n_layers;i++) npin+=m->npin?m->npin[i]:0;
+    fprintf(stderr,COLI_ACCEL_TAG " hot expert tier: %d/%d experts, VRAM %.2f GB (requested %.1f GB, safe %.1f GB, clamp %s)\n",
+        m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb,g_cuda_safe_gb,g_cuda_clamp);
+    for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,COLI_ACCEL_TAG "   device %d: %d experts, %.2f GB\n",
+        g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+    printf("GPU_TIER %.2f %.2f %.2f %s\n", g_cuda_expert_gb, m->gpu_expert_bytes/1e9, g_cuda_safe_gb, g_cuda_clamp);
+    fflush(stdout);
+}
+#endif
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     typedef struct { int l,e; uint32_t c; } Rec;
@@ -2188,64 +2280,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     fprintf(stderr,"[PIN] hot store: %d experts in RAM (%.1f GB) loaded in %.0fs from %s\n",
         npin,npin*eb/1e9,now_s()-t0,statspath);
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && g_cuda_expert_gb>0){
-        double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
-        int placed_n[COLI_CUDA_MAX_DEVICES]={0};
-        double budget=g_cuda_expert_gb*1e9, safe_total=0;
-        for(int i=0;i<g_cuda_ndev;i++){
-            size_t free_b=0,total_b=0;
-            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-                if(remaining[i]<0) remaining[i]=0;
-                safe_total+=remaining[i];
-            }
-        }
-        if(budget>safe_total){
-            fprintf(stderr,COLI_ACCEL_TAG " VRAM budget clamped: requested %.1f GB, safe free %.1f GB\n",
-                g_cuda_expert_gb,safe_total/1e9);
-            budget=safe_total;
-        }
-        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
-            int li=r[a].l;
-            if(cluster_layer_max_tier(li) < 2){
-                if(a==0) fprintf(stderr,COLI_ACCEL_TAG " layer %d max_tier=%d — GPU upload skipped (Aviary cap)\n",
-                    li,cluster_layer_max_tier(li));
-                continue;
-            }
-            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
-                ESlot *s=&m->pin[li][z];
-                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
-                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
-                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
-                    int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
-                    if(best<0) break;
-                    tried[best]=1;
-                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
-                        placed=1;
-                    } else {
-                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                        remaining[best]=0;
-                    }
-                }
-                break;
-            }
-        }
-        fprintf(stderr,COLI_ACCEL_TAG " hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,COLI_ACCEL_TAG "   device %d: %d experts, %.2f GB\n",
-            g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
-    }
+    cuda_fill_pinned(m);
 #endif
     pin_wire(m);
     free(r); free(cnt_l);
@@ -2723,6 +2758,10 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx, 
         if(sscanf(line,"CLUSTER_RELOAD %63s",req_id)==1){
             free(line);
             cluster_reload();
+#ifdef COLI_CUDA
+            cuda_fill_pinned(m);
+            tiers_emit(m);
+#endif
             printf("CLUSTER_OK %s\n",req_id);
             fflush(stdout); return 0;
         }

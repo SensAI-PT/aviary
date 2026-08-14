@@ -317,10 +317,10 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 
 **Scoreboard (suite)**
 
-- Cluster config table (per-node `--ram` / `--vram` budgets, host, hardware) captured at run time
+- Cluster config table: `--ram` / `--vram` **flags**, occupied `TIERS`, `coordinator_eligible`
 - p50 / p95 wall seconds (cold vs warm vs concurrent step)
-- Primary `node_id` mix from job routing
-- `% local / remote / fallback` from per-request expert traces
+- Primary `node_id` mix vs donor hop mix (do not treat fallback% as a cache miss)
+- Warning if a `donor_only` node served chat as primary
 - Planned blocks + `node_tier_prefs` after the run
 - **EPA** = `p50_cold / p50_warm - 1` (warm vs cold on the same cluster)
 - **RPS@W** from the concurrent step
@@ -330,10 +330,12 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 - **Wipe usage** — default on for Cold / Suite cold step; sends `RESET_USAGE` to agents and clears master scheduler usage. Engine in-memory heat is *not* cleared (restart agents for a fully cold engine).
 - **Local-only** — pushes placement with empty `experts` so the primary runs every expert locally (SSD→RAM story without stopping peers).
 
-Paste `docs/bench/latest.md` into the README benchmark table after a run.
+Paste `docs/bench/latest.md` into a dated experiment note after a run — not a single “cluster EPA” README cell.
 
-Measured Qwen3-MoE matrix (solo fat / GPU / starved, cluster + Mac):
+Measured Qwen3-MoE matrix (solo fat / GPU / starved, fat+Mac, starved+Mac, Mac alone), before and after coordinator+donor routing:
 [`experiments/qwen3-moe-aviary-bench-2026-08-14.md`](experiments/qwen3-moe-aviary-bench-2026-08-14.md).
+
+On that hardware, after the fix: Linux fat RAM **0.32 s** warm / **3.0 RPS@4**; fat+Mac matches it with the Mac **donor-only and unused**; starved+Mac warm **0.43 s** (was **8.0 s** when the Mac was primary); Mac alone **1.39 s** (~4× slower — why it must not coordinate); `--vram 14` occupied **0.3 GB** and added a **+43%** wall tax. `.coli_usage` wipe is not a cold page cache.
 
 | variable | default | meaning |
 |---|---|---|

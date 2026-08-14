@@ -1,99 +1,121 @@
 # Qwen3-MoE Aviary bench — 2026-08-14
 
 **Model:** `qwen3-moe-colibri` (engine `qwen3_moe`)
-**Harness:** Cluster Bench tab / `POST /cluster/bench` — 8 requests, 32 max tokens, fixed prompt
+**Harness:** Cluster Bench suite — 8 requests × 32 tokens, fixed prompt, cold → warm → concurrent (W=4)
 **EPA:** `p50_cold / p50_warm - 1` (positive = warm faster than cold)
-**Nodes:** Linux box `192.168.1.120` (`5a2a179f`, 61.7 GB host RAM, NVMe) and Mac `192.168.1.131` (`4f9668ff`, 17.2 GB host RAM). RAM/VRAM columns are Colibri **tier budgets** after dense weights, not the `--ram` CLI flag.
+**Nodes:** Linux `192.168.1.120` (`5a2a179f`, 61.7 GB host RAM, NVMe, optional CUDA) and Mac `192.168.1.131` (`4f9668ff`, 17.2 GB host RAM, no Metal)
 
-Raw exports (gitignored): `docs/bench/<utc>-<preset>.{md,json}`.
+Two matrices on the same hardware:
 
-## Matrix
+| wave | when | raw files |
+|---|---|---|
+| **Before** coordinator/donor routing | ~11:24–11:32Z | `docs/bench_backup/` |
+| **After** (`5373533`) | ~12:30–12:34Z | `docs/bench/*-suite.{md,json}` |
 
-| # | setup | Linux RAM / VRAM | Mac | files |
-|---|---|---|---|---|
-| 1 | Solo fat, no GPU | 11.65 / 0 | — | `112430` cold, `112512` warm |
-| 2 | Solo fat + CUDA | 10.51–10.54 / 1.08 | — | `112651` cold, `112717` warm |
-| 3 | Solo starved | 0.13 / 0 | — | `112751` cold, `112806` warm |
-| 4 | Cluster starved + Mac | 0.13 / 0 | 17.2 GB HW, **no tier budget advertised** | `112927` cold, `113005` warm |
-| 5 | Cluster fat + Mac | 11.56 / 0 | same Mac | `113120` cold, `113127` warm, `113145` concurrent (W=4) |
+`RAM flag` / `VRAM flag` are agent `--ram` / `--vram`. `RAM occ` / `VRAM occ` are Colibri occupied tiers after dense reservation.
 
-## Scoreboard
+## After — scoreboard
 
-| setup | p50 cold (s) | p50 warm (s) | EPA | hop mix (local / remote / fallback) | primary mix |
-|---|---:|---:|---:|---|---|
-| Solo fat, no GPU | 0.344 | 0.351 | **−0.02** | 50 / 0 / 50 | Linux 100% |
-| Solo fat + CUDA | 0.436 | 0.447 | **−0.03** | 50 / 0 / 50 | Linux 100% |
-| Solo starved | 0.505 | 0.474 | **+0.07** | 50 / 0 / 50 | Linux 100% |
-| Cluster starved + Mac | 0.629 | **7.959** | **−0.92** | 44 / 13 / 43 → 41 / 18 / 41 | Linux 88% → **Mac 75%** |
-| Cluster fat + Mac | 0.351 | 0.352 | **0.00** | 50 / 0 / 50 | Linux 100% |
-| Cluster fat + Mac concurrent | — | p50 **3.28** / p95 **11.8** | RPS@4 **0.48** | 50 / 1 / 49 | Linux 100% |
+| # | setup | RAM / VRAM flag | occ | file | p50 cold | p50 warm | EPA | RPS@4 | primary |
+|---|---|---|---|---|---:|---:|---:|---:|---|
+| 1 | Solo fat, no GPU | 50 / — | 11.52 / 0 | `123012` | **0.324** | **0.322** | 0.01 | **3.04** | Linux 100% |
+| 2 | Solo fat + CUDA | 50 / 14 | 11.2 / **0.3** | `123058` | 0.356 | 0.462 | **−0.23** | 2.13 | Linux 100% |
+| 3 | Solo starved | 2 / — | 0.13 / 0 | `123131` | 0.461 | 0.485 | −0.05 | 2.22 | Linux 100% |
+| 4 | Fat + Mac | 50 / — + Mac blank | 11.5 / 0 | `123222` | **0.302** | **0.305** | −0.01 | **3.18** | Linux 100%, Mac `missing_tiers` |
+| 5 | Starved + Mac | 2 / — + Mac blank | 0.13 / 0 | `123247` | 0.428 | **0.426** | 0.01 | 2.38 | Linux **95.8%**, Mac 4.2% (warned) |
+| 6 | Mac alone | no flags | blank | `123349` | 1.473 | 1.389 | 0.06 | 0.71 | Mac 100% (only node) |
 
-First request in every cold run is an outlier (1.5–1.7 s solo; **26.6 s** once the Mac became primary). Medians exclude that pattern except where most requests are slow (starved-cluster warm, concurrent).
+Concurrent p50 (queue on one coordinator): fat 1.31 s · GPU 1.86 s · starved 1.80 s · fat+Mac 1.24 s · starved+Mac 1.68 s · Mac alone **5.57 s**.
 
-Median expert exec from placement (`median_exec` µs):
+First request of each cold step is still an outlier (1.4–2.2 s solo; **33.4 s** on the one Mac-primary chat). Medians hide it except starved+Mac cold p95 **4.98 s**.
+
+Median expert exec (µs) after the fix:
 
 | node | disk (tier 0) | RAM (tier 1) | VRAM (tier 2) |
 |---|---:|---:|---:|
-| Linux fat / starved | 336–478 | **116–134** | 497–546 (when CUDA on) |
-| Mac | 2176 | **1343–1478** | (unused) |
+| Linux | 340 | **118–145** | 494 (when CUDA on) |
+| Mac | 2189 | **876–1092** | unused |
 
-Linux RAM experts are ~10× faster than Mac RAM experts. CUDA VRAM exec is ~4× slower than Linux RAM (546 vs 131 µs) at 1.08 GB VRAM budget.
+Linux RAM experts stay ~8–10× faster than Mac RAM. CUDA VRAM exec is still ~4× slower than Linux RAM (494 vs 118 µs).
+
+## Before vs after (the bug the plan fixed)
+
+| setup | before warm p50 | after warm p50 | before primary | after primary |
+|---|---:|---:|---|---|
+| Solo fat | 0.351 | 0.322 | Linux | Linux |
+| Solo fat + CUDA | 0.447 | 0.462 | Linux | Linux |
+| Solo starved | 0.474 | 0.485 | Linux | Linux |
+| Fat + Mac | 0.352 | 0.305 | Linux 100% | Linux 100%, Mac donor-only |
+| Starved + Mac | **7.959** | **0.426** | **Mac 75%** | Linux 100% warm / concurrent |
+| Fat + Mac concurrent | 3.28 s / **0.48 RPS** | 1.24 s / **3.18 RPS** | Linux (queued badly) | Linux, healthy single-node queue |
+| Mac alone | — | 1.389 | — | baseline: **4.3×** Linux fat |
+
+The 8 s starved+Mac disaster was **Mac as chat coordinator**, not expert RPC. After the split, the Mac is `donor_only` (`missing_tiers` when it sends no `TIERS`; `slow_ram_exec` once ECOST arrives). Warm and concurrent never leave Linux. That is the Spark-style outcome the plan specified.
 
 ## Findings
 
-### 1. On this model, SSD page cache already wins — pin budget barely matters
+### 1. Coordinator vs donor works — with one cold-join leak
 
-Solo fat (11.65 GB RAM) vs solo starved (0.13 GB) is only **1.47×** (0.344 s vs 0.505 s). Warm vs cold EPA is ~0 on every single-node run. That is not “experts stay on disk and get faster as they pin.” It is “the working set is already in the Linux page cache after the first token.”
+Fat+Mac: Mac `coordinator_eligible=no (missing_tiers)`, Linux 100% of 24 chats, 0% remote. Sequential matches (slightly beats) solo fat. Concurrent RPS matches solo fat (~3.1). The Mac is idle as a donor because Linux RAM already wins `load+exec`.
 
-Implication: **EPA as “warm RAM vs cold disk” is not measurable on a small Qwen3-MoE sitting on a fast NVMe box with 64 GB of host RAM.** You need a model whose hot experts do not fit in page cache, or you need to drop caches between cold runs (`echo 3 > /proc/sys/vm/drop_caches` on the agent, not just wipe `.coli_usage`).
+Starved+Mac: Mac `donor_only (slow_ram_exec)`. Warm 8/8 and concurrent 8/8 on Linux at **0.43 s / 2.38 RPS** — vs **7.96 s** before. Bench emitted `donor_only node 4f9668ff was primary 4.2%`. That 4.2% is **one cold chat** (33.4 s, 1443 remote hops) at cluster join, before the role stuck. Cold p50 stayed 0.43 s (Linux); cold p95 4.98 s is that one job.
 
-### 2. 1 GB of CUDA made the fat box slower, not faster
+Implication: **do not treat the Mac as a second chat server.** Pin chat to the fast coordinator. The remaining leak is join-order / first-heartbeat, not warm-lock.
 
-Solo fat + GPU: p50 **0.436 s** vs **0.344 s** RAM-only (**+27%**). Warm p95 also stretched (0.544 s vs 0.367 s). Placement still set `max_tier=2` with `vram_slow=false` even though VRAM median exec was 546 µs vs RAM 131 µs (4.2×). `vram_frac` was only 0.08 — almost nothing actually lived on the card, but the CUDA path still taxed the run.
+### 2. Mac alone is the missing baseline — ~4× slower
 
-Implication: **small VRAM budgets on MoE are overhead, not acceleration.** Matches [Why can GPU be slower than RAM?](../AVIARY.md#why-can-gpu-vram-be-slower-than-ram). Detection did not flip `vram_slow` here because the heatmap never filled with VRAM samples.
+Mac-only suite: warm p50 **1.39 s**, concurrent **0.71 RPS** / 5.57 s p50. Linux fat is 0.32 s / 3.04 RPS. That ratio (about **4.3×**) is why one Mac-primary chat dominates any mixed scoreboard. It also explains the old 8 s warm: six of eight chats ran dense+attn+MTP on the Mac.
 
-### 3. Adding a slower peer can make the cluster much worse than solo
+The Mac still advertises **no `ram_flag` / `ram_occ`**. Agent synthesis only fires if the process has `RAM_GB` / `--ram`. Start the Mac agent with an explicit `--ram` if you want occupied-vs-configured columns; role assignment already works from missing tiers or slow ECOST.
 
-Starved Linux + Mac:
+### 3. Donating experts did not beat Linux page cache
 
-- Cold: p50 0.629 s (already worse than solo starved 0.505 s). One of eight chats went to the Mac and took **26.6 s**. Remote hops appeared (13%).
-- Warm: routing flipped to **Mac primary on 6/8 chats**. p50 **7.96 s** — **12.7× worse than the same cluster’s cold p50**, **16.8× worse than solo starved warm**.
+Starved+Mac cold actually used the donor path: first Linux chat had 107 `remote` hops; overall cold hop mix 25% remote / 75% fallback. Placement recorded a Mac donor score of **~504 ms** (rpc+exec). Warm and concurrent then went **0% remote** — the learner decided Mac RAM is not cheaper than Linux SSD/page-cache.
 
-The Mac advertised 17.2 GB host RAM but **no `ram_gb` / `vram_gb` tiers**. Placement still assigned 256 hot experts and treated the Mac as a viable primary. Once usage accumulated on the Mac, affinity locked traffic there.
+Solo starved vs solo fat is still only **1.4×** (0.46 s vs 0.32 s) with `--ram 2` vs `--ram 50`. Occupied RAM 0.13 GB vs 11.5 GB does not change the fact that the ~18 GB checkpoint fits in 64 GB host RAM. **EPA is not a pin-vs-disk metric on this model** unless you drop the kernel page cache (`echo 3 > /proc/sys/vm/drop_caches` on Linux). Wiping `.coli_usage` is not cold.
 
-Implication: **cluster is not “more nodes = faster.”** Chat latency is the **primary’s** wall time. A slow peer that wins even one warm-lock chat dominates the scoreboard. Expert RPC (13–18% remote) is a rounding error next to “the Mac ran dense + attn + LM head.”
+Cluster win for this pair is therefore **not** sequential latency. It is (1) not destroying latency by moving the chat, which we now do, and (2) extra coordinator-class machines for concurrent chats, which the Mac is not.
 
-### 4. Fat Linux + Mac is a no-op cluster (and that is the good outcome)
+### 4. `--vram 14` is still not 14 GB on GPU
 
-With 11.56 GB on Linux, every sequential chat stayed on Linux (100% primary, 0% remote). p50 0.351 / 0.352 s — **identical to solo fat**. The Mac sat idle. Concurrent (4 workers) still pinned all 8 chats to Linux: p50 3.28 s, p95 11.8 s, **0.48 req/s**. Sequential equivalent is ~2.3 req/s at 0.35 s each; concurrency **queued on one primary** instead of spreading.
+Fat+CUDA: flag **14 GB**, occupied **0.3 GB** (was 1.08 GB in the morning run). Placement now sets coordinator `max_tier=2` (`vram_slow=false`, `vram_frac` 0.023–0.026) — Aviary is no longer silently capping RAM. The engine still only parks a sliver of experts on the card (WSL free-VRAM minus dense minus 2 GB reserve). `gpu_tier` clamp reason is still **not** on `/cluster/nodes`; stderr has the clamp line.
 
-Implication: when the fast node has enough RAM, Aviary correctly **does not** send chat to the slower peer. You do **not** get N× throughput from a second replica unless routing actually picks it as primary — and you do not *want* that if it is the Mac. Concurrent RPS here is a **single-node queue**, not a cluster win.
+Wall time: warm **0.462 s** vs fat RAM **0.322 s** (**+43%**). Same-run EPA **−0.23** (warm slower than cold as more CUDA path engages). VRAM median exec 494 µs vs RAM 118 µs. Concurrent 2.13 RPS vs 3.04 RAM-only.
 
-### 5. The 50 / 50 local / fallback mix is not “half the experts missed RAM”
+Implication: **this is still not a 14 GB GPU result.** Until `vram_occ` is in the 10+ GB range *or* the clamp is explicit in the cluster snapshot, do not attribute the +43% to “14 GB of experts on CUDA.” Small VRAM occupancy on this MoE is overhead. Detection still does not flip `vram_slow` (too few VRAM-resident cells).
 
-Every solo run (and fat-cluster sequential) reports ~50% local / 50% fallback / 0% remote, often **exact** counts (1024 / 1024). That is instrumentation: a failed remote attempt then a local exec, not a 50% disk miss rate. Real RPC only shows up when a peer is in the placement map (starved cluster 13–18% remote; fat concurrent 1.2%).
+### 5. Hop mix is honest about double-counting — and now over-labels fallback
 
-Do not put hop-mix percentages in a README table as if they were cache-hit rates.
+Before: solo reported a fake **50/50 local/fallback** (fallback then local both fired). After: one event per expert, so solo/fat is **100% fallback**. That is `AVIARY_CLUSTER=1` trying RPC, missing (empty or self placement), tagging `fallback`, then suppressing the local emit.
 
-## What this means for the table you wanted
+Read hop mix as:
 
-A useful README row for this hardware is **not** “cluster EPA = X.” It is:
+| kind | meaning now |
+|---|---|
+| `remote` | Activation RPC succeeded (only starved+Mac cold, 16–25%) |
+| `fallback` | RPC miss or no donor, then local exec — **includes healthy local work** |
+| `local` | Almost never, because cluster mode always attempts RPC first |
+| `rpc_in` | This node served an expert for a peer (not in the %-mix table) |
 
-| config | p50 wall (32 tok) | vs solo fat | notes |
-|---|---:|---:|---|
-| Solo fat, RAM only | **0.34 s** | — | best sequential |
-| Solo fat + 1 GB CUDA | 0.44 s | **+27%** | GPU tax |
-| Solo starved (0.13 GB) | 0.47–0.51 s | +38–47% | page cache still carries it |
-| Cluster fat + Mac | 0.35 s | ~0 | Mac unused; same as solo |
-| Cluster starved + Mac (warm) | **8.0 s** | **+23×** | Mac became primary |
-| Cluster fat concurrent W=4 | 3.3 s p50 / 0.48 RPS | latency 10× | all 8 chats on Linux |
+Do not publish fallback% as a cache-miss rate. A useful split would be “no placement → `local`” vs “assigned remote missed → `fallback`.”
 
-**Takeaway:** on Qwen3-MoE with a fast NVMe Linux box, **keep the primary fat and RAM-only**. A Mac peer does not help sequential latency and can destroy it if routing treats it as a chat primary. Cluster value on this pair is **capacity only if you pin chat to Linux** (or run two equal-speed boxes).
+## Honest README row (after)
+
+| config | p50 warm (32 tok) | RPS@4 | vs solo fat | notes |
+|---|---:|---:|---:|---|
+| Solo fat, RAM only | **0.32 s** | **3.04** | — | best single node |
+| Fat + Mac | **0.31 s** | **3.18** | ~0 | Mac donor-only, unused |
+| Solo starved | 0.49 s | 2.22 | +50% | page cache still carries it |
+| Starved + Mac | **0.43 s** | 2.38 | +33% | Linux coordinator; was **8.0 s** |
+| Solo fat + CUDA 0.3 GB occ | 0.46 s | 2.13 | +43% | not a 14 GB result |
+| Mac alone | 1.39 s | 0.71 | **+4.3×** | why it must not be primary |
+
+**Takeaway:** keep the coordinator on the fast Linux box, RAM-only, for this model. The Mac is a legal expert donor and a disastrous coordinator. Donor RPC only pays if Linux would actually hit disk — it does not, until page cache is dropped or the model is much larger. CUDA needs occupied VRAM in the requested ballpark before we re-bench it as a GPU story.
 
 ## Caveats
 
 - 8 × 32-token chats. Good for routing/placement, not tok/s marketing.
-- `.coli_usage` wipe does **not** drop the kernel page cache or engine `eheat`.
-- Mac never reported Colibri tier budgets — placement compared apples to missing data.
-- Concurrent was only run on fat+Mac, not as a same-cluster suite with the sequential pair.
+- `.coli_usage` wipe does not drop kernel page cache or engine `eheat`.
+- Mac agent was not started with `--ram`, so configured/occupied columns stay blank.
+- One starved+Mac cold chat still landed on the Mac (join race). Warm/concurrent did not.
+- Hop `fallback` includes successful local exec whenever cluster mode is on.

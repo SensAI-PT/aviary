@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from aviary.expert_rpc import DEFAULT_EXPERT_PORT, start_expert_rpc_server
@@ -97,12 +98,78 @@ def _resolve_cluster_advertise_host(advertise: str | None, bind_host: str,
               f"with {resolved!r}", file=sys.stderr)
     return resolved
 
-def tiers_config_from_env(env: dict | None = None) -> dict[str, float]:
-    """Configured RAM/VRAM budgets from agent argv/env (--ram, --vram)."""
+def infer_ram_budget_gb(env: dict | None = None, hwinfo: dict | None = None) -> float:
+    """Explicit --ram, else a conservative slice of advertised host RAM."""
     e = env or os.environ
     ram = float(e.get("RAM_GB") or 0)
+    if ram > 0:
+        return ram
+    hw = hwinfo or {}
+    avail = float(hw.get("ram_avail_gb") or 0)
+    total = float(hw.get("ram_total_gb") or 0)
+    if avail > 1:
+        return round(min(avail * 0.5, total * 0.5 if total > 1 else avail * 0.5), 2)
+    if total > 1:
+        return round(total * 0.4, 2)
+    return 0.0
+
+
+def tiers_config_from_env(env: dict | None = None, hwinfo: dict | None = None) -> dict[str, float]:
+    """Configured RAM/VRAM budgets from --ram/--vram, else inferred from hwinfo."""
+    e = env or os.environ
+    ram = infer_ram_budget_gb(e, hwinfo)
     vram = float(e.get("CUDA_EXPERT_GB") or e.get("VRAM_GB") or 0)
     return {k: v for k, v in (("ram_gb", ram), ("vram_gb", vram)) if v > 0}
+
+
+def _probe_hwinfo() -> dict[str, Any] | None:
+    if not (discover_gpus and memory_available):
+        return None
+    try:
+        gpus = discover_gpus()
+        ram_total, ram_avail = memory_available()
+        return {
+            "cores": os.cpu_count() or 0,
+            "ram_total_gb": ram_total,
+            "ram_avail_gb": ram_avail,
+            "gpus": len(gpus),
+            "vram_total_gb": sum(g.get("memory_total_gb", 0) for g in gpus),
+            "cpu": "",
+            "gpu": gpus[0].get("name", "") if gpus else "",
+        }
+    except Exception:
+        return None
+
+
+def attach_tier_telemetry(payload: dict, engine, tiers_config: dict[str, float] | None,
+                          hwinfo: dict | None = None) -> dict:
+    """Always publish configured + occupied RAM/VRAM (synthesize if engine is silent)."""
+    hw = getattr(engine, "hwinfo", None) or hwinfo or payload.get("hwinfo")
+    if hw:
+        payload["hwinfo"] = hw
+    elif not payload.get("hwinfo"):
+        probed = _probe_hwinfo()
+        if probed:
+            payload["hwinfo"] = probed
+            hw = probed
+    cfg = dict(tiers_config or {})
+    if "ram_gb" not in cfg or not cfg.get("ram_gb"):
+        cfg.update(tiers_config_from_env(hwinfo=hw))
+    if cfg:
+        payload["tiers_config"] = cfg
+    tiers = sanitize_tiers(getattr(engine, "tiers", None))
+    if not tiers and cfg:
+        tiers = {
+            "ram_gb": cfg.get("ram_gb", 0),
+            "vram_gb": cfg.get("vram_gb", 0),
+            "ram": 0, "vram": 0, "disk": 0,
+        }
+    if tiers:
+        payload["tiers"] = tiers
+    gpu_tier = getattr(engine, "gpu_tier", None)
+    if gpu_tier:
+        payload["gpu_tier"] = dict(gpu_tier)
+    return payload
 
 
 class ControlConnection:
@@ -204,36 +271,7 @@ class ControlConnection:
             "engine_id": arch_engine_id(self.arch),
             "expert_port": self.expert_port,
         }
-        eng = self.engine
-        if getattr(eng, "hwinfo", None):
-            payload["hwinfo"] = eng.hwinfo
-        tiers = sanitize_tiers(getattr(eng, "tiers", None))
-        if tiers:
-            payload["tiers"] = tiers
-        elif self.tiers_config:
-            payload["tiers"] = {
-                "ram_gb": self.tiers_config.get("ram_gb", 0),
-                "vram_gb": self.tiers_config.get("vram_gb", 0),
-                "ram": 0, "vram": 0, "disk": 0,
-            }
-        if self.tiers_config:
-            payload["tiers_config"] = dict(self.tiers_config)
-        if discover_gpus and not payload.get("hwinfo"):
-            try:
-                gpus = discover_gpus()
-                ram_total, ram_avail = memory_available()
-                payload["hwinfo"] = {
-                    "cores": os.cpu_count() or 0,
-                    "ram_total_gb": ram_total,
-                    "ram_avail_gb": ram_avail,
-                    "gpus": len(gpus),
-                    "vram_total_gb": sum(g.get("memory_total_gb", 0) for g in gpus),
-                    "cpu": "",
-                    "gpu": gpus[0].get("name", "") if gpus else "",
-                }
-            except Exception:
-                pass
-        return payload
+        return attach_tier_telemetry(payload, self.engine, self.tiers_config)
 
     def _telemetry_payload(self) -> dict:
         eng = self.engine
@@ -252,19 +290,7 @@ class ControlConnection:
             "costs": list(getattr(eng, "ecost", []) or []),
             "profile": list(getattr(eng, "profile", ()) or ())[-8:],
         }
-        if getattr(eng, "hwinfo", None):
-            payload["hwinfo"] = eng.hwinfo
-        tiers = sanitize_tiers(getattr(eng, "tiers", None))
-        if tiers:
-            payload["tiers"] = tiers
-        elif self.tiers_config:
-            payload["tiers"] = {
-                "ram_gb": self.tiers_config.get("ram_gb", 0),
-                "vram_gb": self.tiers_config.get("vram_gb", 0),
-                "ram": 0, "vram": 0, "disk": 0,
-            }
-        if self.tiers_config:
-            payload["tiers_config"] = dict(self.tiers_config)
+        attach_tier_telemetry(payload, eng, self.tiers_config)
         if getattr(eng, "emap", None):
             payload["emap"] = eng.emap
         payload["scheduler"] = snap

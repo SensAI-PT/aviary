@@ -106,6 +106,27 @@ class CoordinatorRoutingTest(unittest.TestCase):
         })
         self.assertEqual(reg.pick_with_affinity({(0, 0)}).node_id, "fast")
 
+    def test_slow_hw_is_donor_only_even_with_inferred_tiers(self):
+        """Mac with synthesized RAM budget must not become coordinator vs Linux."""
+        reg = NodeRegistry()
+        reg.register("linux", "10.0.0.1", 8001, "m", {
+            "host": "10.0.0.1",
+            "tiers_config": {"ram_gb": 50},
+            "tiers": {"ram_gb": 11, "ram": 1, "vram": 0, "disk": 0},
+            "hwinfo": {"cores": 20, "ram_avail_gb": 58.0},
+        })
+        reg.register("mac", "10.0.0.2", 8001, "m", {
+            "host": "10.0.0.2",
+            "tiers_config": {"ram_gb": 4},
+            "tiers": {"ram_gb": 4, "ram": 0, "vram": 0, "disk": 0},
+            "hwinfo": {"cores": 8, "ram_avail_gb": 8.0},
+        })
+        roles = reg.node_roles()
+        self.assertTrue(roles["linux"][0])
+        self.assertFalse(roles["mac"][0])
+        self.assertEqual(roles["mac"][1], "slow_hw")
+        self.assertEqual(reg.pick_coordinator().node_id, "linux")
+
     def test_cluster_state_includes_coordinator_id(self):
         reg = NodeRegistry()
         reg.register("linux", "10.0.0.1", 8001, "m", {

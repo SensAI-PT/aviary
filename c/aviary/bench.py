@@ -98,6 +98,7 @@ def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
             "vram_flag": n.get("vram_config_gb") or tc.get("vram_gb"),
             "ram_occ": n.get("ram_occ_gb") if n.get("ram_occ_gb") is not None else tiers.get("ram_gb"),
             "vram_occ": n.get("vram_occ_gb") if n.get("vram_occ_gb") is not None else tiers.get("vram_gb"),
+            "gpu_tier": n.get("gpu_tier"),
             "coordinator_eligible": n.get("coordinator_eligible", True),
             "donor_only_reason": n.get("donor_only_reason", ""),
             "disk_gb": tiers.get("disk"),
