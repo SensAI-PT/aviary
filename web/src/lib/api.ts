@@ -167,6 +167,77 @@ export interface ClusterOverviewResponse {
   updated_at: number
 }
 
+export interface ClusterBenchHopMix {
+  local: number
+  remote: number
+  fallback: number
+}
+
+export interface ClusterBenchScoreboard {
+  p50_cold_sec?: number | null
+  p50_warm_sec?: number | null
+  p95_cold_sec?: number | null
+  p95_warm_sec?: number | null
+  epa?: number | null
+  rps_at_w?: number | null
+  hop_mix_pct?: ClusterBenchHopMix
+  primary_node_mix_pct?: Record<string, number>
+}
+
+export interface ClusterBenchStepResult {
+  step: string
+  wipe_usage: boolean
+  workers: number
+  requests: number
+  ok: number
+  errors: number
+  elapsed_sec: number
+  latency?: { p50_sec?: number; p95_sec?: number }
+  rps?: number
+  hop_mix_pct?: ClusterBenchHopMix
+}
+
+export interface ClusterBenchResult {
+  finished_at: string
+  meta: {
+    preset: string
+    wipe_usage?: boolean
+    local_only: boolean
+    requests: number
+    workers: number
+    max_tokens: number
+    prompt: string
+  }
+  steps: ClusterBenchStepResult[]
+  scoreboard: ClusterBenchScoreboard
+  last_error?: string
+  markdown?: string
+}
+
+export interface ClusterBenchProgress {
+  preset: string
+  step: string
+  chat_index: number
+  chat_total: number
+  last_error: string
+}
+
+export interface ClusterBenchResponse {
+  status: "idle" | "running" | "failed"
+  progress: ClusterBenchProgress
+  last_result: (ClusterBenchResult & { markdown?: string }) | null
+}
+
+export type ClusterBenchStartRequest = {
+  preset: "cold_sequential" | "warm_sequential" | "concurrent" | "suite"
+  wipe_usage?: boolean
+  local_only?: boolean
+  requests?: number
+  workers?: number
+  max_tokens?: number
+  prompt?: string
+}
+
 export interface ProfileTurn {
   wall_s: number
   prompt_tokens: number
@@ -263,6 +334,23 @@ export async function getClusterOverview(baseUrl: string, apiKey = "", signal?: 
   const response = await fetch(serverEndpoint(baseUrl, "cluster/overview"), { headers: headers(apiKey), signal })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ClusterOverviewResponse
+}
+
+export async function getClusterBench(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<ClusterBenchResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/bench"), { headers: headers(apiKey), signal })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterBenchResponse
+}
+
+export async function startClusterBench(baseUrl: string, apiKey: string, req: ClusterBenchStartRequest, signal?: AbortSignal): Promise<ClusterBenchResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "cluster/bench"), {
+    method: "POST",
+    headers: headers(apiKey),
+    signal,
+    body: JSON.stringify(req),
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ClusterBenchResponse
 }
 
 export function extractSSE(buffer: string) {

@@ -21,11 +21,12 @@ import {
   type ClusterPlacementResponse,
 } from "@/lib/api"
 import { ClusterHeatmapSection, ExpertHeatmapModal } from "./ClusterHeatmap"
+import { ClusterBenchPanel } from "./ClusterBench"
 import { Badge } from "@/components/ui/badge"
 import { useLocale } from "./i18n"
 import { cn } from "@/lib/utils"
 
-type ClusterTab = "overview" | "jobs" | "executors" | "placement" | "rpc"
+type ClusterTab = "overview" | "jobs" | "executors" | "placement" | "rpc" | "bench"
 
 function shortId(id: string) {
   return id.slice(0, 8)
@@ -127,6 +128,7 @@ export function Cluster({ baseUrl, apiKey, connected }: { baseUrl: string; apiKe
     { id: "executors", label: t("cluster.tab.executors"), count: nodes.length },
     { id: "placement", label: t("cluster.tab.placement"), count: Object.keys(placement?.experts || {}).length },
     { id: "rpc", label: t("cluster.tab.rpc") },
+    { id: "bench", label: t("cluster.tab.bench") },
   ]
 
   return (
@@ -171,6 +173,10 @@ export function Cluster({ baseUrl, apiKey, connected }: { baseUrl: string; apiKe
 
       {tab === "rpc" && (
         <RpcPanel nodes={nodes} placement={placement} t={t} />
+      )}
+
+      {tab === "bench" && (
+        <ClusterBenchPanel baseUrl={baseUrl} apiKey={apiKey} t={t} />
       )}
     </div>
   )

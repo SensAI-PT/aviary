@@ -366,6 +366,12 @@ class NodeRegistry:
                 record.proxy_inflight = max(0, record.proxy_inflight + delta)
                 record.inflight = record.agent_inflight + record.proxy_inflight
 
+    def clear_usage(self) -> None:
+        with self._lock:
+            self._merged_usage.clear()
+            for record in self._nodes.values():
+                record.usage = []
+
     def control_connections(self) -> dict[str, Any]:
         with self._lock:
             return {nid: rec.control_conn for nid, rec in self._nodes.items()

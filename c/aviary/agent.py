@@ -175,6 +175,16 @@ class ControlConnection:
             self._enqueue_cluster_cmd("LOAD", int(fields[1]), int(fields[2]), int(fields[3]))
         elif kind == "EVICT" and len(fields) >= 3:
             self._enqueue_cluster_cmd("EVICT", int(fields[1]), int(fields[2]))
+        elif kind == "RESET_USAGE":
+            self._reset_usage()
+
+    def _reset_usage(self) -> None:
+        model_dir = Path(self.model_path)
+        for name in (".coli_usage", "stats.txt"):
+            path = model_dir / name
+            if path.is_file():
+                path.unlink()
+        self._usage_snapshot = []
 
     def _register_payload(self) -> dict:
         payload = {

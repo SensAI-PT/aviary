@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from aviary.bench import BenchConfig, BenchRunner
 from aviary.jobs import JobTracker
 from aviary.placement import PlacementScheduler
 from aviary.protocol import ProtocolError, evict_frame, load_frame, pin_frame, placement_frame, read_frame, write_line
@@ -110,6 +111,7 @@ class MasterHTTPServer(ThreadingHTTPServer):
         self.api_key = api_key
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.bench = BenchRunner(registry, scheduler, jobs, api_key=api_key)
 
     @property
     def model_id(self):
@@ -252,6 +254,18 @@ class MasterHTTPHandler(APIHandler):
             jobs = self.server.jobs.snapshot()  # type: ignore[attr-defined]
             self.send_json(200, jobs)
             return
+        if path == "/cluster/bench":
+            bench = self.server.bench  # type: ignore[attr-defined]
+            self.send_json(200, bench.snapshot())
+            return
+        if path == "/cluster/bench/latest":
+            from aviary.bench import BenchRunner as _BenchRunner
+            payload = _BenchRunner.read_latest()
+            if payload is None:
+                self.send_json(404, {"error": {"message": "No bench results saved yet."}})
+                return
+            self.send_json(200, payload)
+            return
         if path == "/cluster/overview":
             registry = self.server.registry  # type: ignore[attr-defined]
             scheduler = self.server.scheduler  # type: ignore[attr-defined]
@@ -293,6 +307,35 @@ class MasterHTTPHandler(APIHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
+        if path == "/cluster/bench":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self.send_json(400, {"error": {"message": "Invalid JSON body."}})
+                return
+            bench = self.server.bench  # type: ignore[attr-defined]
+            if bench.snapshot().get("status") == "running":
+                self.send_json(409, {"error": {"message": "Bench run already in progress."}})
+                return
+            try:
+                cfg = BenchConfig(
+                    preset=str(payload.get("preset") or "cold_sequential"),
+                    wipe_usage=payload.get("wipe_usage") if "wipe_usage" in payload else None,
+                    local_only=bool(payload.get("local_only", False)),
+                    requests=max(1, int(payload.get("requests") or 8)),
+                    workers=max(1, int(payload.get("workers") or 4)),
+                    max_tokens=max(1, int(payload.get("max_tokens") or 32)),
+                    prompt=str(payload.get("prompt") or "Say hello in one word."),
+                )
+                bench.model_id = self.server.model_id  # type: ignore[attr-defined]
+                bench.start(cfg)
+            except (ValueError, RuntimeError) as err:
+                self.send_json(400, {"error": {"message": str(err)}})
+                return
+            self.send_json(202, bench.snapshot())
+            return
         if path not in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
             self.send_json(404, {"error": {"message": "Not found."}})
             return

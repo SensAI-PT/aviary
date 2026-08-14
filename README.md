@@ -198,7 +198,7 @@ The **Cluster** tab shows:
 | **Question** | Is **activation + RTT** across the LAN faster than **disk load on one box**? |
 | **Measure** | tokens/s, p50/p95 latency, expert_wait_s, Cluster RPC histogram, disk I/O |
 
-[`c/tools/cluster_bench.py`](c/tools/cluster_bench.py) runs repeatable load tests. Interpretation: [`docs/AVIARY.md`](docs/AVIARY.md).
+[`c/tools/cluster_bench.py`](c/tools/cluster_bench.py) runs repeatable load tests from the CLI. The Cluster **Bench** tab (or `POST /cluster/bench`) adds usage wipe, job/placement capture, and markdown export — see [Cluster bench](docs/AVIARY.md#cluster-bench-epa-harness). Interpretation: [`docs/AVIARY.md`](docs/AVIARY.md).
 
 ## Status
 
@@ -214,6 +214,7 @@ The **Cluster** tab shows:
 | topic | doc |
 |---|---|
 | Overview, env vars, benchmarks | [docs/AVIARY.md](docs/AVIARY.md) |
+| Cluster bench (EPA harness) | [docs/AVIARY.md § Cluster bench](docs/AVIARY.md#cluster-bench-epa-harness) |
 | Why VRAM can be slower than RAM | [docs/AVIARY.md § Why can GPU be slower than RAM?](docs/AVIARY.md#why-can-gpu-vram-be-slower-than-ram) |
 | Upstream engine sync / drift | [docs/COLIBRI_SYNC.md](docs/COLIBRI_SYNC.md) |
 | Qwen3 convert + oracle | [docs/qwen3_moe.md](docs/qwen3_moe.md) |

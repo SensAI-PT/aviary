@@ -472,6 +472,9 @@ class PlacementScheduler:
                 if vals:
                     self._median_exec[tier] = statistics.median(vals)
 
+    def clear_usage(self) -> None:
+        self._usage.clear()
+
     def ingest_usage(self, records: list[dict[str, int]]) -> None:
         for r in records or []:
             key = (int(r["layer"]), int(r["expert"]))

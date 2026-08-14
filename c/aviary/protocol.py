@@ -115,3 +115,7 @@ def load_frame(layer: int, eid: int, tier: int) -> str:
 
 def evict_frame(layer: int, eid: int) -> str:
     return f"EVICT {layer} {eid}\n"
+
+
+def reset_usage_frame() -> str:
+    return "RESET_USAGE\n"

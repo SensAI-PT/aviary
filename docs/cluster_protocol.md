@@ -142,6 +142,7 @@ PLACEMENT <bytes>\n<json_payload>\n
 PIN <layer> <eid> <tier>\n
 LOAD <layer> <eid> <tier>\n
 EVICT <layer> <eid>\n
+RESET_USAGE\n
 ```
 
 | frame | meaning |
@@ -150,6 +151,7 @@ EVICT <layer> <eid>\n
 | `PIN` | Pin expert to RAM/VRAM tier on this node |
 | `LOAD` | Prefetch expert into tier |
 | `EVICT` | Evict expert from hot store |
+| `RESET_USAGE` | Delete agent `.coli_usage` / `stats.txt`; master clears merged usage on next bench wipe |
 
 ## Failure semantics
 

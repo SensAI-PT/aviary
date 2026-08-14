@@ -267,6 +267,7 @@ People expect “put experts on the GPU → faster.” For MoE that is often **f
 | `AVIARY_BLOCK_MOVE_PCT` | `0.15` | Hysteresis: keep a layer block unless moving saves ≥ this fraction |
 | `AVIARY_MIN_TIER_SAMPLES` | `8` | ECOST samples required before declaring VRAM-slow on a node |
 | `AVIARY_TIER_PROBE` | `8` | When heatmap is mostly VRAM, demote this many hot experts to RAM to measure a baseline |
+| `AVIARY_BENCH_DIR` | `<repo>/docs/bench/` | Cluster bench JSON/markdown output directory |
 | `COLI_API_KEY` | — | Optional auth on master and agents |
 
 Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
@@ -281,6 +282,9 @@ Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
 | `/cluster/jobs` | GET | Active and recent proxied requests |
 | `/cluster/placement` | GET | Current scheduler output |
 | `/cluster/costs` | GET | Cost matrix snapshot |
+| `/cluster/bench` | GET | Bench runner status + last result |
+| `/cluster/bench` | POST | Start a bench run (409 if already running) |
+| `/cluster/bench/latest` | GET | Last saved bench JSON from `AVIARY_BENCH_DIR` |
 | `/cluster/shards` | GET | Agent-only: list local safetensors shard files (prefetch peer) |
 | `/cluster/shard?name=…` | GET | Agent-only: download one shard file from model dir |
 | `/v1/chat/completions` | POST | Proxied to chosen agent (streaming preserved) |
@@ -290,6 +294,44 @@ Each agent persists a stable node UUID at `<model_dir>/.aviary_node_id`.
 
 Proxied chat responses include `X-Aviary-Job-Id` and `X-Aviary-Node-Id` headers for tracing
 in the Cluster **Jobs** tab.
+
+## Cluster bench (EPA harness)
+
+The Cluster **Bench** tab (or `POST /cluster/bench`) runs repeatable chat workloads through the
+same master proxy as the UI, captures job traces and placement, and writes README-ready output
+under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
+
+- `latest.json` / `latest.md` — most recent run
+- `<utc-stamp>-<preset>.json` / `.md` — archived copy
+
+**Presets**
+
+| preset | behavior |
+|---|---|
+| **Cold sequential** | Wipe `.coli_usage` on all agents + master usage; N chats one-by-one |
+| **Warm sequential** | Keep usage; same N chats (multi-turn / warmed experts) |
+| **Concurrent** | Keep usage; N chats with W worker threads (throughput) |
+| **Run suite** | Cold → warm → concurrent; computes scoreboard |
+
+**Scoreboard (suite)**
+
+- p50 / p95 wall seconds (cold vs warm vs concurrent step)
+- Primary `node_id` mix from job routing
+- `% local / remote / fallback` from per-request expert traces
+- Planned blocks + `node_tier_prefs` after the run
+- **EPA** = `p50_cold / p50_warm - 1` (warm vs cold on the same cluster)
+- **RPS@W** from the concurrent step
+
+**Toggles**
+
+- **Wipe usage** — default on for Cold / Suite cold step; sends `RESET_USAGE` to agents and clears master scheduler usage. Engine in-memory heat is *not* cleared (restart agents for a fully cold engine).
+- **Local-only** — pushes placement with empty `experts` so the primary runs every expert locally (SSD→RAM story without stopping peers).
+
+Paste `docs/bench/latest.md` into the README benchmark table after a run.
+
+| variable | default | meaning |
+|---|---|---|
+| `AVIARY_BENCH_DIR` | `<repo>/docs/bench/` | Where bench JSON/markdown is written |
 
 ## Ownership boundary
 
