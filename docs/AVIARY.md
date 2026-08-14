@@ -315,6 +315,7 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 
 **Scoreboard (suite)**
 
+- Cluster config table (per-node `--ram` / `--vram` budgets, host, hardware) captured at run time
 - p50 / p95 wall seconds (cold vs warm vs concurrent step)
 - Primary `node_id` mix from job routing
 - `% local / remote / fallback` from per-request expert traces

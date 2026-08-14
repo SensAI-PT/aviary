@@ -66,6 +66,34 @@ def primary_node_mix(jobs: list[dict[str, Any]]) -> dict[str, float]:
     return {k: round(v / total * 100.0, 1) for k, v in sorted(counts.items(), key=lambda kv: -kv[1])}
 
 
+def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
+    """Hardware + tier budgets reported by agents at bench time."""
+    snap = registry.snapshot()
+    nodes = []
+    for n in snap.get("nodes") or []:
+        hw = n.get("hwinfo") or {}
+        tiers = n.get("tiers") or {}
+        nodes.append({
+            "node_id": n.get("node_id"),
+            "host": n.get("host"),
+            "endpoint": n.get("endpoint"),
+            "model_id": n.get("model_id"),
+            "arch": n.get("arch"),
+            "status": n.get("status"),
+            "ram_gb": tiers.get("ram_gb"),
+            "vram_gb": tiers.get("vram_gb"),
+            "disk_gb": tiers.get("disk"),
+            "ram_total_gb": hw.get("ram_total_gb"),
+            "ram_avail_gb": hw.get("ram_avail_gb"),
+            "vram_total_gb": hw.get("vram_total_gb"),
+            "cores": hw.get("cores"),
+            "cpu": hw.get("cpu"),
+            "gpu": hw.get("gpu"),
+            "gpus": hw.get("gpus"),
+        })
+    return {"cohort": snap.get("cohort") or {}, "nodes": nodes, "healthy": snap.get("healthy"), "total": snap.get("total")}
+
+
 def compute_epa(p50_cold: float | None, p50_warm: float | None) -> float | None:
     if not p50_cold or not p50_warm or p50_warm <= 0:
         return None
@@ -94,6 +122,25 @@ def render_markdown(result: dict[str, Any]) -> str:
         f"- Finished: {result.get('finished_at', '')}",
         "",
     ]
+    cluster = result.get("cluster") or {}
+    cohort = cluster.get("cohort") or {}
+    if cohort.get("model_id") or cohort.get("arch"):
+        lines.append(f"- Cohort: **{cohort.get('model_id') or '?'}** · {cohort.get('arch') or '?'}")
+        lines.append("")
+    nodes = cluster.get("nodes") or []
+    if nodes:
+        lines += ["### Cluster config", "", "| node | host | RAM budget | VRAM budget | HW RAM | GPU |", "|---|---|---:|---:|---:|---|"]
+        for n in nodes:
+            nid = str(n.get("node_id") or "")[:8]
+            host = n.get("host") or "?"
+            ram = n.get("ram_gb")
+            vram = n.get("vram_gb")
+            hw_ram = n.get("ram_total_gb")
+            gpu = n.get("gpu") or (f"{n.get('gpus')}× GPU" if n.get("gpus") else "—")
+            lines.append(
+                f"| `{nid}` | {host} | {ram if ram is not None else '—'} GB | {vram if vram is not None else '—'} GB | {hw_ram if hw_ram is not None else '—'} GB | {gpu or '—'} |"
+            )
+        lines.append("")
     score = result.get("scoreboard") or {}
     if score:
         lines += ["### Scoreboard", "", "| metric | value |", "|---|---|"]
@@ -416,6 +463,7 @@ class BenchRunner:
                     scoreboard["p95_warm_sec"] = (step.get("latency") or {}).get("p95_sec")
             result = {
                 "finished_at": finished_at,
+                "cluster": cluster_snapshot(self.registry),
                 "meta": {
                     "preset": cfg.preset,
                     "wipe_usage": cfg.wipe_usage,

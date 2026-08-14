@@ -66,6 +66,23 @@ class TestBenchMath(unittest.TestCase):
         self.assertIn("cold_sequential", md)
         self.assertIn("p50=30.0s", md)
 
+    def test_markdown_contains_cluster_config(self):
+        result = {
+            "finished_at": "2026-08-14T12:00:00Z",
+            "cluster": {
+                "cohort": {"model_id": "hy3-colibri", "arch": "hy3"},
+                "nodes": [{"node_id": "abc-123", "host": "192.168.1.120", "ram_gb": 50, "vram_gb": 0,
+                           "ram_total_gb": 64, "gpu": ""}],
+            },
+            "meta": {"preset": "cold_sequential", "wipe_usage": True, "local_only": False, "requests": 8, "workers": 1, "max_tokens": 32},
+            "scoreboard": {},
+            "steps": [],
+        }
+        md = render_markdown(result)
+        self.assertIn("### Cluster config", md)
+        self.assertIn("50 GB", md)
+        self.assertIn("192.168.1.120", md)
+
     def test_suite_preset_wipe_flags(self):
         suite = PRESET_STEPS["suite"]
         self.assertTrue(suite[0]["wipe_usage"])
