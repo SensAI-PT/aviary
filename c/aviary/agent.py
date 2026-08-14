@@ -97,10 +97,19 @@ def _resolve_cluster_advertise_host(advertise: str | None, bind_host: str,
               f"with {resolved!r}", file=sys.stderr)
     return resolved
 
+def tiers_config_from_env(env: dict | None = None) -> dict[str, float]:
+    """Configured RAM/VRAM budgets from agent argv/env (--ram, --vram)."""
+    e = env or os.environ
+    ram = float(e.get("RAM_GB") or 0)
+    vram = float(e.get("CUDA_EXPERT_GB") or e.get("VRAM_GB") or 0)
+    return {k: v for k, v in (("ram_gb", ram), ("vram_gb", vram)) if v > 0}
+
+
 class ControlConnection:
     def __init__(self, node_id, master_host, control_port, http_port, model_id, model_path,
                  advertise_host, engine, scheduler, arch, expert_port, placement_path,
-                 trace_buffer: TraceBuffer | None = None):
+                 trace_buffer: TraceBuffer | None = None,
+                 tiers_config: dict[str, float] | None = None):
         self.node_id = node_id
         self.master_host = master_host
         self.control_port = control_port
@@ -114,6 +123,7 @@ class ControlConnection:
         self.expert_port = expert_port
         self.placement_path = placement_path
         self.trace_buffer = trace_buffer
+        self.tiers_config = dict(tiers_config or tiers_config_from_env())
         self._usage_snapshot: list[dict] = []
         self._stop = threading.Event()
         self._sock = None
@@ -200,6 +210,14 @@ class ControlConnection:
         tiers = sanitize_tiers(getattr(eng, "tiers", None))
         if tiers:
             payload["tiers"] = tiers
+        elif self.tiers_config:
+            payload["tiers"] = {
+                "ram_gb": self.tiers_config.get("ram_gb", 0),
+                "vram_gb": self.tiers_config.get("vram_gb", 0),
+                "ram": 0, "vram": 0, "disk": 0,
+            }
+        if self.tiers_config:
+            payload["tiers_config"] = dict(self.tiers_config)
         if discover_gpus and not payload.get("hwinfo"):
             try:
                 gpus = discover_gpus()
@@ -239,6 +257,14 @@ class ControlConnection:
         tiers = sanitize_tiers(getattr(eng, "tiers", None))
         if tiers:
             payload["tiers"] = tiers
+        elif self.tiers_config:
+            payload["tiers"] = {
+                "ram_gb": self.tiers_config.get("ram_gb", 0),
+                "vram_gb": self.tiers_config.get("vram_gb", 0),
+                "ram": 0, "vram": 0, "disk": 0,
+            }
+        if self.tiers_config:
+            payload["tiers_config"] = dict(self.tiers_config)
         if getattr(eng, "emap", None):
             payload["emap"] = eng.emap
         payload["scheduler"] = snap
@@ -412,7 +438,8 @@ def run_agent(model, master_url, host="127.0.0.1", port=8001, model_id=None, api
 
     control = ControlConnection(node_id, master_host, control_port, port, model_id, model,
                                 advertise, runtime, server.scheduler, arch, expert_port,
-                                placement_path, server.trace_buffer)
+                                placement_path, server.trace_buffer,
+                                tiers_config=tiers_config_from_env(child_env))
     server.control = control
     control.start()
 

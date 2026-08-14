@@ -9,7 +9,7 @@
 ```
 
 <p align="center">
-  <strong>Apache Spark–like control plane for MoE inference — commodity boxes, full weights on every node, activations over the LAN.</strong>
+  <strong>One coordinator, many expert donors — full weights on every node, activations over the LAN.</strong>
 </p>
 
 <p align="center">
@@ -26,16 +26,16 @@
 
 Frontier MoEs are huge, but only a thin slice of experts is active per token. Datacenter GPU racks are one answer; another is the hardware many teams already own: several boxes with fast NVMe, plenty of RAM, and maybe a GPU each.
 
-Aviary is the **cluster control plane** for that world. It borrows Apache Spark’s mental model — a **master**, **executors (agents)**, **jobs**, and a placement view — and applies it to sparse MoE inference:
+Aviary is the **cluster control plane** for that world. Like Spark’s driver/executor split, each chat keeps a **fast coordinator** (dense, attention, KV, MTP local) while **donor** agents serve expert blocks via activation-only RPC when that beats local disk:
 
-| Spark idea | Aviary |
+| Role | Aviary |
 |---|---|
-| Master | Registry, chat routing, placement scheduler, Cluster dashboard |
-| Executors | One MoE engine per machine (agent) |
-| Jobs | Each chat / completions request, with expert hop traces |
-| Placement | Which node should own which hot expert |
+| Coordinator | One fast agent per chat — routing, dense/attn, KV, MTP stay local |
+| Donors | Peers that host expert layer blocks; `EXEC_EXPERT` ships activations only |
+| Master | Registry, coordinator pick, donor placement, Cluster dashboard |
+| Jobs | Each chat / completions request, with per-expert hop traces |
 
-Point any OpenAI-compatible client (or the built-in dashboard) at one master URL. The flock routes work, tracks expert heat, and decides when a peer’s hot expert beats a local disk load.
+Point any OpenAI-compatible client (or the built-in dashboard) at one master URL. The coordinator runs the conversation; donors answer expert RPCs when `rpc + exec` beats the coordinator’s `load + exec`.
 
 ### Why full weights on every agent?
 
@@ -77,7 +77,7 @@ Shipping base weights over the LAN has repeatedly proven cumbersome in other dis
 
 ## Cluster UI
 
-Open the master’s URL and use the **Cluster** tab (Spark-style: Overview, Jobs, Executors, Placement, RPC).
+Open the master’s URL and use the **Cluster** tab (Overview, Jobs, Executors, Placement, RPC, Bench).
 
 <p align="center">
   <img src="docs/media/aviary_cluster_view.png" width="900" alt="Aviary Cluster — Placement view with per-node expert ownership heatmaps">
@@ -215,6 +215,7 @@ The **Cluster** tab shows:
 |---|---|
 | Overview, env vars, benchmarks | [docs/AVIARY.md](docs/AVIARY.md) |
 | Cluster bench (EPA harness) | [docs/AVIARY.md § Cluster bench](docs/AVIARY.md#cluster-bench-epa-harness) |
+| Qwen3-MoE bench 2026-08-14 (solo / cluster / Mac) | [docs/experiments/qwen3-moe-aviary-bench-2026-08-14.md](docs/experiments/qwen3-moe-aviary-bench-2026-08-14.md) |
 | Why VRAM can be slower than RAM | [docs/AVIARY.md § Why can GPU be slower than RAM?](docs/AVIARY.md#why-can-gpu-vram-be-slower-than-ram) |
 | Upstream engine sync / drift | [docs/COLIBRI_SYNC.md](docs/COLIBRI_SYNC.md) |
 | Qwen3 convert + oracle | [docs/qwen3_moe.md](docs/qwen3_moe.md) |

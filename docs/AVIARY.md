@@ -47,19 +47,21 @@ That means:
 
 ```
 Client → master (HTTP :9000)
-           ├─ routes chat to primary agent
-           ├─ placement scheduler (every ~4s)
+           ├─ routes chat to **coordinator** agent (fastest eligible node)
+           ├─ placement scheduler (every ~4s) assigns expert **blocks to donors**
            └─ Cluster dashboard (jobs, executors, placement, RPC)
 
 Agent (each node)
   ├─ Colibri engine subprocess (MoE forward, hot-load, .coli_usage)
   ├─ expert RPC server (:9003) — serves individual expert matmuls to peers
-  └─ control heartbeat → master (EMAP, ECOST, usage, profile)
+  └─ control heartbeat → master (EMAP, ECOST, usage, profile, tier config)
 ```
 
-A single chat request lands on one **primary** agent. Inside `moe()`, the engine may RPC
-individual expert forwards to whichever node currently holds that expert hottest. Remote
-miss/timeout always falls through to local disk load.
+Each chat has one **coordinator**: dense layers, attention, KV, and MTP stay local on
+that node. **Donor** peers only receive expert block assignments; the master never routes
+a conversation to a slow or telemetry-blind node just because its EMAP looks warm. Inside
+`moe()`, the coordinator may RPC individual expert forwards when `rpc + exec` beats local
+`load + exec`. Remote miss/timeout always falls through to local disk load.
 
 **Phase 1 capacity model:** each agent runs a **full local replica** of the model. Adding
 nodes increases **concurrent throughput and availability**, not pooled model memory — N modest
@@ -71,14 +73,14 @@ boxes add up to N× throughput, not one virtual GPU with the sum of their VRAM.
 |---|---|---|
 | `coli master` | ✓ | Node registry, heartbeat lease, OpenAI API proxy, dashboard host |
 | `coli agent` | ✓ | Wraps one local `Engine`; relays telemetry to master |
-| Cluster dashboard | ✓ | Spark-style: Overview, Jobs, Executors, Placement, RPC tabs |
-| Least-loaded + affinity routing | ✓ | Master picks agent by load, hot-expert affinity, and slow-node penalty; probabilistic cold bootstrap |
-| Per-request expert trace | ✓ | Jobs tab: layer/expert hops (local, remote, fallback) per chat |
+| Cluster dashboard | ✓ | Overview, Jobs, Executors, Placement, RPC tabs |
+| Coordinator + donor routing | ✓ | Fast coordinator per chat; slow/missing-tier nodes are donor-only |
+| Per-request expert trace | ✓ | Jobs tab: one hop per expert (local, remote, fallback) |
 | Cross-node expert RPC | ✓ | `EXEC_EXPERT` mux + TCP expert server; `cluster_rpc.h` in `moe()` |
-| Placement scheduler | ✓ | Cost-aware expert placement; `PLACEMENT` pushed to agents |
+| Placement scheduler | ✓ | Donor block placement by rpc+exec vs local load+exec; ε-greedy explore |
 | Per-model usage isolation | ✓ | Stats keyed by `engine_id`; never merged across architectures |
 | Request job tracking | ✓ | `GET /cluster/jobs`, `GET /cluster/overview` |
-| MTP / dense layer placement | planned | Phase 2.4 — after expert RPC gates proven |
+| MTP / dense on coordinator | ✓ | Dense, attention, KV, and MTP never RPC'd; coordinator-local only |
 | Cross-node weight prefetch | ✓ | Phase 4 — best-effort shard fetch from peers (`AVIARY_PREFETCH=1`) |
 
 Enable Phase 2 on agents:
@@ -329,6 +331,9 @@ under `AVIARY_BENCH_DIR` (default: `<repo>/docs/bench/`):
 - **Local-only** — pushes placement with empty `experts` so the primary runs every expert locally (SSD→RAM story without stopping peers).
 
 Paste `docs/bench/latest.md` into the README benchmark table after a run.
+
+Measured Qwen3-MoE matrix (solo fat / GPU / starved, cluster + Mac):
+[`experiments/qwen3-moe-aviary-bench-2026-08-14.md`](experiments/qwen3-moe-aviary-bench-2026-08-14.md).
 
 | variable | default | meaning |
 |---|---|---|

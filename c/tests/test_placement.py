@@ -18,6 +18,27 @@ class DecodeEmapTest(unittest.TestCase):
 
 
 class PlacementSchedulerTest(unittest.TestCase):
+    def test_pick_coordinator_id_prefers_fast_eligible(self):
+        nodes = [
+            {"node_id": "linux", "status": "healthy", "inflight": 0, "coordinator_eligible": True,
+             "hwinfo": {"cores": 20, "ram_avail_gb": 58}, "tiers_config": {"ram_gb": 50}},
+            {"node_id": "mac", "status": "healthy", "inflight": 0, "coordinator_eligible": False,
+             "donor_only_reason": "slow_ram_exec", "hwinfo": {"cores": 8, "ram_avail_gb": 8}},
+        ]
+        self.assertEqual(p.pick_coordinator_id(nodes), "linux")
+
+    def test_mtp_layer_excluded_from_expert_map(self):
+        sched = PlacementScheduler(recompute_sec=1)
+        nodes = [
+            {"node_id": "a", "status": "healthy", "inflight": 0, "arch": "hy3",
+             "emap": {"rows": 81, "cols": 256, "map": "00"},
+             "usage": [{"layer": 80, "expert": 0, "count": 100}],
+             "costs": [], "tiers_config": {"ram_gb": 50}, "coordinator_eligible": True},
+        ]
+        plan = sched.recompute(nodes, primary_hint="a")
+        self.assertEqual(plan.experts.get("80:0"), None)
+        self.assertEqual(plan.coordinator_id, "a")
+
     def test_recompute_picks_remote_when_cheaper(self):
         sched = PlacementScheduler(recompute_sec=1)
         nodes = [

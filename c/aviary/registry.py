@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import random
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ from aviary.tiers_util import sanitize_tiers
 
 DEFAULT_HEARTBEAT_SEC = float(os.environ.get("AVIARY_HEARTBEAT_SEC", "2"))
 DEFAULT_HEARTBEAT_MISS = int(os.environ.get("AVIARY_HEARTBEAT_MISS", "3"))
+COORD_SLOW_RATIO = float(os.environ.get("AVIARY_COORD_SLOW_RATIO", "1.5"))
 
 CONTROL_IDLE_TIMEOUT_MS = int(DEFAULT_HEARTBEAT_SEC * 1000 * (DEFAULT_HEARTBEAT_MISS + 2))
 
@@ -32,6 +33,7 @@ class NodeRecord:
     proxy_inflight: int = 0
     hwinfo: dict[str, Any] | None = None
     tiers: dict[str, Any] | None = None
+    tiers_config: dict[str, Any] | None = None
     emap: dict[str, Any] | None = None
     hits: str = ""
     hits_seq: int = 0
@@ -47,8 +49,11 @@ class NodeRecord:
     status: str = "healthy"
     missed_heartbeats: int = 0
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, roles: dict[str, tuple[bool, str]] | None = None) -> dict[str, Any]:
         now = time.time()
+        eligible, reason = (roles or {}).get(self.node_id, (True, ""))
+        tc = self.tiers_config or {}
+        t = self.tiers or {}
         return {
             "node_id": self.node_id,
             "endpoint": self.endpoint,
@@ -64,6 +69,13 @@ class NodeRecord:
             "last_heartbeat_age_sec": now - self.last_heartbeat,
             "hwinfo": self.hwinfo,
             "tiers": self.tiers,
+            "tiers_config": self.tiers_config,
+            "ram_config_gb": tc.get("ram_gb"),
+            "vram_config_gb": tc.get("vram_gb"),
+            "ram_occ_gb": t.get("ram_gb"),
+            "vram_occ_gb": t.get("vram_gb"),
+            "coordinator_eligible": eligible,
+            "donor_only_reason": reason,
             "emap": self.emap,
             "hits": self.hits,
             "hits_seq": self.hits_seq,
@@ -130,6 +142,7 @@ class NodeRegistry:
                 endpoint=endpoint,
                 hwinfo=payload.get("hwinfo"),
                 tiers=sanitize_tiers(payload.get("tiers")) or payload.get("tiers"),
+                tiers_config=dict(payload.get("tiers_config") or {}),
                 emap=payload.get("emap"),
                 hits=payload.get("hits") or "",
                 hits_seq=int(payload.get("hits_seq") or 0),
@@ -161,7 +174,7 @@ class NodeRegistry:
             record.last_heartbeat = time.time()
             record.missed_heartbeats = 0
             record.status = "healthy"
-            for key in ("hwinfo", "tiers", "emap"):
+            for key in ("hwinfo", "tiers", "emap", "tiers_config"):
                 if payload.get(key):
                     value = payload[key]
                     if key == "tiers":
@@ -252,100 +265,91 @@ class NodeRegistry:
         return cores * 10.0 + ram + ram_budget - NodeRegistry._slow_penalty(n)
 
     @staticmethod
-    def _effective_bootstrap_ratio(max_hits: int, min_hits: int,
-                                   residents: dict[str, int]) -> float:
-        ratio = float(os.environ.get("AVIARY_ROUTE_BOOTSTRAP_RATIO", "0.1"))
-        if max_hits <= 0:
-            return ratio
-        max_res = max(residents.values()) if residents else 0
-        min_res = min(residents.values()) if residents else 0
-        # Warm-lock escape: a cold fast node should receive traffic, not only ~10%.
-        if min_res == 0 and max_res >= 32:
-            ratio = max(ratio, float(os.environ.get("AVIARY_ROUTE_COLD_MIN_RATIO", "0.35")))
-        elif min_hits < max_hits * ratio:
-            ratio = max(ratio, float(os.environ.get("AVIARY_ROUTE_COLD_MIN_RATIO", "0.35")))
-        return ratio
+    def _median_ram_exec_us(n: NodeRecord) -> float | None:
+        vals = [float(c.get("exec_us", 0)) for c in (n.costs or [])
+                if int(c.get("tier", 1)) == 1 and float(c.get("exec_us", 0)) > 0]
+        return statistics.median(vals) if vals else None
 
-    def pick_least_loaded(self, affinity_node: str | None = None) -> NodeRecord | None:
-        nodes = self.healthy_nodes()
+    @staticmethod
+    def _has_tier_signal(n: NodeRecord) -> bool:
+        tc = n.tiers_config or {}
+        t = n.tiers or {}
+        return bool(float(tc.get("ram_gb") or 0) or float(tc.get("vram_gb") or 0)
+                    or float(t.get("ram_gb") or 0) or float(t.get("vram_gb") or 0))
+
+    @staticmethod
+    def _coord_score(n: NodeRecord) -> float:
+        exec_us = NodeRegistry._median_ram_exec_us(n)
+        exec_bonus = (1_000_000.0 / exec_us) if exec_us and exec_us > 0 else 0.0
+        return NodeRegistry._speed_hint(n) + exec_bonus
+
+    def node_roles(self, nodes: list[NodeRecord] | None = None) -> dict[str, tuple[bool, str]]:
+        """Return coordinator_eligible and donor_only reason per node."""
+        healthy = nodes if nodes is not None else self.healthy_nodes()
+        execs = {n.node_id: self._median_ram_exec_us(n) for n in healthy}
+        leader_exec = min((v for v in execs.values() if v), default=None)
+        roles: dict[str, tuple[bool, str]] = {}
+        for n in healthy:
+            if not self._has_tier_signal(n) and not (n.costs or []):
+                roles[n.node_id] = (False, "missing_tiers")
+                continue
+            exec_us = execs.get(n.node_id)
+            if leader_exec and exec_us and exec_us > leader_exec * COORD_SLOW_RATIO:
+                roles[n.node_id] = (False, "slow_ram_exec")
+                continue
+            wall = max((float(t.get("wall_s", 0)) for t in (n.profile or [])[-2:]), default=0.0)
+            if wall > 5.0 and leader_exec and exec_us and exec_us > leader_exec:
+                roles[n.node_id] = (False, "slow_profile")
+                continue
+            roles[n.node_id] = (True, "")
+        return roles
+
+    def coordinator_nodes(self) -> list[NodeRecord]:
+        healthy = self.healthy_nodes()
+        roles = self.node_roles(healthy)
+        coords = [n for n in healthy if roles.get(n.node_id, (True, ""))[0]]
+        return coords or healthy
+
+    def _pick_coordinator_from(self, nodes: list[NodeRecord],
+                               affinity_node: str | None = None) -> NodeRecord | None:
         if not nodes:
             return None
         if affinity_node:
             match = next((n for n in nodes if n.node_id == affinity_node), None)
             if match and match.inflight <= min(n.inflight for n in nodes) + 1:
                 return match
-        return min(nodes, key=self._load_key)
+        return min(nodes, key=lambda n: (n.inflight + self._slow_penalty(n),
+                                          -self._coord_score(n), -n.last_heartbeat, n.node_id))
+
+    def pick_coordinator(self, affinity_node: str | None = None) -> NodeRecord | None:
+        """Pick chat coordinator: fastest eligible node, never EMAP-warmth."""
+        healthy = self.healthy_nodes()
+        roles = self.node_roles(healthy)
+        coords = [n for n in healthy if roles.get(n.node_id, (True, ""))[0]]
+        return self._pick_coordinator_from(coords or healthy, affinity_node)
+
+    def pick_least_loaded(self, affinity_node: str | None = None) -> NodeRecord | None:
+        return self.pick_coordinator(affinity_node)
 
     def pick_with_affinity(self, hot_experts: set[tuple[int, int]] | None = None) -> NodeRecord | None:
-        nodes = self.healthy_nodes()
-        if not nodes:
-            return None
-        if not hot_experts:
-            return self.pick_least_loaded()
-        from aviary.placement import decode_emap
-
-        def hot_hits(n: NodeRecord) -> int:
-            inv = decode_emap(n.emap)
-            return sum(1 for k in hot_experts if inv.get(k, {}).get("tier", 0) >= 1)
-
-        hits = {n.node_id: hot_hits(n) for n in nodes}
-        residents = {n.node_id: self._emap_resident_count(n) for n in nodes}
-        max_hits = max(hits.values())
-        min_hits = min(hits.values())
-        max_res = max(residents.values()) if residents else 0
-        min_res = min(residents.values()) if residents else 0
-
-        # All cold: no resident affinity signal — pick by hardware speed, not UUID.
-        if max_res == 0 and max_hits == 0 and len(nodes) >= 2:
-            return min(nodes, key=self._load_key)
-
-        # Severe warm-lock: warm node is slow, cold node is faster — break affinity so the
-        # fast box can take chat. Never the reverse (do not yank traffic off a warm fast node).
-        if max_res >= 32 and min_res == 0 and len(nodes) >= 2:
-            cold = [n for n in nodes if residents[n.node_id] == 0]
-            warm = [n for n in nodes if residents[n.node_id] > 0]
-            if cold and warm:
-                best_cold = max(cold, key=self._speed_hint)
-                best_warm = max(warm, key=lambda n: residents[n.node_id])
-                if self._speed_hint(best_cold) > self._speed_hint(best_warm) + 5.0:
-                    return min(cold, key=self._load_key)
-
-        # Bootstrap cold executors only when the cold peer is a plausible upgrade (faster /
-        # less penalized). Sending chat to a slower cold box just to warm it is how a
-        # 30s primary becomes a 5-minute one after the first successful turn.
-        bootstrap_ratio = self._effective_bootstrap_ratio(max_hits, min_hits, residents)
-        if bootstrap_ratio > 0 and max_hits > 0 and min_hits < max_hits * bootstrap_ratio:
-            warm = [n for n in nodes if hits[n.node_id] > min_hits + 1]
-            cold = [n for n in nodes if hits[n.node_id] <= min_hits + 1]
-            if warm and cold:
-                best_warm = max(warm, key=lambda n: (hits[n.node_id], self._speed_hint(n)))
-                # Keep only cold peers that look faster than the warm leader.
-                cold = [n for n in cold
-                        if self._speed_hint(n) > self._speed_hint(best_warm) + 5.0]
-                warm_min = min((n.inflight for n in warm), default=0)
-                cold = [n for n in cold if n.inflight <= warm_min + 1]
-                if cold and random.random() < bootstrap_ratio:
-                    return min(cold, key=self._load_key)
-
-        def score(n: NodeRecord) -> tuple[int, float, float, float, str]:
-            hit_score = -hits[n.node_id]
-            # Do not let resident affinity permanently override a much faster cold peer.
-            if residents[n.node_id] == 0 and max(hits.values()) >= 4:
-                hit_score = max(hit_score, -min(4, max(hits.values()) // 4))
-            return (hit_score, n.inflight + self._slow_penalty(n),
-                    -self._speed_hint(n), -n.last_heartbeat, n.node_id)
-
-        return min(nodes, key=score)
+        """Chat routing: coordinator only. hot_experts does not move the conversation."""
+        del hot_experts
+        return self.pick_coordinator()
 
     def cluster_state(self) -> dict[str, Any]:
         with self._lock:
-            nodes = [record.snapshot() for record in self._nodes.values()]
+            healthy = [n for n in self._nodes.values() if n.status == "healthy"]
+            roles = self.node_roles(healthy)
+            nodes = [record.snapshot(roles) for record in self._nodes.values()]
             cohort = self._cohort
-        healthy = sum(1 for n in nodes if n["status"] == "healthy")
+            coords = [n for n in healthy if roles.get(n.node_id, (True, ""))[0]]
+            coord = self._pick_coordinator_from(coords or healthy)
+        healthy_count = sum(1 for n in nodes if n["status"] == "healthy")
         return {
             "nodes": nodes,
-            "healthy": healthy,
+            "healthy": healthy_count,
             "total": len(nodes),
+            "coordinator_id": coord.node_id if coord else "",
             "cohort": {
                 "arch": cohort.arch if cohort else "",
                 "model_id": cohort.model_id if cohort else "",

@@ -8,6 +8,7 @@ from aviary.bench import (
     PRESET_STEPS,
     build_scoreboard,
     compute_epa,
+    donor_primary_warnings,
     hop_mix,
     render_markdown,
     summarize_latencies,
@@ -66,13 +67,21 @@ class TestBenchMath(unittest.TestCase):
         self.assertIn("cold_sequential", md)
         self.assertIn("p50=30.0s", md)
 
+    def test_donor_primary_warning(self):
+        nodes = [{"node_id": "mac-donor", "coordinator_eligible": False, "donor_only_reason": "missing_tiers"}]
+        jobs = [{"node_id": "mac-donor", "trace": []}]
+        warnings = donor_primary_warnings(nodes, jobs)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("donor_only", warnings[0])
+
     def test_markdown_contains_cluster_config(self):
         result = {
             "finished_at": "2026-08-14T12:00:00Z",
             "cluster": {
                 "cohort": {"model_id": "hy3-colibri", "arch": "hy3"},
-                "nodes": [{"node_id": "abc-123", "host": "192.168.1.120", "ram_gb": 50, "vram_gb": 0,
-                           "ram_total_gb": 64, "gpu": ""}],
+                "nodes": [{"node_id": "abc-123", "host": "192.168.1.120",
+                           "ram_flag": 50, "vram_flag": 0, "ram_occ": 11, "vram_occ": 0,
+                           "coordinator_eligible": True, "ram_total_gb": 64, "gpu": ""}],
             },
             "meta": {"preset": "cold_sequential", "wipe_usage": True, "local_only": False, "requests": 8, "workers": 1, "max_tokens": 32},
             "scoreboard": {},

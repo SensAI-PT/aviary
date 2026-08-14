@@ -428,7 +428,9 @@ def _push_placement(registry: NodeRegistry, scheduler: PlacementScheduler) -> No
     nodes = snap.get("nodes") or []
     if len(nodes) < 1:
         return
-    plan = scheduler.recompute(nodes)
+    coord = registry.pick_coordinator()
+    primary_hint = coord.node_id if coord else None
+    plan = scheduler.recompute(nodes, primary_hint=primary_hint)
     from aviary.placement import MAX_PIN_PER_TICK
 
     sent_pins: set[tuple[str, int, int, int]] = set()

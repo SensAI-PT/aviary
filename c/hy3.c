@@ -1623,7 +1623,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int j=0;j<nb;j++)
             if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
         /* Per-expert completion: RPC remotes first, then Metal-batch locals, then CPU. */
-        unsigned char done[64]; memset(done,0,(size_t)nb);
+        unsigned char done[64], traced[64]; memset(done,0,(size_t)nb); memset(traced,0,(size_t)nb);
         cluster_init();
         if(g_cluster_enabled){
             for(int j=0;j<nb;j++){
@@ -1639,8 +1639,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                         for(int d=0;d<D;d++) os[d]+=rw[r]*rpc_out[d];
                     } else { remote_ok=0; cluster_reload(); }
                 }
-                if(remote_ok) done[j]=1;
-                else cluster_emit_trace(layer, eid, "fallback", "-", 0);
+                if(remote_ok){ done[j]=1; traced[j]=1; }
+                else { cluster_emit_trace(layer, eid, "fallback", "-", 0); traced[j]=1; }
             }
         }
 #ifdef COLI_METAL
@@ -1693,8 +1693,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                             int j=ej[bi];
                             done[j]=1;
                             ct_record(layer,uniq[base+j],1,0,(uint32_t)((now_s()-t0)*1e6));
-                            cluster_emit_trace(layer, uniq[base+j], "local", "-",
+                            if(!traced[j]) cluster_emit_trace(layer, uniq[base+j], "local", "-",
                                 (uint32_t)((now_s()-t0)*1e6));
+                            traced[j]=1;
                         }
                     } else m->t_emm+=now_s()-t0;
                 }
@@ -1725,7 +1726,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(g_cuda_enabled && e->g.cuda_eligible) etier=2;
 #endif
             ct_record(layer,eid,etier,0,(uint32_t)((now_s()-t0)*1e6));
-            cluster_emit_trace(layer, eid, "local", "-", (uint32_t)((now_s()-t0)*1e6));
+            if(!traced[j]) cluster_emit_trace(layer, eid, "local", "-", (uint32_t)((now_s()-t0)*1e6));
+            traced[j]=1;
         }
         ct_flush();
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
@@ -2198,9 +2200,18 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 safe_total+=remaining[i];
             }
         }
-        if(budget>safe_total) budget=safe_total;
+        if(budget>safe_total){
+            fprintf(stderr,COLI_ACCEL_TAG " VRAM budget clamped: requested %.1f GB, safe free %.1f GB\n",
+                g_cuda_expert_gb,safe_total/1e9);
+            budget=safe_total;
+        }
         for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
+            if(cluster_layer_max_tier(li) < 2){
+                if(a==0) fprintf(stderr,COLI_ACCEL_TAG " layer %d max_tier=%d — GPU upload skipped (Aviary cap)\n",
+                    li,cluster_layer_max_tier(li));
+                continue;
+            }
             for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
                 ESlot *s=&m->pin[li][z];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);

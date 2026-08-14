@@ -21,6 +21,65 @@ VRAM_SLOW_RATIO = float(os.environ.get("AVIARY_VRAM_SLOW_RATIO", "1.25"))
 BLOCK_MOVE_PCT = float(os.environ.get("AVIARY_BLOCK_MOVE_PCT", "0.15"))
 MIN_TIER_SAMPLES = int(os.environ.get("AVIARY_MIN_TIER_SAMPLES", "8"))
 TIER_PROBE = int(os.environ.get("AVIARY_TIER_PROBE", "8"))
+DONOR_SCORE_SAMPLES = int(os.environ.get("AVIARY_DONOR_SCORE_SAMPLES", "64"))
+# Architectures whose EMAP includes a final MTP/dense row — never place or RPC experts there.
+MTP_EMAP_ARCHS = frozenset({"hy3", "glm_moe_dsa", "glm52"})
+
+
+def mtp_layer_index(arch: str, emap_rows: int) -> int | None:
+    """Return the MTP/dense-only layer index for this arch, if any."""
+    if arch in MTP_EMAP_ARCHS and emap_rows > 0:
+        return emap_rows - 1
+    return None
+
+
+def _node_coord_score(n: dict[str, Any]) -> float:
+    hw = n.get("hwinfo") or {}
+    tc = n.get("tiers_config") or {}
+    tiers = n.get("tiers") or {}
+    exec_vals = [float(c.get("exec_us", 0)) for c in (n.get("costs") or [])
+                 if int(c.get("tier", 1)) == 1 and float(c.get("exec_us", 0)) > 0]
+    exec_bonus = (1_000_000.0 / statistics.median(exec_vals)) if exec_vals else 0.0
+    cores = float(hw.get("cores") or 0)
+    ram = float(hw.get("ram_avail_gb") or hw.get("ram_total_gb") or 0)
+    ram_budget = float(tiers.get("ram_gb") or tc.get("ram_gb") or n.get("ram_config_gb") or 0)
+    if ram_budget > 1024:
+        ram_budget = 0.0
+    return cores * 10.0 + ram + ram_budget + exec_bonus
+
+
+def pick_coordinator_id(nodes: list[dict[str, Any]], hint: str | None = None) -> str | None:
+    """Pick the chat coordinator from node snapshots (never EMAP warmth)."""
+    healthy = [n for n in nodes if n.get("status") == "healthy"]
+    if not healthy:
+        return None
+    coords = [n for n in healthy if n.get("coordinator_eligible", True)]
+    pool = coords or healthy
+    if hint:
+        match = next((n for n in pool if n["node_id"] == hint), None)
+        if match and match.get("inflight", 0) <= min(n.get("inflight", 0) for n in pool) + 1:
+            return hint
+    return min(pool, key=lambda n: (n.get("inflight", 0), -_node_coord_score(n), n["node_id"]))["node_id"]
+
+
+def _configured_vram_gb(node: dict[str, Any]) -> float:
+    tc = node.get("tiers_config") or {}
+    return float(tc.get("vram_gb") or node.get("vram_config_gb") or 0)
+
+
+def _boost_coordinator_vram_caps(primary: str, healthy: list[dict[str, Any]],
+                                 layer_owners: dict[int, str], layer_max_tier: dict[int, int],
+                                 node_max: dict[str, tuple[int, bool]]) -> None:
+    """Allow VRAM on coordinator-owned layers when --vram is configured and GPU isn't slow."""
+    coord = next((n for n in healthy if n["node_id"] == primary), None)
+    if not coord or _configured_vram_gb(coord) <= 0:
+        return
+    mt, slow = node_max.get(primary, (1, False))
+    if slow or mt < 2:
+        return
+    for layer, owner in layer_owners.items():
+        if owner == primary:
+            layer_max_tier[layer] = max(layer_max_tier.get(layer, 1), 2)
 
 
 def blocks_from_planned(planned: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -187,7 +246,9 @@ def preferred_max_tier(sched: "PlacementScheduler", node: dict[str, Any]) -> tup
     """
     nid = node["node_id"]
     tiers = node.get("tiers") or {}
-    has_vram = int(tiers.get("vram", 0)) > 0 or float(tiers.get("vram_gb", 0) or 0) > 0
+    tc = node.get("tiers_config") or {}
+    has_vram = (int(tiers.get("vram", 0)) > 0 or float(tiers.get("vram_gb") or 0) > 0
+                or float(tc.get("vram_gb") or 0) > 0 or float(node.get("vram_config_gb") or 0) > 0)
     if not has_vram and _vram_residency_frac(node) < 0.05:
         return 1, False
 
@@ -319,12 +380,12 @@ def _emit_tier_commands(plan: PlacementPlan, inventories: dict[str, dict],
 def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
                        hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
                        inventories: dict[str, dict], primary: str,
-                       prev_owners: dict[int, str]) -> None:
+                       prev_owners: dict[int, str], mtp_layer: int | None = None) -> None:
     """Assign contiguous layer blocks to nodes; prefer measured tier per owner."""
     by_layer: dict[int, int] = {}
     by_layer_experts: dict[int, list[tuple[int, int]]] = {}
     for (layer, expert), freq in hot:
-        if freq < 1:
+        if freq < 1 or (mtp_layer is not None and layer == mtp_layer):
             continue
         by_layer[layer] = by_layer.get(layer, 0) + freq
         by_layer_experts.setdefault(layer, []).append((expert, freq))
@@ -374,6 +435,7 @@ def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
             key = f"{layer}:{expert}"
             plan.experts[key] = best_node
 
+    _boost_coordinator_vram_caps(primary, healthy, layer_owners, layer_max_tier, node_max)
     plan.planned_blocks = _merge_blocks(layer_owners, layer_max_tier)
     plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
 
@@ -396,11 +458,12 @@ def apply_layer_blocks(sched: "PlacementScheduler", plan: PlacementPlan,
 
 def apply_layer_coherence(sched: "PlacementScheduler", plan: PlacementPlan,
                           hot: list[tuple[tuple[int, int], int]], healthy: list[dict[str, Any]],
-                          inventories: dict[str, dict], primary: str) -> None:
+                          inventories: dict[str, dict], primary: str,
+                          mtp_layer: int | None = None) -> None:
     """Assign all hot experts in a layer to one executor (fewer RPC hops per forward pass)."""
     by_layer: dict[int, list[tuple[int, int]]] = {}
     for (layer, expert), freq in hot:
-        if freq < 1:
+        if freq < 1 or (mtp_layer is not None and layer == mtp_layer):
             continue
         by_layer.setdefault(layer, []).append((expert, freq))
     node_max = {n["node_id"]: preferred_max_tier(sched, n)[0] for n in healthy}
@@ -442,6 +505,8 @@ class PlacementPlan:
     computed_at: float = 0.0
     layer_coherent: bool = False
     layer_blocks: bool = False
+    coordinator_id: str = ""
+    donor_scores: dict[str, dict[str, float]] = field(default_factory=dict)
     planned_blocks: list[dict[str, Any]] = field(default_factory=list)
     layer_caps: dict[str, int] = field(default_factory=dict)
     node_tier_prefs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -457,7 +522,25 @@ class PlacementScheduler:
         self._prev_experts: dict[str, str] = {}
         self._reassignments: int = 0
         self._median_exec: dict[int, float] = {0: 500_000.0, 1: 50_000.0, 2: 10_000.0}
+        self._donor_scores: dict[tuple[str, str, int], list[float]] = {}
         self.rpc_histogram = RpcHistogram()
+
+    def _record_donor_score(self, coordinator: str, donor: str, tier: int, cost_us: float) -> None:
+        key = (coordinator, donor, tier)
+        bucket = self._donor_scores.setdefault(key, [])
+        bucket.append(cost_us)
+        if len(bucket) > DONOR_SCORE_SAMPLES:
+            del bucket[: len(bucket) - DONOR_SCORE_SAMPLES]
+
+    def donor_score_snapshot(self, coordinator: str | None = None) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for (coord, donor, tier), samples in self._donor_scores.items():
+            if coordinator and coord != coordinator:
+                continue
+            if not samples:
+                continue
+            out.setdefault(donor, {})[str(tier)] = round(statistics.median(samples))
+        return out
 
     def ingest_costs(self, node_id: str, samples: list[dict[str, Any]]) -> None:
         bucket = self._costs.setdefault(node_id, {})
@@ -522,22 +605,27 @@ class PlacementScheduler:
             self.ingest_usage(n.get("usage") or [])
 
         hot = sorted(self._usage.items(), key=lambda kv: -kv[1])[:256]
-        primary = primary_hint or (min(healthy, key=lambda n: n.get("inflight", 0))["node_id"]
-                                    if healthy else node_ids[0])
+        cohort_arch = next((str(n.get("arch") or "") for n in healthy if n.get("arch")), "")
+        emap_rows = max(int((n.get("emap") or {}).get("rows") or 0) for n in healthy) if healthy else 0
+        mtp_layer = mtp_layer_index(cohort_arch, emap_rows)
+        primary = pick_coordinator_id(healthy, primary_hint)
+        if not primary and healthy:
+            primary = healthy[0]["node_id"]
+        plan.coordinator_id = primary or ""
         prev_owners = _layer_owners_from_plan(self._last_plan)
 
         if LAYER_BLOCKS:
-            apply_layer_blocks(self, plan, hot, healthy, inventories, primary, prev_owners)
+            apply_layer_blocks(self, plan, hot, healthy, inventories, primary, prev_owners, mtp_layer)
             plan.layer_blocks = True
             plan.layer_coherent = True
         elif LAYER_COHERENT:
-            apply_layer_coherence(self, plan, hot, healthy, inventories, primary)
+            apply_layer_coherence(self, plan, hot, healthy, inventories, primary, mtp_layer)
             plan.layer_coherent = True
         else:
             node_max = {n["node_id"]: preferred_max_tier(self, n)[0] for n in healthy}
             layer_max_tier: dict[int, int] = {}
             for (layer, expert), freq in hot:
-                if freq < 1:
+                if freq < 1 or (mtp_layer is not None and layer == mtp_layer):
                     continue
                 key = f"{layer}:{expert}"
                 inv_p = inventories.get(primary, {}).get((layer, expert), {"tier": 0})
@@ -564,8 +652,28 @@ class PlacementScheduler:
 
                 plan.experts[key] = best_node
                 layer_max_tier[layer] = node_max.get(best_node, 1)
+            _boost_coordinator_vram_caps(primary, healthy,
+                                         {int(k.split(":")[0]): plan.experts[k]
+                                          for k in plan.experts if ":" in k},
+                                         layer_max_tier,
+                                         {n["node_id"]: preferred_max_tier(self, n) for n in healthy})
             plan.layer_caps = {str(layer): layer_max_tier[layer] for layer in layer_max_tier}
             _emit_tier_commands(plan, inventories, layer_max_tier, hot)
+
+        for (layer, expert), _freq in hot[:64]:
+            if mtp_layer is not None and layer == mtp_layer:
+                continue
+            key = f"{layer}:{expert}"
+            owner = plan.experts.get(key)
+            if not owner or owner == primary:
+                continue
+            inv = inventories.get(owner, {}).get((layer, expert), {"tier": 0})
+            tier = max(int(inv.get("tier", 0)), 1)
+            cost = self._rpc_cost(primary, owner) + self._exec_cost(owner, layer, expert, tier)
+            if inv.get("tier", 0) < 1:
+                cost += self._load_cost(owner, layer, expert, 0)
+            self._record_donor_score(primary, owner, tier, cost)
+        plan.donor_scores = self.donor_score_snapshot(primary or None)
 
         plan.rpc_matrix_us = {k: dict(v) for k, v in self._rpc_us.items()}
         if self._prev_experts:
@@ -585,6 +693,7 @@ class PlacementScheduler:
         experts = {k: v for k, v in plan.experts.items() if v != node_id}
         return {
             "node_id": node_id,
+            "coordinator_id": plan.coordinator_id,
             "peers": peers,
             "experts": experts,
             "layer_caps": plan.layer_caps,
@@ -615,6 +724,8 @@ class PlacementScheduler:
             "layer_coherence": layer_coherence_stats(experts),
             "layer_coherent": bool(plan and getattr(plan, "layer_coherent", False)),
             "layer_blocks": bool(plan and getattr(plan, "layer_blocks", False)),
+            "coordinator_id": plan.coordinator_id if plan else "",
+            "donor_scores": dict(plan.donor_scores) if plan else {},
             "reassignments": self._reassignments,
             "rpc_histogram": self.rpc_histogram.snapshot(),
         }

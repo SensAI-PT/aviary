@@ -66,6 +66,17 @@ def primary_node_mix(jobs: list[dict[str, Any]]) -> dict[str, float]:
     return {k: round(v / total * 100.0, 1) for k, v in sorted(counts.items(), key=lambda kv: -kv[1])}
 
 
+def donor_primary_warnings(nodes: list[dict[str, Any]], jobs: list[dict[str, Any]]) -> list[str]:
+    """Warn when a donor_only node served chat as primary (coordinator violation)."""
+    roles = {n["node_id"]: n.get("coordinator_eligible", True) for n in nodes}
+    reasons = {n["node_id"]: n.get("donor_only_reason", "") for n in nodes}
+    return [
+        f"donor_only node {nid[:8]} was primary {pct}% ({reasons.get(nid, 'donor_only')})"
+        for nid, pct in primary_node_mix(jobs).items()
+        if pct > 0 and not roles.get(nid, True)
+    ]
+
+
 def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
     """Hardware + tier budgets reported by agents at bench time."""
     snap = registry.snapshot()
@@ -73,6 +84,7 @@ def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
     for n in snap.get("nodes") or []:
         hw = n.get("hwinfo") or {}
         tiers = n.get("tiers") or {}
+        tc = n.get("tiers_config") or {}
         nodes.append({
             "node_id": n.get("node_id"),
             "host": n.get("host"),
@@ -82,6 +94,12 @@ def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
             "status": n.get("status"),
             "ram_gb": tiers.get("ram_gb"),
             "vram_gb": tiers.get("vram_gb"),
+            "ram_flag": n.get("ram_config_gb") or tc.get("ram_gb"),
+            "vram_flag": n.get("vram_config_gb") or tc.get("vram_gb"),
+            "ram_occ": n.get("ram_occ_gb") if n.get("ram_occ_gb") is not None else tiers.get("ram_gb"),
+            "vram_occ": n.get("vram_occ_gb") if n.get("vram_occ_gb") is not None else tiers.get("vram_gb"),
+            "coordinator_eligible": n.get("coordinator_eligible", True),
+            "donor_only_reason": n.get("donor_only_reason", ""),
             "disk_gb": tiers.get("disk"),
             "ram_total_gb": hw.get("ram_total_gb"),
             "ram_avail_gb": hw.get("ram_avail_gb"),
@@ -91,7 +109,13 @@ def cluster_snapshot(registry: NodeRegistry) -> dict[str, Any]:
             "gpu": hw.get("gpu"),
             "gpus": hw.get("gpus"),
         })
-    return {"cohort": snap.get("cohort") or {}, "nodes": nodes, "healthy": snap.get("healthy"), "total": snap.get("total")}
+    return {
+        "cohort": snap.get("cohort") or {},
+        "nodes": nodes,
+        "healthy": snap.get("healthy"),
+        "total": snap.get("total"),
+        "coordinator_id": snap.get("coordinator_id", ""),
+    }
 
 
 def compute_epa(p50_cold: float | None, p50_warm: float | None) -> float | None:
@@ -129,16 +153,23 @@ def render_markdown(result: dict[str, Any]) -> str:
         lines.append("")
     nodes = cluster.get("nodes") or []
     if nodes:
-        lines += ["### Cluster config", "", "| node | host | RAM budget | VRAM budget | HW RAM | GPU |", "|---|---|---:|---:|---:|---|"]
+        lines += [
+            "### Cluster config", "",
+            "| node | host | RAM flag | VRAM flag | RAM occ | VRAM occ | coord |",
+            "|---|---|---:|---:|---:|---:|---|",
+        ]
         for n in nodes:
             nid = str(n.get("node_id") or "")[:8]
             host = n.get("host") or "?"
-            ram = n.get("ram_gb")
-            vram = n.get("vram_gb")
-            hw_ram = n.get("ram_total_gb")
-            gpu = n.get("gpu") or (f"{n.get('gpus')}× GPU" if n.get("gpus") else "—")
+            ram_f = n.get("ram_flag")
+            vram_f = n.get("vram_flag")
+            ram_o = n.get("ram_occ")
+            vram_o = n.get("vram_occ")
+            coord = "yes" if n.get("coordinator_eligible", True) else f"no ({n.get('donor_only_reason') or '?'})"
             lines.append(
-                f"| `{nid}` | {host} | {ram if ram is not None else '—'} GB | {vram if vram is not None else '—'} GB | {hw_ram if hw_ram is not None else '—'} GB | {gpu or '—'} |"
+                f"| `{nid}` | {host} | {ram_f if ram_f is not None else '—'} GB | "
+                f"{vram_f if vram_f is not None else '—'} GB | {ram_o if ram_o is not None else '—'} GB | "
+                f"{vram_o if vram_o is not None else '—'} GB | {coord} |"
             )
         lines.append("")
     score = result.get("scoreboard") or {}
@@ -155,6 +186,9 @@ def render_markdown(result: dict[str, Any]) -> str:
         if prim:
             mix = ", ".join(f"{nid[:8]} {pct}%" for nid, pct in list(prim.items())[:4])
             lines.append(f"| primary nodes | {mix} |")
+        warnings = score.get("donor_primary_warnings") or []
+        if warnings:
+            lines.append(f"| **warnings** | {'; '.join(warnings)} |")
         lines.append("")
     for step in result.get("steps") or []:
         lat = step.get("latency") or {}
@@ -184,7 +218,7 @@ def render_markdown(result: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_scoreboard(steps: list[dict[str, Any]]) -> dict[str, Any]:
+def build_scoreboard(steps: list[dict[str, Any]], cluster_nodes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     by_name = {s["step"]: s for s in steps}
     cold = by_name.get("cold_sequential") or {}
     warm = by_name.get("warm_sequential") or {}
@@ -194,6 +228,7 @@ def build_scoreboard(steps: list[dict[str, Any]]) -> dict[str, Any]:
     p50_cold = cold_lat.get("p50_sec")
     p50_warm = warm_lat.get("p50_sec")
     all_jobs = [j for s in steps for j in (s.get("jobs") or [])]
+    warnings = donor_primary_warnings(cluster_nodes or [], all_jobs)
     return {
         "p50_cold_sec": p50_cold,
         "p50_warm_sec": p50_warm,
@@ -203,6 +238,7 @@ def build_scoreboard(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "rps_at_w": conc.get("rps"),
         "hop_mix_pct": hop_mix(all_jobs),
         "primary_node_mix_pct": primary_node_mix(all_jobs),
+        "donor_primary_warnings": warnings,
     }
 
 
@@ -446,9 +482,11 @@ class BenchRunner:
                 steps_plan = [{**steps_plan[0], "wipe_usage": cfg.wipe_usage}]
             finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             steps = [self._run_step(cfg, step) for step in steps_plan]
-            scoreboard = build_scoreboard(steps) if cfg.preset == "suite" or len(steps) > 1 else {}
+            cluster = cluster_snapshot(self.registry)
+            scoreboard = build_scoreboard(steps, cluster.get("nodes") or []) if cfg.preset == "suite" or len(steps) > 1 else {}
             if not scoreboard and steps:
                 step = steps[-1]
+                warnings = donor_primary_warnings(cluster.get("nodes") or [], step.get("jobs") or [])
                 scoreboard = {
                     "p50_cold_sec": (step.get("latency") or {}).get("p50_sec") if step["step"] == "cold_sequential" else None,
                     "p50_warm_sec": (step.get("latency") or {}).get("p50_sec") if step["step"] == "warm_sequential" else None,
@@ -456,6 +494,7 @@ class BenchRunner:
                     "rps_at_w": step.get("rps"),
                     "hop_mix_pct": step.get("hop_mix_pct"),
                     "primary_node_mix_pct": step.get("primary_node_mix_pct"),
+                    "donor_primary_warnings": warnings,
                 }
                 if step["step"] == "cold_sequential":
                     scoreboard["p95_cold_sec"] = (step.get("latency") or {}).get("p95_sec")
@@ -463,7 +502,7 @@ class BenchRunner:
                     scoreboard["p95_warm_sec"] = (step.get("latency") or {}).get("p95_sec")
             result = {
                 "finished_at": finished_at,
-                "cluster": cluster_snapshot(self.registry),
+                "cluster": cluster,
                 "meta": {
                     "preset": cfg.preset,
                     "wipe_usage": cfg.wipe_usage,
